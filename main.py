@@ -3,8 +3,21 @@ import json
 import websockets
 import requests
 import os
+from threading import Thread
+from flask import Flask
 
-# Lấy cấu hình bảo mật từ biến môi trường của Render
+# 1. Tạo Web Server giả lập để Render không báo lỗi "No open ports detected"
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot Realtime is running 24/7!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# 2. Cấu hình Telegram
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
@@ -23,21 +36,20 @@ def send_telegram_signal(symbol, price, volume, side):
     try:
         response = requests.post(url, json=payload)
         if response.status_code != 200:
-            print(f"Lỗi gửi tin nhắn Telegram: {response.text}")
+            print(f"Lỗi gửi tin nhắn: {response.text}")
     except Exception as e:
-        print(f"Lỗi kết nối gửi Telegram: {e}")
+        print(f"Lỗi gửi Telegram: {e}")
 
-# URL WebSocket Bybit Futures (Linear)
+# 3. Kết nối WebSocket Real-time Bybit
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
 async def subscribe_realtime_data():
     while True:
         try:
             async with websockets.connect(BYBIT_WS_URL) as ws:
-                # Đăng ký nhận dữ liệu khớp lệnh real-time
                 subscribe_msg = {
                     "op": "subscribe",
-                    "args": ["publicTrade.GRASSUSDT"]  # Bạn có thể đổi hoặc thêm cặp coin khác tại đây
+                    "args": ["publicTrade.GRASSUSDT"]
                 }
                 await ws.send(json.dumps(subscribe_msg))
                 print("⚡️ Đã kết nối WebSocket Bybit Real-time thành công...")
@@ -51,9 +63,9 @@ async def subscribe_realtime_data():
                             symbol = trade["s"]
                             price = float(trade["p"])
                             volume = float(trade["v"])
-                            side = trade["S"]  # Buy hoặc Sell
+                            side = trade["S"]
                             
-                            # Lọc điều kiện: Đơn hàng lớn hơn 10,000 USDT
+                            # Lọc đơn hàng > 10,000 USDT
                             trade_value = price * volume
                             if trade_value > 10000:
                                 print(f"🔥 Lệnh lớn: {side} {symbol} - ${trade_value:,.2f}")
@@ -64,4 +76,10 @@ async def subscribe_realtime_data():
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
+    # Chạy Web server ở luồng riêng (Background Thread)
+    server_thread = Thread(target=run_flask)
+    server_thread.daemon = True
+    server_thread.start()
+    
+    # Chạy WebSocket lắng nghe Real-time
     asyncio.run(subscribe_realtime_data())

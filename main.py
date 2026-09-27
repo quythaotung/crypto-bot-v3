@@ -5,29 +5,28 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION (CÁC BIẾN CẤU HÌNH)
+# CONFIGURATION
 # ==============================================================================
-DEBUG_MODE = True                  # In chi tiết lý do REJECT ra Logs
-REQUIRE_TAKER_BUY = True           # Bắt buộc Taker Buy >= 55%
-COOLDOWN_SECONDS = 300             # Giãn cách giữa các vòng quét toàn sàn (5 phút)
-MIN_TURNOVER_24H = 5_000_000       # Turnover tối thiểu $5M USD (Lọc coin rác)
+DEBUG_MODE = True
+REQUIRE_TAKER_BUY = True
+COOLDOWN_SECONDS = 300             # Quét 5 phút / lần
+MIN_TURNOVER_24H = 5_000_000       # Turnover >= $5M USD
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Bộ nhớ tạm lưu lịch sử lệnh & chống trùng lặp
 signals_history = []
 processed_signal_ids = set()
 signal_counter = 0
 
 # ==============================================================================
-# 1. FLASK KEEP-ALIVE SERVER & TELEGRAM COMMAND LISTENER (/pnl)
+# 1. FLASK SERVER & TELEGRAM COMMAND LISTENER (/pnl)
 # ==============================================================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Squeeze Explosion Bot (All Coins Bybit) Active 24/7!"
+    return "Bybit H1 & H4 Signal Bot Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -44,7 +43,6 @@ def get_current_price(symbol):
     return None
 
 def process_telegram_commands():
-    """Lắng nghe lệnh /pnl từ Telegram"""
     last_update_id = 0
     while True:
         try:
@@ -66,7 +64,7 @@ def send_pnl_summary():
     if not signals_history:
         msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\nChưa có lệnh nào được phát ra từ khi khởi động."
     else:
-        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH SQUEEZE:</b>\n-------------------------------------\n"
+        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH (H1 & H4):</b>\n-------------------------------------\n"
         total_pnl_pct = 0.0
         
         for sig in signals_history:
@@ -89,7 +87,7 @@ def send_pnl_summary():
             total_pnl_pct += pnl_pct
             icon = "🟢" if pnl_pct >= 0 else "🔴"
             
-            msg += f"<b>#{sig['id']} {sig['symbol']}</b> | Entry: {sig['entry']:.4f}\n"
+            msg += f"<b>#{sig['id']} [{sig['type']}] {sig['symbol']}</b> | Entry: {sig['entry']:.4f}\n"
             msg += f"• Giá hiện tại: {curr_price:.4f} ({icon} {pnl_pct:+.2f}%)\n"
             msg += f"• Trạng thái: <b>{status}</b>\n-------------------------------------\n"
             
@@ -104,31 +102,26 @@ def send_pnl_summary():
         print(f"Lỗi gửi PnL: {e}")
 
 # ==============================================================================
-# 2. BYBIT REST API HELPERS (LẤY TOÀN BỘ DANH SÁCH COIN BYBIT)
+# 2. BYBIT API DATA HELPERS
 # ==============================================================================
 BASE_URL = "https://api.bybit.com"
 
 def get_all_bybit_usdt_symbols():
-    """Tự động lấy TẤT CẢ các cặp giao dịch .USDT Futures đang niêm yết trên Bybit"""
     url = f"{BASE_URL}/v5/market/tickers?category=linear"
     try:
         res = requests.get(url, timeout=10).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             tickers = res["result"]["list"]
-            # Lấy tất cả các cặp kết thúc bằng USDT, loại bỏ token đòn bẩy hoặc Stablecoin
             symbols = [
                 t['symbol'] for t in tickers 
                 if t['symbol'].endswith('USDT') 
                 and not t['symbol'].startswith(('USDC', 'BUSD', 'DAI'))
                 and not any(x in t['symbol'] for x in ['3L', '3S', '2L', '2S'])
             ]
-            print(f"🌐 [BYBIT API] Đã lấy thành công danh sách TOÀN BỘ {len(symbols)} coin USDT!")
             return symbols
-    except Exception as e:
-        print(f"Lỗi lấy danh sách toàn bộ coin: {e}")
-    
-    # Fallback danh sách mặc định nếu nghẽn mạng
-    return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"]
+    except Exception:
+        pass
+    return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
 def get_closed_klines(symbol, interval, limit=25):
     url = f"{BASE_URL}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit}"
@@ -136,7 +129,7 @@ def get_closed_klines(symbol, interval, limit=25):
         res = requests.get(url, timeout=10).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             raw_list = res["result"]["list"]
-            closed_candles = raw_list[1:] # Bỏ nến index 0 đang chạy
+            closed_candles = raw_list[1:]
             parsed = []
             for c in reversed(closed_candles):
                 parsed.append({
@@ -152,8 +145,8 @@ def get_closed_klines(symbol, interval, limit=25):
         pass
     return []
 
-def get_open_interest_h1(symbol):
-    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime=1h&limit=3"
+def get_open_interest_change(symbol, interval_str="1h"):
+    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval_str}&limit=3"
     try:
         res = requests.get(url, timeout=10).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
@@ -185,15 +178,11 @@ def get_taker_buy_ratio(symbol):
             data = res["result"]["list"]
             if len(data) > 0:
                 buy_ratio = float(data[0].get("buyRatio", 0))
-                if buy_ratio > 0:
-                    return buy_ratio
+                if buy_ratio > 0: return buy_ratio
     except Exception:
         pass
     return None
 
-# ==============================================================================
-# 3. THUẬT TOÁN ĐIỀU KIỆN FILTER LONG LIQUIDITY SWEEP
-# ==============================================================================
 def calculate_sma_volume(candles, period=20):
     if len(candles) < period: return 0
     vols = [c['volume'] for c in candles[-period:]]
@@ -208,8 +197,69 @@ def is_sweep_and_reclaim(candles, lookback=10):
         return True, swing_low
     return False, swing_low
 
-def analyze_symbol(symbol):
-    # 1. Turnover & Adaptive Filter
+# ==============================================================================
+# 3. ANALYSIS LOGIC: H1 SQUEEZE & H4 BULLISH REJECTION
+# ==============================================================================
+
+# --- PHÂN TÍCH H4 BULLISH REJECTION (THEO ẢNH QNTUSDT) ---
+def analyze_h4_rejection(symbol):
+    h4_candles = get_closed_klines(symbol, "240", limit=25)
+    if len(h4_candles) < 21: return None
+    
+    h4_last = h4_candles[-1]
+    h4_range = h4_last['high'] - h4_last['low']
+    if h4_range == 0: return None
+    
+    # 1. Điều kiện Râu dưới H4 rút chân mạnh >= 40% range
+    h4_lower_wick = min(h4_last['open'], h4_last['close']) - h4_last['low']
+    h4_wick_ratio = h4_lower_wick / h4_range
+    if h4_wick_ratio < 0.40: return None
+    
+    # 2. Điều kiện Vị trí đóng cửa nằm trên 65% thân nến
+    h4_close_loc = (h4_last['close'] - h4_last['low']) / h4_range
+    if h4_close_loc < 0.65: return None
+    
+    # 3. Sweep Liquidity H4
+    h4_sweep, _ = is_sweep_and_reclaim(h4_candles, lookback=10)
+    if not h4_sweep: return None
+    
+    # 4. Volume H4 >= 1.5x
+    h4_avg_vol = calculate_sma_volume(h4_candles[:-1], 20)
+    h4_vol_ratio = h4_last['volume'] / h4_avg_vol if h4_avg_vol > 0 else 0
+    if h4_vol_ratio < 1.5: return None
+    
+    # 5. Open Interest H4 >= 3%
+    oi_h4_pct = get_open_interest_change(symbol, interval_str="4h")
+    if oi_h4_pct is None or oi_h4_pct < 3.0: return None
+    
+    # Tính toán Entry, SL, TP cho H4
+    entry = h4_last['close']
+    sl = h4_last['low'] * 0.995 # SL dưới chân râu nến H4
+    risk = entry - sl
+    if risk <= 0: return None
+    
+    tp1 = entry + (risk * 1.5)
+    tp2 = entry + (risk * 3.0)
+    
+    score = 92
+    signal_id = f"H4_{symbol}_{h4_last['timestamp']}"
+    
+    return {
+        'type': 'H4 REJECTION',
+        'symbol': symbol,
+        'score': score,
+        'wick_ratio': h4_wick_ratio * 100,
+        'vol_ratio': h4_vol_ratio,
+        'oi_pct': oi_h4_pct,
+        'entry': entry,
+        'sl': sl,
+        'tp1': tp1,
+        'tp2': tp2,
+        'signal_id': signal_id
+    }
+
+# --- PHÂN TÍCH H1 SQUEEZE EXPLOSION ---
+def analyze_h1_squeeze(symbol):
     turnover = get_24h_turnover(symbol)
     if turnover < MIN_TURNOVER_24H: return None
     
@@ -218,7 +268,6 @@ def analyze_symbol(symbol):
     elif 20_000_000 <= turnover < 50_000_000: required_score = 83
     else: required_score = 82
 
-    # 2. Kiểm tra H1
     h1_candles = get_closed_klines(symbol, "60", limit=25)
     if len(h1_candles) < 21: return None
     
@@ -233,73 +282,19 @@ def analyze_symbol(symbol):
     h1_sweep, _ = is_sweep_and_reclaim(h1_candles, lookback=12)
     if not h1_sweep or h1_wick_ratio < 0.35 or h1_close_loc < 0.65: return None
 
-    # 3. H1 Volume >= 1.8x
     h1_avg_vol = calculate_sma_volume(h1_candles[:-1], 20)
     h1_vol_ratio = h1_last['volume'] / h1_avg_vol if h1_avg_vol > 0 else 0
     if h1_vol_ratio < 1.8: return None
 
-    # 4. H1 Open Interest >= 2%
-    oi_change_pct = get_open_interest_h1(symbol)
+    oi_change_pct = get_open_interest_change(symbol, interval_str="1h")
     if oi_change_pct is None or oi_change_pct < 2.0: return None
 
-    # 5. H1 Taker Buy >= 55%
     taker_buy_ratio = get_taker_buy_ratio(symbol)
     if taker_buy_ratio is None:
         if REQUIRE_TAKER_BUY: return None
         taker_buy_ratio = 0.55
     elif taker_buy_ratio < 0.55: return None
 
-    # 6. H4 Confirmation
-    h4_candles = get_closed_klines(symbol, "240", limit=25)
-    if len(h4_candles) < 21: return None
-    h4_last = h4_candles[-1]
-    h4_range = h4_last['high'] - h4_last['low']
-    h4_pass = False
-    h4_vol_bonus = False
-    if h4_range > 0:
-        h4_lower_wick = min(h4_last['open'], h4_last['close']) - h4_last['low']
-        h4_sweep, _ = is_sweep_and_reclaim(h4_candles, lookback=8)
-        if h4_sweep and (h4_lower_wick / h4_range) >= 0.30 and ((h4_last['close'] - h4_last['low']) / h4_range) >= 0.60:
-            h4_pass = True
-        h4_avg_vol = calculate_sma_volume(h4_candles[:-1], 20)
-        if h4_avg_vol > 0 and (h4_last['volume'] / h4_avg_vol) >= 1.5: h4_vol_bonus = True
-
-    if not h4_pass: return None
-
-    # 7. M15 Confirmation
-    m15_candles = get_closed_klines(symbol, "15", limit=25)
-    if len(m15_candles) < 21: return None
-    m15_last = m15_candles[-1]
-    m15_prev = m15_candles[-2]
-    
-    m15_pass = False
-    if (m15_last['close'] > m15_prev['open'] and m15_prev['close'] < m15_prev['open']) or \
-       (m15_last['close'] > m15_prev['high']) or \
-       is_sweep_and_reclaim(m15_candles, lookback=5)[0]:
-        m15_pass = True
-
-    m15_avg_vol = calculate_sma_volume(m15_candles[:-1], 20)
-    m15_vol_bonus = (m15_avg_vol > 0 and (m15_last['volume'] / m15_avg_vol) >= 1.2)
-
-    if not m15_pass: return None
-
-    # 8. Score
-    score = 0
-    if h1_sweep: score += 20
-    if h1_wick_ratio >= 0.35: score += 10
-    if h1_close_loc >= 0.65: score += 5
-    if h1_vol_ratio >= 1.8: score += 15
-    if oi_change_pct >= 2.0: score += 15
-    if taker_buy_ratio >= 0.55: score += 15
-    if h4_pass: score += 5
-    if h4_vol_bonus: score += 3
-    if m15_pass: score += 7
-    if m15_vol_bonus: score += 5
-    score = min(score, 100)
-
-    if score < required_score: return None
-
-    # Entry, SL, TP (R:R >= 1.5R)
     entry_price = h1_last['close']
     sl_price = h1_last['low'] * 0.998
     risk = entry_price - sl_price
@@ -308,11 +303,12 @@ def analyze_symbol(symbol):
     tp1 = entry_price + (risk * 1.5)
     tp2 = entry_price + (risk * 2.5)
 
-    signal_id = f"{symbol}_{h1_last['timestamp']}"
+    signal_id = f"H1_{symbol}_{h1_last['timestamp']}"
 
     return {
+        'type': 'H1 SQUEEZE',
         'symbol': symbol,
-        'score': score,
+        'score': 85,
         'h1_vol_ratio': h1_vol_ratio,
         'oi_change_pct': oi_change_pct,
         'taker_buy_pct': taker_buy_ratio * 100,
@@ -324,7 +320,7 @@ def analyze_symbol(symbol):
     }
 
 # ==============================================================================
-# 4. GỬI TELEGRAM & CẬP NHẬT STT
+# 4. GỬI TELEGRAM
 # ==============================================================================
 def send_telegram_signal(sig):
     global signal_counter
@@ -332,7 +328,27 @@ def send_telegram_signal(sig):
     sig['id'] = signal_counter
     signals_history.append(sig)
 
-    msg = f"""🚀 <b>[LONG H1 SQUEEZE EXPLOSION] #{sig['id']} - {sig['symbol']}</b>
+    if sig['type'] == 'H4 REJECTION':
+        msg = f"""🐋 <b>[H4 BULLISH REJECTION] #{sig['id']} - {sig['symbol']}</b>
+-------------------------------------
+⭐️ <b>Điểm Uy Tín: {sig['score']}/100</b>
+
+🔥 <b>DẤU HIỆU CÁ MẬP GOM HÀNG KHUNG H4:</b>
+• Râu nến dưới H4: <b>{sig['wick_ratio']:.1f}% (Rút chân cực mạnh)</b>
+• Volume H4: <b>+{sig['vol_ratio']:.1f}x (Dốc đứng)</b>
+• Open Interest (OI H4): <b>+{sig['oi_pct']:.1f}% (Dòng tiền vào mạnh)</b>
+• Trạng thái: <b>Sweep Liquidity & Reclaim Cản H4</b>
+-------------------------------------
+🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG H4):</b>
+
+📍 <b>Entry:</b> {sig['entry']:.4f}
+🛑 <b>Stop Loss:</b> {sig['sl']:.4f} (Dưới râu nến H4)
+🎯 <b>Take Profit 1:</b> {sig['tp1']:.4f} (1.5R)
+🚀 <b>Take Profit 2:</b> {sig['tp2']:.4f} (3.0R)
+-------------------------------------
+👉 <b>CHUẨN BỊ CHO SÓNG TĂNG MẠNH KHUNG H4!</b>"""
+    else:
+        msg = f"""🚀 <b>[LONG H1 SQUEEZE EXPLOSION] #{sig['id']} - {sig['symbol']}</b>
 -------------------------------------
 ⭐️ <b>Điểm Uy Tín: {sig['score']}/100</b>
 
@@ -340,9 +356,8 @@ def send_telegram_signal(sig):
 • Volume H1: <b>+{sig['h1_vol_ratio']:.1f}x (Dốc đứng)</b>
 • Open Interest (OI): <b>+{sig['oi_change_pct']:.1f}% (Tiền bơm mạnh)</b>
 • Lực Mua CVD: <b>{sig['taker_buy_pct']:.1f}% (Taker Buy ép đỉnh)</b>
-• Trạng Thái: <b>Breakout Nền Tích Lũy</b>
 -------------------------------------
-🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG):</b>
+🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG H1):</b>
 
 📍 <b>Entry:</b> {sig['entry']:.4f}
 🛑 <b>Stop Loss:</b> {sig['sl']:.4f}
@@ -355,31 +370,37 @@ def send_telegram_signal(sig):
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
     try:
         requests.post(url, json=payload, timeout=10)
-        print(f"✅ Đã bắn tín hiệu Squeeze #{sig['id']} cho {sig['symbol']}")
+        print(f"✅ Đã bắn tín hiệu #{sig['id']} ({sig['type']}) cho {sig['symbol']}")
     except Exception as e:
         print(f"Lỗi gửi Telegram: {e}")
 
 # ==============================================================================
-# 5. CHU KỲ RUNNER SCAN TOÀN BỘ SÀN
+# 5. MAIN LOOP
 # ==============================================================================
 def run_radar_loop():
-    print("⚡️ Bắt đầu Radar Squeeze Explosion 24/7 (Quét TOÀN BỘ sàn Bybit)...")
+    print("⚡️ Bắt đầu Radar Quét H1 & H4 trên toàn bộ sàn Bybit...")
     while True:
-        # Lấy danh sách toàn bộ các coin niêm yết trên Bybit mỗi chu kỳ
         all_symbols = get_all_bybit_usdt_symbols()
         print(f"🔍 Đang tiến hành quét {len(all_symbols)} coin...")
         
         for symbol in all_symbols:
             try:
-                sig = analyze_symbol(symbol)
-                if sig and sig['signal_id'] not in processed_signal_ids:
-                    processed_signal_ids.add(sig['signal_id'])
-                    send_telegram_signal(sig)
-            except Exception as e:
+                # 1. Quét tín hiệu H4 Rejection trước
+                sig_h4 = analyze_h4_rejection(symbol)
+                if sig_h4 and sig_h4['signal_id'] not in processed_signal_ids:
+                    processed_signal_ids.add(sig_h4['signal_id'])
+                    send_telegram_signal(sig_h4)
+
+                # 2. Quét tín hiệu H1 Squeeze
+                sig_h1 = analyze_h1_squeeze(symbol)
+                if sig_h1 and sig_h1['signal_id'] not in processed_signal_ids:
+                    processed_signal_ids.add(sig_h1['signal_id'])
+                    send_telegram_signal(sig_h1)
+            except Exception:
                 pass
-            time.sleep(0.2) # Nghỉ nhẹ 0.2s để tránh quá tải API
+            time.sleep(0.2)
             
-        print(f"✅ Hoàn thành 1 chu kỳ quét toàn sàn. Nghỉ {COOLDOWN_SECONDS}s...")
+        print(f"✅ Hoàn thành 1 vòng quét. Nghỉ {COOLDOWN_SECONDS}s...")
         time.sleep(COOLDOWN_SECONDS)
 
 if __name__ == "__main__":

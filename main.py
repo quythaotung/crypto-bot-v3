@@ -67,7 +67,7 @@ async def subscribe_realtime_data():
                             
                             # Lọc đơn hàng > 10,000 USDT
                             trade_value = price * volume
-                            if trade_value > 100:
+                            if trade_value > -100:
                                 print(f"🔥 Lệnh lớn: {side} {symbol} - ${trade_value:,.2f}")
                                 send_telegram_signal(symbol, price, volume, side)
 

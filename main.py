@@ -378,14 +378,14 @@ def send_telegram_signal(sig):
 # 5. MAIN LOOP
 # ==============================================================================
 def run_radar_loop():
-    print("⚡️ Bắt đầu Radar Quét H1 & H4 trên toàn bộ sàn Bybit...")
+    print("⚡️ Bắt đầu Radar Quét H1 & H4 trên toàn bộ sàn Bybit...", flush=True)
     while True:
         all_symbols = get_all_bybit_usdt_symbols()
-        print(f"🔍 Đang tiến hành quét {len(all_symbols)} coin...")
+        print(f"🔍 Đang tiến hành quét {len(all_symbols)} coin...", flush=True)
         
         for symbol in all_symbols:
             try:
-                # 1. Quét tín hiệu H4 Rejection trước
+                # 1. Quét tín hiệu H4 Rejection
                 sig_h4 = analyze_h4_rejection(symbol)
                 if sig_h4 and sig_h4['signal_id'] not in processed_signal_ids:
                     processed_signal_ids.add(sig_h4['signal_id'])
@@ -400,10 +400,5 @@ def run_radar_loop():
                 pass
             time.sleep(0.2)
             
-        print(f"✅ Hoàn thành 1 vòng quét. Nghỉ {COOLDOWN_SECONDS}s...")
+        print(f"✅ Hoàn thành 1 vòng quét. Nghỉ {COOLDOWN_SECONDS}s...", flush=True)
         time.sleep(COOLDOWN_SECONDS)
-
-if __name__ == "__main__":
-    Thread(target=run_flask, daemon=True).start()
-    Thread(target=process_telegram_commands, daemon=True).start()
-    run_radar_loop()

@@ -7,10 +7,10 @@ from flask import Flask
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-DEBUG_MODE = True                  # In chi tiết lý do REJECT ra Logs
-REQUIRE_TAKER_BUY = True           # Bắt buộc Taker Buy >= 55%
-COOLDOWN_SECONDS = 300             # Giãn cách giữa các vòng quét (5 phút)
-MIN_TURNOVER_24H = 5_000_000       # Turnover tối thiểu $5M USD (Lọc coin rác)
+DEBUG_MODE = True
+REQUIRE_TAKER_BUY = True
+COOLDOWN_SECONDS = 300             # Quét 5 phút / lần
+MIN_TURNOVER_24H = 5_000_000       # Turnover >= $5M USD
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -20,13 +20,13 @@ processed_signal_ids = set()
 signal_counter = 0
 
 # ==============================================================================
-# 1. FLASK KEEP-ALIVE SERVER & TELEGRAM COMMAND LISTENER (/pnl)
+# 1. FLASK SERVER & TELEGRAM COMMAND LISTENER (/pnl)
 # ==============================================================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Squeeze Explosion Bot Active 24/7!"
+    return "Bybit Multi-Strategy Bot Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -198,8 +198,70 @@ def is_sweep_and_reclaim(candles, lookback=10):
     return False, swing_low
 
 # ==============================================================================
-# 3. ANALYSIS LOGIC (H1 & H4)
+# 3. STRATEGY ANALYSIS
 # ==============================================================================
+
+# --- STRATEGY 1: H1 CONTINUATION BREAKOUT (BẮT CÁC KÈO ĐI NGANG BƠM THẲNG NHƯ SEIUSDT) ---
+def analyze_continuation_breakout(symbol):
+    turnover = get_24h_turnover(symbol)
+    if turnover < MIN_TURNOVER_24H: return None
+    
+    h1_candles = get_closed_klines(symbol, "60", limit=25)
+    if len(h1_candles) < 21: return None
+    
+    h1_last = h1_candles[-1]
+    h1_prev = h1_candles[-2]
+    h1_range = h1_last['high'] - h1_last['low']
+    if h1_range == 0: return None
+    
+    # 1. Đáy sau cao hơn hoặc bằng đáy trước (Higher Low / Consolidation)
+    if h1_last['low'] < h1_prev['low'] * 0.998: return None
+    
+    # 2. Lực đóng cửa nến nằm sát đỉnh (>= 70% range)
+    close_loc = (h1_last['close'] - h1_last['low']) / h1_range
+    if close_loc < 0.70: return None
+    
+    # 3. Volume tăng đột biến (>= 1.5x)
+    h1_avg_vol = calculate_sma_volume(h1_candles[:-1], 20)
+    vol_ratio = h1_last['volume'] / h1_avg_vol if h1_avg_vol > 0 else 0
+    if vol_ratio < 1.5: return None
+    
+    # 4. OI tăng vọt cực mạnh (>= +3.5%) - Điều kiện sống còn của Continuation
+    oi_pct = get_open_interest_change(symbol, interval_str="1h")
+    if oi_pct is None or oi_pct < 3.5: return None
+    
+    # 5. Taker Buy mạnh (>= 58%)
+    taker_buy = get_taker_buy_ratio(symbol)
+    if taker_buy is None:
+        if REQUIRE_TAKER_BUY: return None
+        taker_buy = 0.58
+    elif taker_buy < 0.58: return None
+    
+    entry = h1_last['close']
+    sl = h1_last['low'] * 0.995 # SL sát dưới đáy nến tích lũy
+    risk = entry - sl
+    if risk <= 0: return None
+    
+    tp1 = entry + (risk * 1.5)
+    tp2 = entry + (risk * 2.8)
+    
+    signal_id = f"H1CONT_{symbol}_{h1_last['timestamp']}"
+    
+    return {
+        'type': 'H1 CONTINUATION',
+        'symbol': symbol,
+        'score': 88,
+        'vol_ratio': vol_ratio,
+        'oi_pct': oi_pct,
+        'taker_buy_pct': taker_buy * 100,
+        'entry': entry,
+        'sl': sl,
+        'tp1': tp1,
+        'tp2': tp2,
+        'signal_id': signal_id
+    }
+
+# --- STRATEGY 2: H4 BULLISH REJECTION ---
 def analyze_h4_rejection(symbol):
     h4_candles = get_closed_klines(symbol, "240", limit=25)
     if len(h4_candles) < 21: return None
@@ -249,6 +311,7 @@ def analyze_h4_rejection(symbol):
         'signal_id': signal_id
     }
 
+# --- STRATEGY 3: H1 LIQUIDITY SWEEP SQUEEZE ---
 def analyze_h1_squeeze(symbol):
     turnover = get_24h_turnover(symbol)
     if turnover < MIN_TURNOVER_24H: return None
@@ -299,8 +362,8 @@ def analyze_h1_squeeze(symbol):
         'type': 'H1 SQUEEZE',
         'symbol': symbol,
         'score': 85,
-        'h1_vol_ratio': h1_vol_ratio,
-        'oi_change_pct': oi_change_pct,
+        'vol_ratio': h1_vol_ratio,
+        'oi_pct': oi_change_pct,
         'taker_buy_pct': taker_buy_ratio * 100,
         'entry': entry_price,
         'sl': sl_price,
@@ -310,7 +373,7 @@ def analyze_h1_squeeze(symbol):
     }
 
 # ==============================================================================
-# 4. TELEGRAM ALERT
+# 4. TELEGRAM ALERT FORMATTER
 # ==============================================================================
 def send_telegram_signal(sig):
     global signal_counter
@@ -318,7 +381,26 @@ def send_telegram_signal(sig):
     sig['id'] = signal_counter
     signals_history.append(sig)
 
-    if sig['type'] == 'H4 REJECTION':
+    if sig['type'] == 'H1 CONTINUATION':
+        msg = f"""🚀 <b>[LONG H1 CONTINUATION BREAKOUT] #{sig['id']} - {sig['symbol']}</b>
+-------------------------------------
+⭐️ <b>Điểm Uy Tín: {sig['score']}/100</b>
+
+🔥 <b>TÍN HIỆU CÁ MẬP BƠM THẲNG (BREAKOUT NỀN):</b>
+• Dạng cấu trúc: <b>Tích lũy nâng đáy (Higher Low)</b>
+• Open Interest (OI): <b>+{sig['oi_pct']:.1f}% (Bơm tiền cực mạnh)</b>
+• Volume H1: <b>+{sig['vol_ratio']:.1f}x (Bùng nổ)</b>
+• Lực Mua CVD: <b>{sig['taker_buy_pct']:.1f}% (Taker Buy ăn giá)</b>
+-------------------------------------
+🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG BREAKOUT):</b>
+
+📍 <b>Entry:</b> {sig['entry']:.4f}
+🛑 <b>Stop Loss:</b> {sig['sl']:.4f} (Dưới đáy nến H1 tích lũy)
+🎯 <b>Take Profit 1:</b> {sig['tp1']:.4f} (1.5R)
+🚀 <b>Take Profit 2:</b> {sig['tp2']:.4f} (2.8R)
+-------------------------------------
+👉 <b>BẮT SÓNG ĐỦNG ĐỈNH BREAKOUT CONTINUATION!</b>"""
+    elif sig['type'] == 'H4 REJECTION':
         msg = f"""🐋 <b>[H4 BULLISH REJECTION] #{sig['id']} - {sig['symbol']}</b>
 -------------------------------------
 ⭐️ <b>Điểm Uy Tín: {sig['score']}/100</b>
@@ -332,9 +414,9 @@ def send_telegram_signal(sig):
 🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG H4):</b>
 
 📍 <b>Entry:</b> {sig['entry']:.4f}
-🛑 <b>Stop Loss:</b> {sig['sl']:.4f} (Dưới râu nến H4)
-🎯 <b>Take Profit 1:</b> {sig['tp1']:.4f} (1.5R)
-🚀 <b>Take Profit 2:</b> {sig['tp2']:.4f} (3.0R)
+🛑 <b>Stop Loss:</b> {sig['sl']:.4f}
+🎯 <b>Take Profit 1:</b> {sig['tp1']:.4f}
+🚀 <b>Take Profit 2:</b> {sig['tp2']:.4f}
 -------------------------------------
 👉 <b>CHUẨN BỊ CHO SÓNG TĂNG MẠNH KHUNG H4!</b>"""
     else:
@@ -343,8 +425,8 @@ def send_telegram_signal(sig):
 ⭐️ <b>Điểm Uy Tín: {sig['score']}/100</b>
 
 🔥 <b>DẤU HIỆU CÁ MẬP GOM SPOT & SHORT SQUEEZE:</b>
-• Volume H1: <b>+{sig['h1_vol_ratio']:.1f}x (Dốc đứng)</b>
-• Open Interest (OI): <b>+{sig['oi_change_pct']:.1f}% (Tiền bơm mạnh)</b>
+• Volume H1: <b>+{sig['vol_ratio']:.1f}x (Dốc đứng)</b>
+• Open Interest (OI): <b>+{sig['oi_pct']:.1f}% (Tiền bơm mạnh)</b>
 • Lực Mua CVD: <b>{sig['taker_buy_pct']:.1f}% (Taker Buy ép đỉnh)</b>
 -------------------------------------
 🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG H1):</b>
@@ -375,11 +457,19 @@ def run_radar_loop():
         
         for symbol in all_symbols:
             try:
+                # 1. Quét H1 Continuation Breakout (Ưu tiên bắt kèo nâng đáy bơm tiền)
+                sig_cont = analyze_continuation_breakout(symbol)
+                if sig_cont and sig_cont['signal_id'] not in processed_signal_ids:
+                    processed_signal_ids.add(sig_cont['signal_id'])
+                    send_telegram_signal(sig_cont)
+
+                # 2. Quét H4 Rejection
                 sig_h4 = analyze_h4_rejection(symbol)
                 if sig_h4 and sig_h4['signal_id'] not in processed_signal_ids:
                     processed_signal_ids.add(sig_h4['signal_id'])
                     send_telegram_signal(sig_h4)
 
+                # 3. Quét H1 Sweep Squeeze
                 sig_h1 = analyze_h1_squeeze(symbol)
                 if sig_h1 and sig_h1['signal_id'] not in processed_signal_ids:
                     processed_signal_ids.add(sig_h1['signal_id'])

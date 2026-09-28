@@ -16,6 +16,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 signals_history = []
+active_signals = []                # Danh sách các lệnh đang chạy để theo dõi TP/SL
 processed_signal_ids = set()
 signal_counter = 0
 
@@ -26,7 +27,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Structural SL/TP Accumulation Bot Active 24/7!"
+    return "Bybit Structural SL/TP Tracking Bot Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -64,7 +65,7 @@ def send_pnl_summary():
     if not signals_history:
         msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\nChưa có lệnh nào được phát ra từ khi khởi động."
     else:
-        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH (STRUCTURAL SL/TP):</b>\n-------------------------------------\n"
+        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH REAL-TIME:</b>\n-------------------------------------\n"
         total_pnl_pct = 0.0
         
         for sig in signals_history:
@@ -73,23 +74,14 @@ def send_pnl_summary():
                 curr_price = sig['entry_mid']
                 
             pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
+            status = sig.get('status_text', '⏳ Đang theo dõi')
             
-            status = "⏳ Đang chạy"
-            if curr_price >= sig['tp2_mid']:
-                status = "🚀 Hit TP2 Zone"
-                pnl_pct = ((sig['tp2_mid'] - sig['entry_mid']) / sig['entry_mid']) * 100
-            elif curr_price >= sig['tp1_mid']:
-                status = "🎯 Hit TP1 Zone"
-            elif curr_price <= sig['sl']:
-                status = "🛑 Hit SL (Structural Invalidation)"
-                pnl_pct = ((sig['sl'] - sig['entry_mid']) / sig['entry_mid']) * 100
-                
-            total_pnl_pct += pnl_pct
             icon = "🟢" if pnl_pct >= 0 else "🔴"
             
-            msg += f"<b>#{sig['id']} [{sig['setup_name']}] {sig['symbol']}</b> | Entry: {sig['entry_mid']:.4f}\n"
+            msg += f"<b>#{sig['id']} [{sig['status_label']}] {sig['symbol']}</b> | Entry: {sig['entry_mid']:.4f}\n"
             msg += f"• Giá hiện tại: {curr_price:.4f} ({icon} {pnl_pct:+.2f}%)\n"
-            msg += f"• Score: {sig['total_score']}/100 | Status: <b>{status}</b>\n-------------------------------------\n"
+            msg += f"• Trạng thái: <b>{status}</b>\n-------------------------------------\n"
+            total_pnl_pct += pnl_pct
             
         total_icon = "🔥" if total_pnl_pct >= 0 else "🔻"
         msg += f"<b>TỔNG PnL TÍCH LŨY: {total_icon} {total_pnl_pct:+.2f}%</b>"
@@ -102,7 +94,98 @@ def send_pnl_summary():
         print(f"Lỗi gửi PnL: {e}", flush=True)
 
 # ==============================================================================
-# 2. BYBIT REST API & INDICATORS HELPERS
+# 2. TIẾN TRÌNH THEO DÕI GIÁ REAL-TIME BÁO CHẠM TP / HỦY SL
+# ==============================================================================
+def process_active_signals_tracker():
+    """Kiểm tra giá liên tục 10s/lần để phát thông báo TP/SL chuẩn xác"""
+    while True:
+        try:
+            for sig in list(active_signals):
+                curr_price = get_current_price(sig['symbol'])
+                if not curr_price:
+                    continue
+
+                # 1. KIỂM TRA CHẠM TP1 ZONE
+                if not sig['hit_tp1'] and curr_price >= sig['tp1_low']:
+                    sig['hit_tp1'] = True
+                    sig['status_text'] = "🎯 Hit TP1 Zone (Đã hủy bảo vệ SL)"
+                    pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
+                    
+                    msg = f"""🎯 <b>[CẢNH BÁO CHẠM TP1 ZONE] #{sig['id']} - {sig['symbol']}</b>
+-------------------------------------
+📍 Entry Mid: <b>{sig['entry_mid']:.4f}</b>
+🎯 Giá Hiện Tại: <b>{curr_price:.4f} (+{pnl_pct:.2f}%)</b>
+🎯 Vùng TP1 Zone: <b>{sig['tp1_low']:.4f} – {sig['tp1_high']:.4f}</b>
+-------------------------------------
+✅ <b>ĐÃ CẢN TP1 THÀNH CÔNG!</b>
+🛡 <b>Hệ thống tự động HỦY thông báo SL đối với lệnh này. Bạn có thể dời SL về Breakeven (Hoà vốn) để gồng TP2/TP3!</b>"""
+                    
+                    send_telegram_notification(msg)
+
+                # 2. KIỂM TRA CHẠM TP2 ZONE
+                elif sig['hit_tp1'] and not sig['hit_tp2'] and curr_price >= sig['tp2_low']:
+                    sig['hit_tp2'] = True
+                    sig['status_text'] = "🚀 Hit TP2 Zone (Chốt lời thành công)"
+                    pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
+                    
+                    msg = f"""🚀 <b>[CẢNH BÁO CHẠM TP2 ZONE] #{sig['id']} - {sig['symbol']}</b>
+-------------------------------------
+📍 Entry Mid: <b>{sig['entry_mid']:.4f}</b>
+🚀 Giá Hiện Tại: <b>{curr_price:.4f} (+{pnl_pct:.2f}%)</b>
+🚀 Vùng TP2 Zone: <b>{sig['tp2_low']:.4f} – {sig['tp2_high']:.4f}</b>
+-------------------------------------
+🔥 <b>ĐÃ CHẠM VÙNG SWING HIGH CŨ! KHUYẾN NGHỊ CHỐN LỜI HOẶC CHỈ GIỮ LẠI TỶ TRỌNG NHỎ!</b>"""
+                    
+                    send_telegram_notification(msg)
+                    if not sig['tp3_zone']:
+                        active_signals.remove(sig) # Đóng theo dõi nếu không có TP3
+
+                # 3. KIỂM TRA CHẠM TP3 ZONE (NẾU CÓ)
+                elif sig['hit_tp2'] and sig['tp3_zone'] and curr_price >= sig['tp3_zone'][0]:
+                    sig['status_text'] = "🔥 Hit TP3 Zone (Full Target Expansion)"
+                    pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
+                    
+                    msg = f"""🔥 <b>[CẢNH BÁO CHẠM TP3 ZONE - MEGAPUMP] #{sig['id']} - {sig['symbol']}</b>
+-------------------------------------
+📍 Entry Mid: <b>{sig['entry_mid']:.4f}</b>
+🔥 Giá Hiện Tại: <b>{curr_price:.4f} (+{pnl_pct:.2f}%)</b>
+🔥 Vùng TP3 Zone: <b>{sig['tp3_zone'][0]:.4f} – {sig['tp3_zone'][1]:.4f}</b>
+-------------------------------------
+🏆 <b>HOÀN THÀNH TOÀN BỘ MỤC TIÊU SÓNG TĂNG KỲ VỌNG!</b>"""
+                    
+                    send_telegram_notification(msg)
+                    active_signals.remove(sig) # Đóng theo dõi
+
+                # 4. KIỂM TRA HIT SL (CHỈ BÁO KHI CHƯA CẢN TP1)
+                elif not sig['hit_tp1'] and curr_price <= sig['sl']:
+                    sig['status_text'] = "🛑 Hit SL (Structural Invalidation)"
+                    pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
+                    
+                    msg = f"""🛑 <b>[CẢNH BÁO HIT SL STRUCTURAL] #{sig['id']} - {sig['symbol']}</b>
+-------------------------------------
+📍 Entry Mid: <b>{sig['entry_mid']:.4f}</b>
+🛑 Giá Hiện Tại: <b>{curr_price:.4f} ({pnl_pct:.2f}%)</b>
+🛑 Mốc SL Cấu Trúc: <b>{sig['sl']:.4f}</b>
+-------------------------------------
+⚠️ <b>CẤU TRÚC TÍCH LŨY BỊ VI PHẠM (INVALIDATION). DỪNG LỆNH ĐỂ BẢO VỆ VỐN!</b>"""
+                    
+                    send_telegram_notification(msg)
+                    active_signals.remove(sig) # Đóng theo dõi
+        except Exception as e:
+            print(f"Lỗi theo dõi Tracker: {e}", flush=True)
+        
+        time.sleep(10) # Lặp lại kiểm tra mỗi 10 giây
+
+def send_telegram_notification(msg):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Lỗi gửi thông báo Tracker: {e}", flush=True)
+
+# ==============================================================================
+# 3. BYBIT REST API & INDICATORS HELPERS
 # ==============================================================================
 BASE_URL = "https://api.bybit.com"
 
@@ -216,7 +299,7 @@ def calculate_sma_volume(candles, period=20):
     return sum(vols) / period
 
 # ==============================================================================
-# 3. THIẾT LẬP CẤU TRÚC: SUPPORT ZONE, SL KỸ THUẬT VÀ TP ZONES THỰC TẾ
+# 4. THIẾT LẬP CẤU TRÚC: SUPPORT ZONE, SL KỸ THUẬT VÀ TP ZONES THỰC TẾ
 # ==============================================================================
 
 def find_support_zone(h1_candles):
@@ -230,21 +313,12 @@ def find_support_zone(h1_candles):
     return supp_low, supp_high, touch_count
 
 def find_structural_sl_and_tp(h1_candles, supp_low, curr_price):
-    """
-    XÁC ĐỊNH SL VÀ TP DỰA HOÀN TOÀN TRÊN CẤU TRÚC KỸ THUẬT CHART:
-    1. SL: Structural Low (Liquidity Sweep / Swing Low / Supp Low) - ATR Buffer
-    2. TP1 Zone: H1 Resistance gần nhất
-    3. TP2 Zone: H1/H4 Swing High lớn hơn
-    4. TP3 Zone: Structural Expansion (Measured Move) nếu có khoảng trống
-    """
     h1_atr = calculate_h1_atr(h1_candles, 14)
     buffer = h1_atr * 0.2 if h1_atr > 0 else supp_low * 0.003
 
-    # --- 1. DỰA CẤU TRÚC TÌM STRUCTURAL LOW CHO SL ---
     recent_lows = [c['low'] for c in h1_candles[-15:]]
     sweep_low = min(recent_lows)
     
-    # Thứ tự ưu tiên cấu trúc: Liquidity Sweep Low -> Swing Low H1 -> Support Low
     if sweep_low < supp_low:
         structural_low = sweep_low
         sl_reason = "Dưới Liquidity Sweep Low H1"
@@ -254,8 +328,6 @@ def find_structural_sl_and_tp(h1_candles, supp_low, curr_price):
 
     sl_price = structural_low - buffer
 
-    # --- 2. TÌM KHÁNG CỰ CHO TP1 ZONE ---
-    # Lấy các đỉnh H1 Swing High trong 20 nến gần nhất
     recent_highs = [c['high'] for c in h1_candles[-20:] if c['high'] > curr_price]
     if recent_highs:
         tp1_base = min(recent_highs)
@@ -266,7 +338,6 @@ def find_structural_sl_and_tp(h1_candles, supp_low, curr_price):
     tp1_high = tp1_base * 1.002
     tp1_mid = (tp1_low + tp1_high) / 2
 
-    # --- 3. TÌM SWING HIGH CŨ CHO TP2 ZONE ---
     all_highs = [c['high'] for c in h1_candles[-45:] if c['high'] > tp1_high]
     if all_highs:
         tp2_base = max(all_highs)
@@ -277,7 +348,6 @@ def find_structural_sl_and_tp(h1_candles, supp_low, curr_price):
     tp2_high = tp2_base * 1.003
     tp2_mid = (tp2_low + tp2_high) / 2
 
-    # --- 4. TÌM STRUCTURAL EXPANSION CHO TP3 ZONE (MEASURED MOVE) ---
     range_height = tp2_base - supp_low
     if range_height > 0 and (tp2_base - curr_price) >= (curr_price - sl_price) * 1.5:
         tp3_base = tp2_base + (range_height * 0.618)
@@ -285,7 +355,7 @@ def find_structural_sl_and_tp(h1_candles, supp_low, curr_price):
         tp3_high = tp3_base * 1.005
         tp3_zone = (tp3_low, tp3_high)
     else:
-        tp3_zone = None # Không tạo TP3 giả nếu phía trên không có cấu trúc / khoảng trống đủ rộng
+        tp3_zone = None
 
     return sl_price, sl_reason, (tp1_low, tp1_high, tp1_mid), (tp2_low, tp2_high, tp2_mid), tp3_zone
 
@@ -299,51 +369,42 @@ def evaluate_accumulation_reclaim(symbol, h1_candles, h4_candles, btc_h1_candles
     last = h1_candles[-1]
     curr_price = last['close']
 
-    # Kiểm tra giá nằm trong hoặc sát Support Zone <= 2.0%
     dist_to_supp = (curr_price - supp_high) / supp_high if curr_price >= supp_high else 0.0
     if dist_to_supp > 0.020 or curr_price < supp_low * 0.993:
         return None
 
-    # --- CHẤM ĐIỂM THANG 100 ĐIỂM ---
     score_support = 20 if touch_count >= 2 else 12
 
-    # Accumulation / Compression
     range_last = last['high'] - last['low']
     range_avg = sum(c['high'] - c['low'] for c in h1_candles[-10:-1]) / 9
     is_compressed = range_last <= range_avg * 1.1
     higher_low = last['low'] >= min(c['low'] for c in h1_candles[-4:-1])
     score_accum = (8 if is_compressed else 0) + (7 if higher_low else 0)
 
-    # Price Action / Reclaim
     h1_range = last['high'] - last['low']
     wick_ratio = (min(last['open'], last['close']) - last['low']) / h1_range if h1_range > 0 else 0
     is_sweep = last['low'] < supp_low and last['close'] > supp_low
     score_pa = 15 if is_sweep else (12 if wick_ratio >= 0.35 else (10 if curr_price >= supp_high else 6))
 
-    # OI Structure
     oi_series = get_open_interest_series(symbol, "1h")
     if len(oi_series) >= 3:
         oi_prev2, oi_prev1, oi_curr = oi_series[-3], oi_series[-2], oi_series[-1]
         score_oi = 15 if (oi_curr > oi_prev1 and oi_prev1 >= oi_prev2 * 0.99) else (10 if oi_curr >= oi_prev1 else 5)
     else: score_oi = 8
 
-    # CVD Structure
     taker_series = get_taker_buy_series(symbol)
     if len(taker_series) >= 2:
         score_cvd = 10 if (taker_series[-1] > taker_series[-2] and taker_series[-1] >= 50.0) else (7 if taker_series[-1] >= 50.0 else 4)
     else: score_cvd = 6
 
-    # Volume
     avg_vol_20 = calculate_sma_volume(h1_candles[:-1], 20)
     vol_ratio = last['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
     score_vol = 10 if 1.2 <= vol_ratio <= 2.2 else (7 if vol_ratio < 1.0 else 5)
 
-    # RSI (35–55)
     rsi_vals = calculate_rsi(h1_candles, 14)
     curr_rsi = rsi_vals[-1] if rsi_vals else 50.0
     score_rsi = 5 if 35.0 <= curr_rsi <= 55.0 else (3 if curr_rsi < 35 else 2)
 
-    # Relative Strength & BTC Regime
     sym_chg_6h = (h1_candles[-1]['close'] - h1_candles[-6]['close']) / h1_candles[-6]['close']
     btc_chg_6h = (btc_h1_candles[-1]['close'] - btc_h1_candles[-6]['close']) / btc_h1_candles[-6]['close'] if btc_h1_candles else 0.0
     score_rs = 5 if sym_chg_6h >= btc_chg_6h else 2
@@ -355,7 +416,6 @@ def evaluate_accumulation_reclaim(symbol, h1_candles, h4_candles, btc_h1_candles
     if total_score < 70:
         return None
 
-    # TÍNH XÁC ĐỊNH SL VÀ TP ZONES KỸ THUẬT
     entry_low = supp_low
     entry_high = min(curr_price, supp_high * 1.008)
     entry_mid = (entry_low + entry_high) / 2
@@ -365,7 +425,6 @@ def evaluate_accumulation_reclaim(symbol, h1_candles, h4_candles, btc_h1_candles
     risk = entry_mid - sl
     if risk <= 0: return None
 
-    # TÍNH R:R HIỂN THỊ THAM KHẢO (KHÔNG ÉP VỊ TRÍ SL/TP)
     rr_tp1 = (tp1_data[2] - entry_mid) / risk
     rr_tp2 = (tp2_data[2] - entry_mid) / risk
 
@@ -391,19 +450,22 @@ def evaluate_accumulation_reclaim(symbol, h1_candles, h4_candles, btc_h1_candles
         'rr_tp1': rr_tp1,
         'rr_tp2': rr_tp2,
         'risk_pct': (risk / entry_mid) * 100,
+        'hit_tp1': False,
+        'hit_tp2': False,
+        'status_text': '⏳ Đang theo dõi real-time',
         'signal_id': f"ACCUM_{symbol}_{last['timestamp']}"
     }
 
 # ==============================================================================
-# 4. FORMATTER TELEGRAM chuẩn KẾ HOẠCH KỸ THUẬT
+# 5. FORMATTER TELEGRAM & PHÁT TÍN HIỆU CƠ BẢN
 # ==============================================================================
 def send_telegram_signal(sig):
     global signal_counter
     signal_counter += 1
     sig['id'] = signal_counter
     signals_history.append(sig)
+    active_signals.append(sig) # Thêm vào danh sách theo dõi TP/SL real-time
 
-    # Format TP3 Zone nếu có cấu trúc
     tp3_str = ""
     if sig['tp3_zone']:
         tp3_str = f"\n🔥 <b>TP3 Zone:</b>\n{sig['tp3_zone'][0]:.4f} – {sig['tp3_zone'][1]:.4f}\n(Major Resistance / Expansion)\n"
@@ -437,7 +499,7 @@ def send_telegram_signal(sig):
 📐 <b>R:R Tham Khảo:</b>
 TP1: 1:{sig['rr_tp1']:.2f} | TP2: 1:{sig['rr_tp2']:.2f}
 -------------------------------------
-👉 <b>SL/TP XÁC ĐỊNH THEO CẤU TRÚC CHART REAL-TIME!</b>"""
+👉 <b>ĐÃ BẬT THEO DÕI TP/SL REAL-TIME 24/7!</b>"""
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
@@ -448,10 +510,10 @@ TP1: 1:{sig['rr_tp1']:.2f} | TP2: 1:{sig['rr_tp2']:.2f}
         print(f"Lỗi gửi Telegram: {e}", flush=True)
 
 # ==============================================================================
-# 5. MAIN LOOP RUNNER CHỐNG SPAM (TOP 4 COIN/VÒNG QUÉT)
+# 6. MAIN LOOP RUNNER
 # ==============================================================================
 def run_radar_loop():
-    print("⚡️ Bắt đầu Radar Structural SL/TP Accumulation Base (Top 4 Coin)...", flush=True)
+    print("⚡️ Bắt đầu Radar Structural SL/TP Tracking Bot (Top 4 Coin)...", flush=True)
     while True:
         btc_h1 = get_closed_klines("BTCUSDT", "60", limit=50)
         all_symbols = get_all_bybit_usdt_symbols()
@@ -470,7 +532,6 @@ def run_radar_loop():
                 pass
             time.sleep(0.12)
 
-        # LỌC TOP 4 COIN ĐIỂM CAO NHẤT ĐỂ BẮN CẢNH BÁO
         if candidates:
             candidates.sort(key=lambda x: (x['total_score'], x['oi_pct'], x['vol_ratio']), reverse=True)
             top_candidates = candidates[:MAX_ALERTS_PER_CYCLE]
@@ -485,4 +546,5 @@ def run_radar_loop():
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
     Thread(target=process_telegram_commands, daemon=True).start()
+    Thread(target=process_active_signals_tracker, daemon=True).start() # Tiến trình quét TP/SL Real-time 10s/lần
     run_radar_loop()

@@ -10,7 +10,7 @@ from flask import Flask
 DEBUG_MODE = True                  # In log chi tiết ra Render
 COOLDOWN_SECONDS = 300             # Giãn cách giữa các vòng quét toàn sàn (5 phút)
 MIN_TURNOVER_24H = 5_000_000       # Turnover 24h tối thiểu $5M USD
-MAX_ALERTS_PER_CYCLE = 4           # Tối đa gửi Top 4 coin đẹp nhất mỗi vòng quét
+MAX_ALERTS_PER_CYCLE = 4           # Tối đa gửi Top 4 coin điểm cao nhất mỗi vòng quét
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -26,7 +26,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Accumulation Base & Squeeze Bot Active 24/7!"
+    return "Bybit Long H1 Pre-Pump Base Engine Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -64,7 +64,7 @@ def send_pnl_summary():
     if not signals_history:
         msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\nChưa có lệnh nào được phát ra từ khi khởi động."
     else:
-        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH:</b>\n-------------------------------------\n"
+        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH (PRE-PUMP BASE):</b>\n-------------------------------------\n"
         total_pnl_pct = 0.0
         
         for sig in signals_history:
@@ -87,9 +87,9 @@ def send_pnl_summary():
             total_pnl_pct += pnl_pct
             icon = "🟢" if pnl_pct >= 0 else "🔴"
             
-            msg += f"<b>#{sig['id']} [{sig['setup_type_tag']}] {sig['symbol']}</b> | Entry: {sig['entry_mid']:.4f}\n"
+            msg += f"<b>#{sig['id']} [{sig['label']}] {sig['symbol']}</b> | Entry: {sig['entry_mid']:.4f}\n"
             msg += f"• Giá hiện tại: {curr_price:.4f} ({icon} {pnl_pct:+.2f}%)\n"
-            msg += f"• Score: {sig['total_score']}/100 | Status: <b>{status}</b>\n-------------------------------------\n"
+            msg += f"• Total Score: {sig['total_score']}/100 | Status: <b>{status}</b>\n-------------------------------------\n"
             
         total_icon = "🔥" if total_pnl_pct >= 0 else "🔻"
         msg += f"<b>TỔNG PnL TÍCH LŨY: {total_icon} {total_pnl_pct:+.2f}%</b>"
@@ -186,20 +186,17 @@ def calculate_m15_atr(symbol, period=14):
         tr_list.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
     return sum(tr_list[-period:]) / period if tr_list else 0.0
 
-def get_open_interest_data(symbol, interval_str="1h"):
-    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval_str}&limit=3"
+def get_open_interest_series(symbol, interval_str="1h"):
+    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval_str}&limit=5"
     try:
         res = requests.get(url, timeout=10).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             oi_list = res["result"]["list"]
-            if len(oi_list) >= 2:
-                curr_oi = float(oi_list[0]["openInterest"])
-                prev_oi = float(oi_list[1]["openInterest"])
-                pct = ((curr_oi - prev_oi) / prev_oi) * 100 if prev_oi > 0 else 0
-                return curr_oi, prev_oi, pct
+            if len(oi_list) >= 3:
+                return [float(x["openInterest"]) for x in reversed(oi_list)]
     except Exception:
         pass
-    return None, None, 0.0
+    return []
 
 def get_24h_turnover(symbol):
     url = f"{BASE_URL}/v5/market/tickers?category=linear&symbol={symbol}"
@@ -211,19 +208,17 @@ def get_24h_turnover(symbol):
         pass
     return 0
 
-def get_taker_buy_data(symbol):
-    url = f"{BASE_URL}/v5/market/account-ratio?category=linear&symbol={symbol}&period=1h&limit=3"
+def get_taker_buy_series(symbol):
+    url = f"{BASE_URL}/v5/market/account-ratio?category=linear&symbol={symbol}&period=1h&limit=4"
     try:
         res = requests.get(url, timeout=10).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             data = res["result"]["list"]
-            if len(data) >= 2:
-                curr_buy = float(data[0].get("buyRatio", 0))
-                prev_buy = float(data[1].get("buyRatio", 0))
-                return curr_buy, prev_buy
+            if len(data) >= 3:
+                return [float(x.get("buyRatio", 0.5)) * 100 for x in reversed(data)]
     except Exception:
         pass
-    return None, None
+    return []
 
 def calculate_sma_volume(candles, period=20):
     if len(candles) < period: return 0
@@ -231,111 +226,126 @@ def calculate_sma_volume(candles, period=20):
     return sum(vols) / period
 
 # ==============================================================================
-# 3. THIẾT LẬP SUPPORT ZONE & SETUP LONG A (ACCUMULATION BASE)
+# 3. CORE STRATEGY: LONG H1 PRE-PUMP BASE (SCORE 100)
 # ==============================================================================
 
-def find_support_zone(h1_candles, h4_candles):
-    """
-    Xác định Support Zone dựa trên:
-    - Swing Lows gần đây (ít nhất 2 lần phản ứng)
-    - Breakout base / Kháng cự cũ bị vượt
-    """
+def find_support_zone(h1_candles):
     if len(h1_candles) < 25: return None, None, 0
-    
     recent_lows = [c['low'] for c in h1_candles[-20:]]
     recent_lows.sort()
     
-    # Lấy vùng hỗ trợ từ cụm giá thấp gần nhất
     supp_low = recent_lows[0]
-    supp_high = recent_lows[3] # Tự động tạo dải hỗ trợ (Support Zone)
+    supp_high = recent_lows[3]
     
-    # Kiểm tra số lần phản ứng tại vùng này
-    touch_count = sum(1 for c in h1_candles[-25:] if supp_low * 0.998 <= c['low'] <= supp_high * 1.005)
-    
+    # Đếm số lần giá phản ứng quanh vùng Hỗ trợ
+    touch_count = sum(1 for c in h1_candles[-25:] if supp_low * 0.997 <= c['low'] <= supp_high * 1.008)
     return supp_low, supp_high, touch_count
 
-def evaluate_long_a_accumulation(symbol, h1_candles, h4_candles, btc_h1_candles):
-    """
-    SETUP LONG A — H1 ACCUMULATION BASE / SUPPORT RECLAIM
-    Thang điểm 100 điểm:
-    - Support Structure: 20đ
-    - Price Action / Reclaim: 20đ
-    - Volume: 10đ
-    - OI: 15đ
-    - CVD: 10đ
-    - RSI: 10đ
-    - Relative Strength: 10đ
-    - BTC Regime: 5đ
-    """
-    supp_low, supp_high, touch_count = find_support_zone(h1_candles, h4_candles)
-    if not supp_low or touch_count < 1:
-        return None
+def evaluate_prepump_base(symbol, h1_candles, h4_candles, btc_h1_candles):
+    if get_24h_turnover(symbol) < MIN_TURNOVER_24H: return None
+    if len(h1_candles) < 35 or len(h4_candles) < 35: return None
+
+    supp_low, supp_high, touch_count = find_support_zone(h1_candles)
+    if not supp_low or touch_count < 1: return None
 
     last = h1_candles[-1]
     curr_price = last['close']
-    
-    # 1. GIÁ PHẢI Ở GẦN SUPPORT (Distance <= 2.0%)
-    dist_to_supp = (curr_price - supp_high) / supp_high
-    if dist_to_supp > 0.020 or curr_price < supp_low * 0.995:
-        return None # Loại nếu quá xa hoặc thủng hỗ trợ mạnh
 
-    # --- TÍNH TOÁN BỘ ĐIỂM 100 ĐIỂM ---
-    score_support_struct = 20 if touch_count >= 2 else 12
+    # 1. BẮT BUỘC: GIÁ ĐANG Ở GẦN VÙNG NỀN HỖ TRỢ (Distance <= 2.0%)
+    dist_to_supp = (curr_price - supp_high) / supp_high if curr_price >= supp_high else 0.0
+    if dist_to_supp > 0.020 or curr_price < supp_low * 0.993:
+        return None # Đã pump quá xa khỏi Support Zone hoặc sập gãy hỗ trợ
+
+    # --- CHẤM ĐIỂM THANG 100 ĐIỂM ---
+
+    # 1. Support Structure (Max 20đ)
+    score_support = 20 if touch_count >= 2 else 12
+
+    # 2. Accumulation / Compression (Max 15đ)
+    # Biên độ dao động nén thu hẹp + Không liên tục tạo Lower Low
+    range_last = last['high'] - last['low']
+    range_avg = sum(c['high'] - c['low'] for c in h1_candles[-10:-1]) / 9
+    is_compressed = range_last <= range_avg * 1.1
+    higher_low = last['low'] >= min(c['low'] for c in h1_candles[-4:-1])
     
-    # Price Action: Reclaim / Wick / Higher Low
+    score_accum = 0
+    if is_compressed: score_accum += 8
+    if higher_low: score_accum += 7
+
+    # 3. Price Action / Reclaim (Max 15đ)
     h1_range = last['high'] - last['low']
     wick_ratio = (min(last['open'], last['close']) - last['low']) / h1_range if h1_range > 0 else 0
-    
+    is_sweep = last['low'] < supp_low and last['close'] > supp_low
+
     score_pa = 0
-    if last['low'] < supp_low and last['close'] > supp_low: score_pa += 20 # Sweep & Reclaim
-    elif wick_ratio >= 0.30: score_pa += 16
-    elif curr_price >= supp_high: score_pa += 14
-    else: score_pa += 10
+    if is_sweep: score_pa = 15
+    elif wick_ratio >= 0.35: score_pa = 12
+    elif curr_price >= supp_high: score_pa = 10
+    else: score_pa = 6
 
-    # Flow Confirmation: Volume, OI, CVD
-    avg_vol = calculate_sma_volume(h1_candles[:-1], 20)
-    vol_ratio = last['volume'] / avg_vol if avg_vol > 0 else 1.0
-    score_vol = 10 if vol_ratio >= 1.2 else (7 if 0.8 <= vol_ratio < 1.2 else 4)
+    # 4. OI Structure (Max 15đ) - Phân tích theo tiến trình Giai Đoạn
+    oi_series = get_open_interest_series(symbol, "1h")
+    score_oi = 0
+    if len(oi_series) >= 3:
+        oi_prev2, oi_prev1, oi_curr = oi_series[-3], oi_series[-2], oi_series[-1]
+        # Giai đoạn 3: OI bắt đầu tăng lại từ nền tích lũy
+        if oi_curr > oi_prev1 and oi_prev1 >= oi_prev2 * 0.99:
+            score_oi = 15
+        elif oi_curr >= oi_prev1: # Giai đoạn 2: OI ổn định/ngừng giảm
+            score_oi = 10
+        else:
+            score_oi = 5
+    else:
+        score_oi = 8
 
-    _, _, oi_pct = get_open_interest_data(symbol, "1h")
-    score_oi = 15 if oi_pct >= 1.5 else (10 if oi_pct >= 0 else 5)
+    # 5. CVD Structure (Max 10đ)
+    taker_series = get_taker_buy_series(symbol)
+    score_cvd = 0
+    if len(taker_series) >= 2:
+        cvd_prev, cvd_curr = taker_series[-2], taker_series[-1]
+        if cvd_curr > cvd_prev and cvd_curr >= 50.0: # CVD tạo Higher Low / tăng
+            score_cvd = 10
+        elif cvd_curr >= 50.0:
+            score_cvd = 7
+        else:
+            score_cvd = 4
+    else:
+        score_cvd = 6
 
-    curr_buy, prev_buy = get_taker_buy_data(symbol)
-    taker_pct = (curr_buy * 100) if curr_buy is not None else 50.0
-    score_cvd = 10 if taker_pct >= 55.0 else (6 if taker_pct >= 48.0 else 3)
+    # 6. Volume (Max 10đ)
+    avg_vol_20 = calculate_sma_volume(h1_candles[:-1], 20)
+    vol_ratio = last['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
+    # Volume cạn kiệt trong nền vẫn được điểm, volume nhích tăng khi Reclaim điểm cao nhất
+    if 1.2 <= vol_ratio <= 2.2: score_vol = 10 # Volume vừa chớm bùng nổ đẹp
+    elif vol_ratio < 1.0: score_vol = 7        # Volume cạn tích lũy nén
+    else: score_vol = 5                        # Volume đã quá cao (có thể đã pump xa)
 
-    # RSI (Ưu tiên 35 - 55, Bullish Divergence cộng điểm)
+    # 7. RSI (Max 5đ) - Ưu tiên 35 đến 55
     rsi_vals = calculate_rsi(h1_candles, 14)
     curr_rsi = rsi_vals[-1] if rsi_vals else 50.0
-    
-    score_rsi = 0
-    if 35 <= curr_rsi <= 55: score_rsi += 7
-    elif curr_rsi < 35: score_rsi += 5
-    
-    if len(rsi_vals) >= 12 and curr_rsi > min(rsi_vals[-12:-3]):
-        score_rsi += 3 # Cộng điểm Bullish Divergence
-    score_rsi = min(score_rsi, 10)
+    score_rsi = 5 if 35.0 <= curr_rsi <= 55.0 else (3 if curr_rsi < 35 else 2)
 
-    # Relative Strength & BTC Regime
+    # 8. Relative Strength vs BTC (Max 5đ)
     sym_chg_6h = (h1_candles[-1]['close'] - h1_candles[-6]['close']) / h1_candles[-6]['close']
-    btc_chg_6h = (btc_h1_candles[-1]['close'] - btc_h1_candles[-6]['close']) / btc_h1_candles[-6]['close'] if btc_h1_candles else 0
-    
-    score_rs = 10 if sym_chg_6h > btc_chg_6h else 5
-    score_btc = 5 if btc_chg_6h >= -0.005 else 2
+    btc_chg_6h = (btc_h1_candles[-1]['close'] - btc_h1_candles[-6]['close']) / btc_h1_candles[-6]['close'] if btc_h1_candles else 0.0
+    score_rs = 5 if sym_chg_6h >= btc_chg_6h else 2
 
-    total_score = score_support_struct + score_pa + score_vol + score_oi + score_cvd + score_rsi + score_rs + score_btc
+    # 9. BTC Regime (Max 5đ)
+    score_btc = 5 if btc_chg_6h >= -0.008 else 2
+
+    total_score = score_support + score_accum + score_pa + score_oi + score_cvd + score_vol + score_rsi + score_rs + score_btc
     total_score = min(total_score, 100)
 
-    if total_score < 70:
+    if total_score < 68: # REJECT
         return None
 
-    # TÍNH ENTRY ZONE, SL & TP CẤU TRÚC
+    # TÍNH VÙNG ENTRY ZONE & SL/TP CẤU TRÚC
     atr15 = calculate_m15_atr(symbol)
-    entry_low = max(supp_low, curr_price * 0.997)
-    entry_high = curr_price
+    entry_low = supp_low
+    entry_high = min(curr_price, supp_high * 1.008)
     entry_mid = (entry_low + entry_high) / 2
 
-    # SL dưới đáy Support Zone + Buffer ATR
+    # SL dưới đáy Support Zone / Sweep Low
     sl = supp_low - (atr15 * 0.3) if atr15 > 0 else supp_low * 0.995
     risk = entry_mid - sl
     if risk <= 0: return None
@@ -348,19 +358,24 @@ def evaluate_long_a_accumulation(symbol, h1_candles, h4_candles, btc_h1_candles)
     tp2 = max(entry_mid + (risk * 2.5), swing_high)
     tp3 = entry_mid + (risk * 3.8)
 
-    signal_status = "LONG" if total_score >= 80 else "WATCH"
+    if total_score >= 85:
+        status_code = "PRE_PUMP_BASE"
+        status_label = "🚀 LONG H1 PRE-PUMP BASE"
+    elif total_score >= 75:
+        status_code = "LONG_SETUP"
+        status_label = "🟢 LONG SETUP"
+    else:
+        status_code = "WATCH"
+        status_label = "👀 WATCH"
 
     return {
-        'signal_status': signal_status,
-        'setup_type_tag': "LONG A",
-        'setup_name': "H1 ACCUMULATION BASE / SUPPORT RECLAIM",
+        'status_code': status_code,
+        'label': status_label,
         'symbol': symbol,
         'total_score': total_score,
-        'health_score': score_rs + score_btc + score_support_struct,
-        'setup_score': score_pa + score_vol + score_oi + score_cvd + score_rsi,
         'vol_ratio': vol_ratio,
-        'oi_pct': oi_pct,
-        'taker_pct': taker_pct,
+        'oi_pct': ((oi_series[-1] - oi_series[-2])/oi_series[-2]*100) if len(oi_series)>=2 else 0.0,
+        'taker_pct': taker_series[-1] if taker_series else 50.0,
         'supp_low': supp_low,
         'supp_high': supp_high,
         'entry_low': entry_low,
@@ -371,11 +386,11 @@ def evaluate_long_a_accumulation(symbol, h1_candles, h4_candles, btc_h1_candles)
         'tp2': tp2,
         'tp3': tp3,
         'risk_pct': (risk / entry_mid) * 100,
-        'signal_id': f"LONGA_BASE_{symbol}_{last['timestamp']}"
+        'signal_id': f"{status_code}_{symbol}_{last['timestamp']}"
     }
 
 # ==============================================================================
-# 4. FORMATTER TIN NHẮN TELEGRAM chuẩn KHUÔN MẪU
+# 4. FORMATTER TELEGRAM chuẩn FORMAT PRE-PUMP BASE
 # ==============================================================================
 def send_telegram_signal(sig):
     global signal_counter
@@ -383,21 +398,18 @@ def send_telegram_signal(sig):
     sig['id'] = signal_counter
     signals_history.append(sig)
 
-    icon_head = "🧱" if sig['signal_status'] == "LONG" else "👀"
-    status_label = "LONG ACCUMULATION" if sig['signal_status'] == "LONG" else "CẢNH BÁO WATCH"
-
-    msg = f"""{icon_head} <b>[{sig['setup_name']}] #{sig['id']} - {sig['symbol']}</b>
+    msg = f"""{sig['label']} #{sig['id']} - <b>{sig['symbol']}</b>
 -------------------------------------
-⭐️ <b>Điểm Uy Tín: {sig['total_score']}/100</b> ({status_label})
-🛡 Support Zone: <b>{sig['supp_low']:.4f} – {sig['supp_high']:.4f}</b>
+⭐️ <b>Điểm Uy Tín: {sig['total_score']}/100</b>
+🧱 Support Zone: <b>{sig['supp_low']:.4f} – {sig['supp_high']:.4f}</b>
 
-🔥 <b>TÍN HIỆU TÍCH LŨY / CỨU NỀN HỖ TRỢ:</b>
+🔥 <b>DẤU HIỆU DÒNG TIỀN & SHORT SQUEEZE:</b>
 • Volume H1: <b>+{sig['vol_ratio']:.2f}x (SMA20)</b>
-• Open Interest: <b>+{sig['oi_pct']:.2f}% (Tăng khi Reclaim)</b>
-• Lực Mua CVD: <b>{sig['taker_pct']:.1f}% (Cải thiện)</b>
-• Trạng Thái: <b>Giữ vững Support Zone trước Breakout</b>
+• Open Interest: <b>+{sig['oi_pct']:.2f}% (Bắt đầu tăng/ngừng giảm)</b>
+• Lực Mua CVD: <b>{sig['taker_pct']:.1f}% (CVD tạo đáy & hồi phục)</b>
+• Trạng Thái: <b>Giữ vững nền Hỗ Trợ trước Breakout</b>
 -------------------------------------
-🎯 <b>KẾ HOẠCH VÀO LỆNH (BUY THE BASE):</b>
+🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG):</b>
 
 📍 <b>Entry Zone:</b>
 {sig['entry_low']:.4f} – {sig['entry_high']:.4f}
@@ -409,50 +421,47 @@ def send_telegram_signal(sig):
 {sig['tp1']:.4f} (Kháng cự gần / 1.5R)
 
 🚀 <b>Take Profit 2:</b>
-{sig['tp2']:.4f} (Swing High cũ / 2.5R+)
+{sig['tp2']:.4f} (Swing High / 2.5R+)
 
 🔥 <b>Take Profit 3:</b>
 {sig['tp3']:.4f} (Expansion Momentum / 3.8R)
 -------------------------------------
-👉 <b>BẮT TÍCH LŨY NỀN HỖ TRỢ TRƯỚC KHI PUMP!</b>"""
+👉 <b>CHECK CHART H1 & BẮT SÓNG NGAY!</b>"""
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
     try:
         requests.post(url, json=payload, timeout=10)
-        print(f"✅ Đã bắn tín hiệu #{sig['id']} [{sig['setup_type_tag']}] cho {sig['symbol']} (Score: {sig['total_score']})", flush=True)
+        print(f"✅ Đã bắn tín hiệu #{sig['id']} [{sig['label']}] cho {sig['symbol']} (Score: {sig['total_score']})", flush=True)
     except Exception as e:
         print(f"Lỗi gửi Telegram: {e}", flush=True)
 
 # ==============================================================================
-# 5. MAIN LOOP RUNNER VỚI CHỐNG SPAM (TOP 4 COIN)
+# 5. MAIN LOOP RUNNER CHỐNG SPAM (TOP 3-5 COIN/VÒNG QUÉT)
 # ==============================================================================
 def run_radar_loop():
-    print("⚡️ Bắt đầu Radar Long Accumulation Base & Squeeze (Top 4 Coin)...", flush=True)
+    print("⚡️ Bắt đầu Radar Long H1 Pre-Pump Base (Chống Spam Top 4 Coin)...", flush=True)
     while True:
         btc_h1 = get_closed_klines("BTCUSDT", "60", limit=50)
         all_symbols = get_all_bybit_usdt_symbols()
-        print(f"🔍 Đang quét thang điểm 100 tích lũy cho {len(all_symbols)} coin...", flush=True)
+        print(f"🔍 Đang quét thang điểm Pre-Pump Base 100 cho {len(all_symbols)} coin...", flush=True)
         
         candidates = []
         for symbol in all_symbols:
             try:
-                if get_24h_turnover(symbol) < MIN_TURNOVER_24H:
-                    continue
-                    
                 h1_candles = get_closed_klines(symbol, "60", limit=50)
                 h4_candles = get_closed_klines(symbol, "240", limit=50)
                 
-                sig = evaluate_long_a_accumulation(symbol, h1_candles, h4_candles, btc_h1)
+                sig = evaluate_prepump_base(symbol, h1_candles, h4_candles, btc_h1)
                 if sig and sig['signal_id'] not in processed_signal_ids:
                     candidates.append(sig)
             except Exception:
                 pass
             time.sleep(0.12)
 
-        # CHỌN TOP 4 COIN ĐIỂM CAO NHẤT ĐỂ BẮN CẢNH BÁO
+        # LỌC TOP 4 COIN ĐIỂM CAO NHẤT ĐỂ BẮN CẢNH BÁO
         if candidates:
-            candidates.sort(key=lambda x: (x['total_score'], x['health_score'], x['vol_ratio']), reverse=True)
+            candidates.sort(key=lambda x: (x['total_score'], x['oi_pct'], x['vol_ratio']), reverse=True)
             top_candidates = candidates[:MAX_ALERTS_PER_CYCLE]
 
             for c in top_candidates:

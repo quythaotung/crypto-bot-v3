@@ -7,10 +7,10 @@ from flask import Flask
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-DEBUG_MODE = True
-REQUIRE_TAKER_BUY = True
-COOLDOWN_SECONDS = 300             # Quét 5 phút / lần
-MIN_TURNOVER_24H = 5_000_000       # Turnover >= $5M USD
+DEBUG_MODE = True                  # In chi tiết lý do REJECT ra Logs
+REQUIRE_TAKER_BUY = True           # Bắt buộc Taker Buy >= 55%
+COOLDOWN_SECONDS = 300             # Giãn cách giữa các vòng quét (5 phút)
+MIN_TURNOVER_24H = 5_000_000       # Turnover tối thiểu $5M USD (Lọc coin rác)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -20,13 +20,13 @@ processed_signal_ids = set()
 signal_counter = 0
 
 # ==============================================================================
-# 1. FLASK SERVER & TELEGRAM COMMAND LISTENER (/pnl)
+# 1. FLASK KEEP-ALIVE SERVER & TELEGRAM COMMAND LISTENER (/pnl)
 # ==============================================================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit H1 & H4 Signal Bot Active 24/7!"
+    return "Squeeze Explosion Bot Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -99,10 +99,10 @@ def send_pnl_summary():
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Lỗi gửi PnL: {e}")
+        print(f"Lỗi gửi PnL: {e}", flush=True)
 
 # ==============================================================================
-# 2. BYBIT API DATA HELPERS
+# 2. BYBIT REST API HELPERS
 # ==============================================================================
 BASE_URL = "https://api.bybit.com"
 
@@ -198,10 +198,8 @@ def is_sweep_and_reclaim(candles, lookback=10):
     return False, swing_low
 
 # ==============================================================================
-# 3. ANALYSIS LOGIC: H1 SQUEEZE & H4 BULLISH REJECTION
+# 3. ANALYSIS LOGIC (H1 & H4)
 # ==============================================================================
-
-# --- PHÂN TÍCH H4 BULLISH REJECTION (THEO ẢNH QNTUSDT) ---
 def analyze_h4_rejection(symbol):
     h4_candles = get_closed_klines(symbol, "240", limit=25)
     if len(h4_candles) < 21: return None
@@ -210,44 +208,37 @@ def analyze_h4_rejection(symbol):
     h4_range = h4_last['high'] - h4_last['low']
     if h4_range == 0: return None
     
-    # 1. Điều kiện Râu dưới H4 rút chân mạnh >= 40% range
     h4_lower_wick = min(h4_last['open'], h4_last['close']) - h4_last['low']
     h4_wick_ratio = h4_lower_wick / h4_range
     if h4_wick_ratio < 0.40: return None
     
-    # 2. Điều kiện Vị trí đóng cửa nằm trên 65% thân nến
     h4_close_loc = (h4_last['close'] - h4_last['low']) / h4_range
     if h4_close_loc < 0.65: return None
     
-    # 3. Sweep Liquidity H4
     h4_sweep, _ = is_sweep_and_reclaim(h4_candles, lookback=10)
     if not h4_sweep: return None
     
-    # 4. Volume H4 >= 1.5x
     h4_avg_vol = calculate_sma_volume(h4_candles[:-1], 20)
     h4_vol_ratio = h4_last['volume'] / h4_avg_vol if h4_avg_vol > 0 else 0
     if h4_vol_ratio < 1.5: return None
     
-    # 5. Open Interest H4 >= 3%
     oi_h4_pct = get_open_interest_change(symbol, interval_str="4h")
     if oi_h4_pct is None or oi_h4_pct < 3.0: return None
     
-    # Tính toán Entry, SL, TP cho H4
     entry = h4_last['close']
-    sl = h4_last['low'] * 0.995 # SL dưới chân râu nến H4
+    sl = h4_last['low'] * 0.995
     risk = entry - sl
     if risk <= 0: return None
     
     tp1 = entry + (risk * 1.5)
     tp2 = entry + (risk * 3.0)
     
-    score = 92
     signal_id = f"H4_{symbol}_{h4_last['timestamp']}"
     
     return {
         'type': 'H4 REJECTION',
         'symbol': symbol,
-        'score': score,
+        'score': 92,
         'wick_ratio': h4_wick_ratio * 100,
         'vol_ratio': h4_vol_ratio,
         'oi_pct': oi_h4_pct,
@@ -258,7 +249,6 @@ def analyze_h4_rejection(symbol):
         'signal_id': signal_id
     }
 
-# --- PHÂN TÍCH H1 SQUEEZE EXPLOSION ---
 def analyze_h1_squeeze(symbol):
     turnover = get_24h_turnover(symbol)
     if turnover < MIN_TURNOVER_24H: return None
@@ -320,7 +310,7 @@ def analyze_h1_squeeze(symbol):
     }
 
 # ==============================================================================
-# 4. GỬI TELEGRAM
+# 4. TELEGRAM ALERT
 # ==============================================================================
 def send_telegram_signal(sig):
     global signal_counter
@@ -370,9 +360,9 @@ def send_telegram_signal(sig):
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
     try:
         requests.post(url, json=payload, timeout=10)
-        print(f"✅ Đã bắn tín hiệu #{sig['id']} ({sig['type']}) cho {sig['symbol']}")
+        print(f"✅ Đã bắn tín hiệu #{sig['id']} ({sig['type']}) cho {sig['symbol']}", flush=True)
     except Exception as e:
-        print(f"Lỗi gửi Telegram: {e}")
+        print(f"Lỗi gửi Telegram: {e}", flush=True)
 
 # ==============================================================================
 # 5. MAIN LOOP
@@ -385,13 +375,11 @@ def run_radar_loop():
         
         for symbol in all_symbols:
             try:
-                # 1. Quét tín hiệu H4 Rejection
                 sig_h4 = analyze_h4_rejection(symbol)
                 if sig_h4 and sig_h4['signal_id'] not in processed_signal_ids:
                     processed_signal_ids.add(sig_h4['signal_id'])
                     send_telegram_signal(sig_h4)
 
-                # 2. Quét tín hiệu H1 Squeeze
                 sig_h1 = analyze_h1_squeeze(symbol)
                 if sig_h1 and sig_h1['signal_id'] not in processed_signal_ids:
                     processed_signal_ids.add(sig_h1['signal_id'])
@@ -402,3 +390,8 @@ def run_radar_loop():
             
         print(f"✅ Hoàn thành 1 vòng quét. Nghỉ {COOLDOWN_SECONDS}s...", flush=True)
         time.sleep(COOLDOWN_SECONDS)
+
+if __name__ == "__main__":
+    Thread(target=run_flask, daemon=True).start()
+    Thread(target=process_telegram_commands, daemon=True).start()
+    run_radar_loop()

@@ -16,18 +16,18 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 signals_history = []
-active_signals = []                # Danh sách các lệnh đang chạy để theo dõi TP/SL
+active_signals = []                # Danh sách theo dõi TP/SL real-time
 processed_signal_ids = set()
 signal_counter = 0
 
 # ==============================================================================
-# 1. FLASK KEEP-ALIVE SERVER & TELEGRAM COMMAND LISTENER (/pnl)
+# 1. FLASK KEEP-ALIVE SERVER & TELEGRAM COMMAND LISTENER (/pnl) - FIXED
 # ==============================================================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Structural SL/TP Tracking Bot Active 24/7!"
+    return "Bybit Structural Tracker Bot (Fixed Telegram Listener) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -43,8 +43,49 @@ def get_current_price(symbol):
         pass
     return None
 
+def send_telegram_direct_message(text):
+    """Hàm hỗ trợ gửi tin nhắn trực tiếp không bị ngắt"""
+    if not BOT_TOKEN or not CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Lỗi gửi Telegram Direct: {e}", flush=True)
+
+def send_pnl_summary():
+    if not signals_history:
+        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\n🟢 Bot vẫn đang chạy 24/7 bình thường!\n⏳ Chưa có tín hiệu nào đạt chuẩn điểm kỹ thuật được phát ra từ lần khởi động gần nhất."
+        send_telegram_direct_message(msg)
+        return
+
+    msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH REAL-TIME:</b>\n-------------------------------------\n"
+    total_pnl_pct = 0.0
+    
+    for sig in signals_history:
+        curr_price = get_current_price(sig['symbol'])
+        if not curr_price:
+            curr_price = sig['entry_mid']
+            
+        pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
+        status = sig.get('status_text', '⏳ Đang theo dõi')
+        
+        icon = "🟢" if pnl_pct >= 0 else "🔴"
+        
+        msg += f"<b>#{sig['id']} [{sig['status_label']}] {sig['symbol']}</b> | Entry: {sig['entry_mid']:.4f}\n"
+        msg += f"• Giá hiện tại: {curr_price:.4f} ({icon} {pnl_pct:+.2f}%)\n"
+        msg += f"• Trạng thái: <b>{status}</b>\n-------------------------------------\n"
+        total_pnl_pct += pnl_pct
+        
+    total_icon = "🔥" if total_pnl_pct >= 0 else "🔻"
+    msg += f"<b>TỔNG PnL TÍCH LŨY: {total_icon} {total_pnl_pct:+.2f}%</b>"
+    send_telegram_direct_message(msg)
+
 def process_telegram_commands():
+    """Luồng lắng nghe lệnh Telegram không bao giờ bị Crash"""
     last_update_id = 0
+    print("🤖 Đã bật luồng lắng nghe lệnh Telegram (/pnl, /start, /ping)...", flush=True)
     while True:
         try:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=10"
@@ -56,62 +97,34 @@ def process_telegram_commands():
                     text = message.get("text", "").strip().lower()
                     
                     if text in ["/pnl", "/summary", "pnl"]:
+                        print("📩 Nhận lệnh /pnl từ Telegram -> Đang gửi báo cáo...", flush=True)
                         send_pnl_summary()
-        except Exception:
-            pass
+                    elif text in ["/start", "/ping", "ping"]:
+                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot Bybit đang hoạt động 24/7 trơn tru!")
+        except Exception as e:
+            print(f"Lỗi luồng Telegram Listener: {e}", flush=True)
         time.sleep(2)
 
-def send_pnl_summary():
-    if not signals_history:
-        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\nChưa có lệnh nào được phát ra từ khi khởi động."
-    else:
-        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH REAL-TIME:</b>\n-------------------------------------\n"
-        total_pnl_pct = 0.0
-        
-        for sig in signals_history:
-            curr_price = get_current_price(sig['symbol'])
-            if not curr_price:
-                curr_price = sig['entry_mid']
-                
-            pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
-            status = sig.get('status_text', '⏳ Đang theo dõi')
-            
-            icon = "🟢" if pnl_pct >= 0 else "🔴"
-            
-            msg += f"<b>#{sig['id']} [{sig['status_label']}] {sig['symbol']}</b> | Entry: {sig['entry_mid']:.4f}\n"
-            msg += f"• Giá hiện tại: {curr_price:.4f} ({icon} {pnl_pct:+.2f}%)\n"
-            msg += f"• Trạng thái: <b>{status}</b>\n-------------------------------------\n"
-            total_pnl_pct += pnl_pct
-            
-        total_icon = "🔥" if total_pnl_pct >= 0 else "🔻"
-        msg += f"<b>TỔNG PnL TÍCH LŨY: {total_icon} {total_pnl_pct:+.2f}%</b>"
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Lỗi gửi PnL: {e}", flush=True)
-
 # ==============================================================================
-# 2. TIẾN TRÌNH THEO DÕI GIÁ REAL-TIME BÁO CHẠM TP / HỦY SL
+# 2. TIẾN TRÌNH THEO DÕI GIÁ REAL-TIME BÁO CHẠM TP / SL
 # ==============================================================================
 def process_active_signals_tracker():
-    """Kiểm tra giá liên tục 10s/lần để phát thông báo TP/SL chuẩn xác"""
     while True:
         try:
-            for sig in list(active_signals):
-                curr_price = get_current_price(sig['symbol'])
-                if not curr_price:
-                    continue
+            current_active = list(active_signals)
+            for sig in current_active:
+                try:
+                    curr_price = get_current_price(sig['symbol'])
+                    if not curr_price:
+                        continue
 
-                # 1. KIỂM TRA CHẠM TP1 ZONE
-                if not sig['hit_tp1'] and curr_price >= sig['tp1_low']:
-                    sig['hit_tp1'] = True
-                    sig['status_text'] = "🎯 Hit TP1 Zone (Đã hủy bảo vệ SL)"
-                    pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
-                    
-                    msg = f"""🎯 <b>[CẢNH BÁO CHẠM TP1 ZONE] #{sig['id']} - {sig['symbol']}</b>
+                    # 1. KIỂM TRA CHẠM TP1 ZONE
+                    if not sig['hit_tp1'] and curr_price >= sig['tp1_low']:
+                        sig['hit_tp1'] = True
+                        sig['status_text'] = "🎯 Hit TP1 Zone (Đã hủy bảo vệ SL)"
+                        pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
+                        
+                        msg = f"""🎯 <b>[CẢNH BÁO CHẠM TP1 ZONE] #{sig['id']} - {sig['symbol']}</b>
 -------------------------------------
 📍 Entry Mid: <b>{sig['entry_mid']:.4f}</b>
 🎯 Giá Hiện Tại: <b>{curr_price:.4f} (+{pnl_pct:.2f}%)</b>
@@ -119,70 +132,62 @@ def process_active_signals_tracker():
 -------------------------------------
 ✅ <b>ĐÃ CẢN TP1 THÀNH CÔNG!</b>
 🛡 <b>Hệ thống tự động HỦY thông báo SL đối với lệnh này. Bạn có thể dời SL về Breakeven (Hoà vốn) để gồng TP2/TP3!</b>"""
-                    
-                    send_telegram_notification(msg)
+                        send_telegram_direct_message(msg)
 
-                # 2. KIỂM TRA CHẠM TP2 ZONE
-                elif sig['hit_tp1'] and not sig['hit_tp2'] and curr_price >= sig['tp2_low']:
-                    sig['hit_tp2'] = True
-                    sig['status_text'] = "🚀 Hit TP2 Zone (Chốt lời thành công)"
-                    pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
-                    
-                    msg = f"""🚀 <b>[CẢNH BÁO CHẠM TP2 ZONE] #{sig['id']} - {sig['symbol']}</b>
+                    # 2. KIỂM TRA CHẠM TP2 ZONE
+                    elif sig['hit_tp1'] and not sig['hit_tp2'] and curr_price >= sig['tp2_low']:
+                        sig['hit_tp2'] = True
+                        sig['status_text'] = "🚀 Hit TP2 Zone (Chốt lời thành công)"
+                        pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
+                        
+                        msg = f"""🚀 <b>[CẢNH BÁO CHẠM TP2 ZONE] #{sig['id']} - {sig['symbol']}</b>
 -------------------------------------
 📍 Entry Mid: <b>{sig['entry_mid']:.4f}</b>
 🚀 Giá Hiện Tại: <b>{curr_price:.4f} (+{pnl_pct:.2f}%)</b>
 🚀 Vùng TP2 Zone: <b>{sig['tp2_low']:.4f} – {sig['tp2_high']:.4f}</b>
 -------------------------------------
 🔥 <b>ĐÃ CHẠM VÙNG SWING HIGH CŨ! KHUYẾN NGHỊ CHỐN LỜI HOẶC CHỈ GIỮ LẠI TỶ TRỌNG NHỎ!</b>"""
-                    
-                    send_telegram_notification(msg)
-                    if not sig['tp3_zone']:
-                        active_signals.remove(sig) # Đóng theo dõi nếu không có TP3
+                        send_telegram_direct_message(msg)
+                        if not sig['tp3_zone'] and sig in active_signals:
+                            active_signals.remove(sig)
 
-                # 3. KIỂM TRA CHẠM TP3 ZONE (NẾU CÓ)
-                elif sig['hit_tp2'] and sig['tp3_zone'] and curr_price >= sig['tp3_zone'][0]:
-                    sig['status_text'] = "🔥 Hit TP3 Zone (Full Target Expansion)"
-                    pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
-                    
-                    msg = f"""🔥 <b>[CẢNH BÁO CHẠM TP3 ZONE - MEGAPUMP] #{sig['id']} - {sig['symbol']}</b>
+                    # 3. KIỂM TRA CHẠM TP3 ZONE (NẾU CÓ)
+                    elif sig['hit_tp2'] and sig['tp3_zone'] and curr_price >= sig['tp3_zone'][0]:
+                        sig['status_text'] = "🔥 Hit TP3 Zone (Full Target Expansion)"
+                        pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
+                        
+                        msg = f"""🔥 <b>[CẢNH BÁO CHẠM TP3 ZONE - MEGAPUMP] #{sig['id']} - {sig['symbol']}</b>
 -------------------------------------
 📍 Entry Mid: <b>{sig['entry_mid']:.4f}</b>
 🔥 Giá Hiện Tại: <b>{curr_price:.4f} (+{pnl_pct:.2f}%)</b>
 🔥 Vùng TP3 Zone: <b>{sig['tp3_zone'][0]:.4f} – {sig['tp3_zone'][1]:.4f}</b>
 -------------------------------------
 🏆 <b>HOÀN THÀNH TOÀN BỘ MỤC TIÊU SÓNG TĂNG KỲ VỌNG!</b>"""
-                    
-                    send_telegram_notification(msg)
-                    active_signals.remove(sig) # Đóng theo dõi
+                        send_telegram_direct_message(msg)
+                        if sig in active_signals:
+                            active_signals.remove(sig)
 
-                # 4. KIỂM TRA HIT SL (CHỈ BÁO KHI CHƯA CẢN TP1)
-                elif not sig['hit_tp1'] and curr_price <= sig['sl']:
-                    sig['status_text'] = "🛑 Hit SL (Structural Invalidation)"
-                    pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
-                    
-                    msg = f"""🛑 <b>[CẢNH BÁO HIT SL STRUCTURAL] #{sig['id']} - {sig['symbol']}</b>
+                    # 4. KIỂM TRA HIT SL (CHỈ BÁO KHI CHƯA CẢN TP1)
+                    elif not sig['hit_tp1'] and curr_price <= sig['sl']:
+                        sig['status_text'] = "🛑 Hit SL (Structural Invalidation)"
+                        pnl_pct = ((curr_price - sig['entry_mid']) / sig['entry_mid']) * 100
+                        
+                        msg = f"""🛑 <b>[CẢNH BÁO HIT SL STRUCTURAL] #{sig['id']} - {sig['symbol']}</b>
 -------------------------------------
 📍 Entry Mid: <b>{sig['entry_mid']:.4f}</b>
 🛑 Giá Hiện Tại: <b>{curr_price:.4f} ({pnl_pct:.2f}%)</b>
 🛑 Mốc SL Cấu Trúc: <b>{sig['sl']:.4f}</b>
 -------------------------------------
 ⚠️ <b>CẤU TRÚC TÍCH LŨY BỊ VI PHẠM (INVALIDATION). DỪNG LỆNH ĐỂ BẢO VỆ VỐN!</b>"""
-                    
-                    send_telegram_notification(msg)
-                    active_signals.remove(sig) # Đóng theo dõi
+                        send_telegram_direct_message(msg)
+                        if sig in active_signals:
+                            active_signals.remove(sig)
+                except Exception as inner_e:
+                    print(f"Lỗi theo dõi coin {sig.get('symbol')}: {inner_e}", flush=True)
         except Exception as e:
-            print(f"Lỗi theo dõi Tracker: {e}", flush=True)
+            print(f"Lỗi theo dõi Tracker Loop: {e}", flush=True)
         
-        time.sleep(10) # Lặp lại kiểm tra mỗi 10 giây
-
-def send_telegram_notification(msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Lỗi gửi thông báo Tracker: {e}", flush=True)
+        time.sleep(10)
 
 # ==============================================================================
 # 3. BYBIT REST API & INDICATORS HELPERS
@@ -464,7 +469,7 @@ def send_telegram_signal(sig):
     signal_counter += 1
     sig['id'] = signal_counter
     signals_history.append(sig)
-    active_signals.append(sig) # Thêm vào danh sách theo dõi TP/SL real-time
+    active_signals.append(sig)
 
     tp3_str = ""
     if sig['tp3_zone']:
@@ -501,19 +506,14 @@ TP1: 1:{sig['rr_tp1']:.2f} | TP2: 1:{sig['rr_tp2']:.2f}
 -------------------------------------
 👉 <b>ĐÃ BẬT THEO DÕI TP/SL REAL-TIME 24/7!</b>"""
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-        print(f"✅ Đã bắn tín hiệu #{sig['id']} [{sig['status_label']}] cho {sig['symbol']} (Score: {sig['total_score']})", flush=True)
-    except Exception as e:
-        print(f"Lỗi gửi Telegram: {e}", flush=True)
+    send_telegram_direct_message(msg)
+    print(f"✅ Đã bắn tín hiệu #{sig['id']} [{sig['status_label']}] cho {sig['symbol']} (Score: {sig['total_score']})", flush=True)
 
 # ==============================================================================
 # 6. MAIN LOOP RUNNER
 # ==============================================================================
 def run_radar_loop():
-    print("⚡️ Bắt đầu Radar Structural SL/TP Tracking Bot (Top 4 Coin)...", flush=True)
+    print("⚡️ Bắt đầu Radar Structural SL/TP Tracking Bot (Fixed Telegram)...", flush=True)
     while True:
         btc_h1 = get_closed_klines("BTCUSDT", "60", limit=50)
         all_symbols = get_all_bybit_usdt_symbols()
@@ -546,5 +546,5 @@ def run_radar_loop():
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
     Thread(target=process_telegram_commands, daemon=True).start()
-    Thread(target=process_active_signals_tracker, daemon=True).start() # Tiến trình quét TP/SL Real-time 10s/lần
+    Thread(target=process_active_signals_tracker, daemon=True).start()
     run_radar_loop()

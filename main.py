@@ -10,7 +10,8 @@ from flask import Flask
 DEBUG_MODE = True                  # In log chi tiết ra Render
 COOLDOWN_SECONDS = 300             # Giãn cách giữa các vòng quét toàn sàn (5 phút)
 MIN_TURNOVER_24H = 5_000_000       # Turnover 24h tối thiểu $5M USD
-MAX_ALERTS_PER_CYCLE = 4           # Tối đa gửi Top 4 coin đẹp nhất mỗi vòng quét
+MAX_ALERTS_PER_CYCLE = 3           # Tối đa gửi Top 3 coin SIÊU ĐẸP mỗi vòng quét (Chống Spam)
+MIN_WINRATE_SCORE = 85             # CHỈ BÁO KÈO ĐẠT TỪ 85/100 ĐIỂM TRỞ LÊN
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -27,7 +28,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit H4 Rejection & H1 Spot Squeeze Bot Active 24/7!"
+    return "Bybit High Win-Rate & M15 Early Entry Bot Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -55,11 +56,11 @@ def send_telegram_direct_message(text):
 
 def send_pnl_summary():
     if not signals_history:
-        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\n🟢 Bot đang hoạt động 24/7!\n⏳ Chưa có tín hiệu H4/H1 mới phát ra."
+        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\n🟢 Bot đang hoạt động 24/7!\n⏳ Chưa có tín hiệu Tỷ Lệ Thắng Cao (>=85đ) nào mới."
         send_telegram_direct_message(msg)
         return
 
-    msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH REAL-TIME:</b>\n"
+    msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH HIGH WIN-RATE:</b>\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
     total_pnl_pct = 0.0
     
@@ -72,7 +73,7 @@ def send_pnl_summary():
         status = sig.get('status_text', '⏳ Đang theo dõi')
         icon = "🟢" if pnl_pct >= 0 else "🔴"
         
-        msg += f"<b>#{sig['id']} [{sig['engine_tag']}] {sig['symbol']}</b>\n"
+        msg += f"<b>#{sig['id']} [{sig['engine_tag']}] {sig['symbol']}</b> (Score: {sig['score']})\n"
         msg += f"• Entry: <code>{sig['entry']:.4f}</code> | Hiện tại: <code>{curr_price:.4f}</code> ({icon} <b>{pnl_pct:+.2f}%</b>)\n"
         msg += f"• Trạng thái: <b>{status}</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"
         total_pnl_pct += pnl_pct
@@ -97,7 +98,7 @@ def process_telegram_commands():
                     if text in ["/pnl", "/summary", "pnl"]:
                         send_pnl_summary()
                     elif text in ["/start", "/ping", "ping"]:
-                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot Bybit H4/H1 đang hoạt động 24/7!")
+                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot High Win-rate đang hoạt động 24/7!")
         except Exception as e:
             print(f"Lỗi luồng Telegram Listener: {e}", flush=True)
         time.sleep(2)
@@ -121,14 +122,14 @@ def process_active_signals_tracker():
                         sig['status_text'] = "🎯 Hit TP1 (Đã hủy bảo vệ SL)"
                         pnl_pct = ((curr_price - sig['entry']) / sig['entry']) * 100
                         
-                        msg = f"""🎯 <b>[CHẠM MỤC TIÊU TP1] #{sig['id']} - {sig['symbol']}</b>
+                        msg = f"""🎯 <b>[CẢNH BÁO CHẠM TP1] #{sig['id']} - {sig['symbol']}</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
 📍 Entry: <code>{sig['entry']:.4f}</code>
 🚀 Giá Hiện Tại: <code>{curr_price:.4f}</code> (<b>+{pnl_pct:.2f}%</b>)
-🎯 Mục Tiêu TP1: <code>{sig['tp1']:.4f}</code>
+🎯 TP1 (1.6R): <code>{sig['tp1']:.4f}</code>
 ━━━━━━━━━━━━━━━━━━━━━━━
 ✅ <b>ĐÃ CẢN TP1 THÀNH CÔNG!</b>
-🛡 <i>Tự động HỦY cảnh báo SL. Khuyên dời SL về Breakeven!</i>"""
+🛡 <i>Tự động HỦY cảnh báo SL. Khuyên dời SL về Breakeven để gồng TP2!</i>"""
                         send_telegram_direct_message(msg)
 
                     # 2. CHẠM TP2
@@ -137,20 +138,20 @@ def process_active_signals_tracker():
                         sig['status_text'] = "🚀 Hit TP2 (Chốt lời thành công)"
                         pnl_pct = ((curr_price - sig['entry']) / sig['entry']) * 100
                         
-                        msg = f"""🚀 <b>[CHẠM MỤC TIÊU TP2 - MEGAPUMP] #{sig['id']} - {sig['symbol']}</b>
+                        msg = f"""🚀 <b>[CẢNH BÁO CHẠM TP2 - FULL TARGET] #{sig['id']} - {sig['symbol']}</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
 📍 Entry: <code>{sig['entry']:.4f}</code>
 🔥 Giá Hiện Tại: <code>{curr_price:.4f}</code> (<b>+{pnl_pct:.2f}%</b>)
-🚀 Mục Tiêu TP2: <code>{sig['tp2']:.4f}</code>
+🚀 TP2 (2.6R): <code>{sig['tp2']:.4f}</code>
 ━━━━━━━━━━━━━━━━━━━━━━━
-🏆 <b>HOÀN THÀNH TOÀN BỘ MỤC TIÊU SÓNG PUMP! CHỐT LỜI CỰC ĐẸP!</b>"""
+🏆 <b>HOÀN THÀNH KẾ HOẠCH TRADE TỶ LỆ THẮNG CAO! CHỐT LỜI ĐẸP!</b>"""
                         send_telegram_direct_message(msg)
                         if sig in active_signals:
                             active_signals.remove(sig)
 
                     # 3. HIT SL (Chỉ báo khi CHƯA chạm TP1)
                     elif not sig['hit_tp1'] and curr_price <= sig['sl']:
-                        sig['status_text'] = "🛑 Hit SL (Phá vỡ cấu trúc)"
+                        sig['status_text'] = "🛑 Hit SL (Cắt lỗ bảo vệ)"
                         pnl_pct = ((curr_price - sig['entry']) / sig['entry']) * 100
                         
                         msg = f"""🛑 <b>[CẢNH BÁO HIT SL] #{sig['id']} - {sig['symbol']}</b>
@@ -159,7 +160,7 @@ def process_active_signals_tracker():
 🛑 Giá Hiện Tại: <code>{curr_price:.4f}</code> (<b>{pnl_pct:.2f}%</b>)
 🛑 Mốc SL Cấu Trúc: <code>{sig['sl']:.4f}</code>
 ━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ <i>Cấu trúc râu nến bị phá vỡ. Cắt lỗ bảo vệ tài khoản!</i>"""
+⚠️ <i>Vi phạm mốc bảo vệ cấu trúc. Cắt lỗ an toàn!</i>"""
                         send_telegram_direct_message(msg)
                         if sig in active_signals:
                             active_signals.remove(sig)
@@ -266,7 +267,7 @@ def calculate_sma_volume(candles, period=20):
     return sum(vols) / period
 
 # ==============================================================================
-# 4. ENGINE DÒ TÍN HIỆU (2 MÔ HÌNH QNT & ONDO)
+# 4. CORE ENGINE: TÌM KÈO HIGH WIN-RATE & M15 EARLY ENTRY
 # ==============================================================================
 
 def evaluate_symbol_setups(symbol):
@@ -274,53 +275,56 @@ def evaluate_symbol_setups(symbol):
         return None
 
     # --------------------------------------------------------------------------
-    # ENGINE 1: QUÉT H4 REJECTION & PUMP (MÔ HÌNH QNT)
+    # ENGINE 1: M15 EARLY BUY ENTRY (BẮT SỚM KHUNG M15)
     # --------------------------------------------------------------------------
-    h4_candles = get_closed_klines(symbol, "240", limit=30)
-    if len(h4_candles) >= 22:
-        last_h4 = h4_candles[-1]
-        h4_range = last_h4['high'] - last_h4['low']
+    m15_candles = get_closed_klines(symbol, "15", limit=30)
+    if len(m15_candles) >= 22:
+        last_m15 = m15_candles[-1]
+        m15_range = last_m15['high'] - last_m15['low']
         
-        if h4_range > 0:
-            lower_wick_h4 = min(last_h4['open'], last_h4['close']) - last_h4['low']
-            wick_ratio_h4 = lower_wick_h4 / h4_range
+        if m15_range > 0:
+            lower_wick_m15 = min(last_m15['open'], last_m15['close']) - last_m15['low']
+            wick_ratio_m15 = lower_wick_m15 / m15_range
             
-            avg_vol_h4 = calculate_sma_volume(h4_candles[:-1], 20)
-            vol_ratio_h4 = last_h4['volume'] / avg_vol_h4 if avg_vol_h4 > 0 else 0.0
-            oi_h4_pct = get_open_interest_pct(symbol, "4h")
+            avg_vol_m15 = calculate_sma_volume(m15_candles[:-1], 20)
+            vol_ratio_m15 = last_m15['volume'] / avg_vol_m15 if avg_vol_m15 > 0 else 0.0
+            taker_m15_pct = get_taker_buy_pct(symbol, "5m")
 
-            # ĐIỀU KIỆN MÔ HÌNH QNT (H4)
-            if wick_ratio_h4 >= 0.35 and vol_ratio_h4 >= 1.8 and oi_h4_pct >= 3.0:
-                atr4h = calculate_atr(h4_candles, 14)
-                entry = last_h4['close']
-                sl = last_h4['low'] - (0.15 * atr4h)
+            # ĐIỀU KIỆN M15 EARLY ENTRY HIGH WIN-RATE
+            if (wick_ratio_m15 >= 0.30 or last_m15['close'] > m15_candles[-2]['high']) and vol_ratio_m15 >= 1.8 and taker_m15_pct >= 65.0:
+                atr15m = calculate_atr(m15_candles, 14)
+                entry = last_m15['close']
+                sl = last_m15['low'] - (0.15 * atr15m)
+                risk = entry - sl
+                if risk <= 0: return None
+
+                # SET TP1 & TP2 HỢP LÝ CƠ CẤU R:R (TP1 = 1.6R, TP2 = 2.6R)
+                tp1 = entry + (risk * 1.6)
+                tp2 = entry + (risk * 2.6)
                 
-                # Swing high gần nhất trong 20 nến H4
-                prev_highs = [c['high'] for c in h4_candles[-20:-1]]
-                swing_high = max(prev_highs) if prev_highs else entry + (1.6 * atr4h)
-                
-                tp1 = max(swing_high, entry + (1.6 * atr4h))
-                tp2 = entry + (2.6 * atr4h)
-                
-                return {
-                    'engine_tag': 'H4 REJECTION',
-                    'title': '🚀 [H4 REJECTION & PUMP] - QNT PATTERN',
-                    'symbol': symbol,
-                    'entry': entry,
-                    'sl': sl,
-                    'tp1': tp1,
-                    'tp2': tp2,
-                    'wick_pct': wick_ratio_h4 * 100,
-                    'vol_ratio': vol_ratio_h4,
-                    'oi_pct': oi_h4_pct,
-                    'taker_pct': get_taker_buy_pct(symbol, "4h"),
-                    'score': 90 + min(vol_ratio_h4 * 2, 10),
-                    'timestamp': last_h4['timestamp'],
-                    'signal_id': f"QNT_H4_{symbol}_{last_h4['timestamp']}"
-                }
+                score_m15 = 85 + min(vol_ratio_m15 * 2, 10)
+                if score_m15 >= MIN_WINRATE_SCORE:
+                    return {
+                        'engine_tag': 'M15 EARLY BUY',
+                        'title': '⚡️ [EARLY LONG M15] - TÍN HIỆU BẮT SỚM',
+                        'symbol': symbol,
+                        'entry': entry,
+                        'sl': sl,
+                        'tp1': tp1,
+                        'tp2': tp2,
+                        'risk_pct': (risk / entry) * 100,
+                        'tp1_pct': ((tp1 - entry) / entry) * 100,
+                        'tp2_pct': ((tp2 - entry) / entry) * 100,
+                        'vol_ratio': vol_ratio_m15,
+                        'oi_pct': get_open_interest_pct(symbol, "15m"),
+                        'taker_pct': taker_m15_pct,
+                        'score': score_m15,
+                        'timestamp': last_m15['timestamp'],
+                        'signal_id': f"EARLY_M15_{symbol}_{last_m15['timestamp']}"
+                    }
 
     # --------------------------------------------------------------------------
-    # ENGINE 2: QUÉT H1 SPOT SQUEEZE (MÔ HÌNH ONDO)
+    # ENGINE 2: H1/H4 HIGH WIN-RATE SQUEEZE & RECLAIM
     # --------------------------------------------------------------------------
     h1_candles = get_closed_klines(symbol, "60", limit=30)
     if len(h1_candles) >= 22:
@@ -331,39 +335,43 @@ def evaluate_symbol_setups(symbol):
         oi_h1_pct = get_open_interest_pct(symbol, "1h")
         taker_h1_pct = get_taker_buy_pct(symbol, "1h")
 
-        # ĐIỀU KIỆN MÔ HÌNH ONDO (H1)
-        if vol_ratio_h1 >= 2.2 and oi_h1_pct >= 4.0 and taker_h1_pct >= 80.0:
+        # ĐIỀU KIỆN CHUẨN HIGH WIN-RATE (Score >= 88)
+        if vol_ratio_h1 >= 2.0 and oi_h1_pct >= 3.0 and taker_h1_pct >= 75.0:
             atr1h = calculate_atr(h1_candles, 14)
             entry = last_h1['close']
             sl = last_h1['low'] - (0.15 * atr1h)
-            
-            prev_highs = [c['high'] for c in h1_candles[-20:-1]]
-            swing_high = max(prev_highs) if prev_highs else entry + (1.6 * atr1h)
-            
-            tp1 = max(swing_high, entry + (1.6 * atr1h))
-            tp2 = entry + (2.6 * atr1h)
+            risk = entry - sl
+            if risk <= 0: return None
 
-            return {
-                'engine_tag': 'H1 SQUEEZE',
-                'title': '⚡️ [H1 SPOT SQUEEZE] - ONDO PATTERN',
-                'symbol': symbol,
-                'entry': entry,
-                'sl': sl,
-                'tp1': tp1,
-                'tp2': tp2,
-                'wick_pct': 0,
-                'vol_ratio': vol_ratio_h1,
-                'oi_pct': oi_h1_pct,
-                'taker_pct': taker_h1_pct,
-                'score': 88 + min(vol_ratio_h1 * 2, 10),
-                'timestamp': last_h1['timestamp'],
-                'signal_id': f"ONDO_H1_{symbol}_{last_h1['timestamp']}"
-            }
+            # SET TP1 (1.6R) & TP2 (2.6R)
+            tp1 = entry + (risk * 1.6)
+            tp2 = entry + (risk * 2.6)
+
+            score_h1 = 88 + min(vol_ratio_h1 * 2, 10)
+            if score_h1 >= MIN_WINRATE_SCORE:
+                return {
+                    'engine_tag': 'H1 BREAKOUT',
+                    'title': '🚀 [HIGH WIN-RATE LONG H1] - CONFIRMED',
+                    'symbol': symbol,
+                    'entry': entry,
+                    'sl': sl,
+                    'tp1': tp1,
+                    'tp2': tp2,
+                    'risk_pct': (risk / entry) * 100,
+                    'tp1_pct': ((tp1 - entry) / entry) * 100,
+                    'tp2_pct': ((tp2 - entry) / entry) * 100,
+                    'vol_ratio': vol_ratio_h1,
+                    'oi_pct': oi_h1_pct,
+                    'taker_pct': taker_h1_pct,
+                    'score': score_h1,
+                    'timestamp': last_h1['timestamp'],
+                    'signal_id': f"HIGH_H1_{symbol}_{last_h1['timestamp']}"
+                }
 
     return None
 
 # ==============================================================================
-# 5. GIAO DIỆN TELEGRAM GỌN GÀNG, ĐẸP MẮT, KHÔNG RỐI
+# 5. GIAO DIỆN TELEGRAM GỌN GÀNG, SẮC NẮT, DỄ NHÌN
 # ==============================================================================
 def send_telegram_signal(sig):
     global signal_counter
@@ -376,39 +384,33 @@ def send_telegram_signal(sig):
     signals_history.append(sig)
     active_signals.append(sig)
 
-    risk_pct = ((sig['entry'] - sig['sl']) / sig['entry']) * 100
-    tp1_pct = ((sig['tp1'] - sig['entry']) / sig['entry']) * 100
-    tp2_pct = ((sig['tp2'] - sig['entry']) / sig['entry']) * 100
-
-    extra_info = f"• Râu nến rút: <b>{sig['wick_pct']:.1f}%</b>\n" if sig['wick_pct'] > 0 else ""
-
     msg = f"""<b>{sig['title']}</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
-🪙 Coin: <b>#{sig['symbol']}</b> (Signal #{sig['id']})
-🔥 <b>Dấu hiệu dòng tiền:</b>
+🪙 Coin: <b>#{sig['symbol']}</b> (Score: <b>{sig['score']}/100</b>)
+🔥 <b>Dòng tiền & Lực mua:</b>
 • Volume: <b>+{sig['vol_ratio']:.2f}x SMA20</b>
 • Open Interest: <b>+{sig['oi_pct']:.2f}%</b>
 • Taker Buy (CVD): <b>{sig['taker_pct']:.1f}%</b>
-{extra_info}
+
 🎯 <b>KẾ HOẠCH LỆNH (LONG):</b>
 📍 Entry: <code>{sig['entry']:.4f}</code>
-🛑 Stop Loss: <code>{sig['sl']:.4f}</code> (-{risk_pct:.2f}%)
-🎯 Take Profit 1: <code>{sig['tp1']:.4f}</code> (+{tp1_pct:.2f}%)
-🚀 Take Profit 2: <code>{sig['tp2']:.4f}</code> (+{tp2_pct:.2f}%)
+🛑 Stop Loss: <code>{sig['sl']:.4f}</code> (<b>-{sig['risk_pct']:.2f}%</b>)
+🎯 Take Profit 1 (1.6R): <code>{sig['tp1']:.4f}</code> (<b>+{sig['tp1_pct']:.2f}%</b>)
+🚀 Take Profit 2 (2.6R): <code>{sig['tp2']:.4f}</code> (<b>+{sig['tp2_pct']:.2f}%</b>)
 ━━━━━━━━━━━━━━━━━━━━━━━
 👉 <i>Đã bật theo dõi giá Real-time 24/7!</i>"""
 
     send_telegram_direct_message(msg)
-    print(f"✅ Đã bắn tín hiệu #{sig['id']} [{sig['engine_tag']}] cho {sig['symbol']}", flush=True)
+    print(f"✅ Đã bắn tín hiệu High Winrate #{sig['id']} [{sig['engine_tag']}] cho {sig['symbol']}", flush=True)
 
 # ==============================================================================
 # 6. MAIN LOOP RUNNER
 # ==============================================================================
 def run_radar_loop():
-    print("⚡️ Bắt đầu Radar Engine H4 Rejection & H1 Spot Squeeze...", flush=True)
+    print("⚡️ Bắt đầu Radar High Win-Rate & M15 Early Entry Bot...", flush=True)
     while True:
         all_symbols = get_all_bybit_usdt_symbols()
-        print(f"🔍 Đang rà soát 2 mô hình QNT/ONDO cho {len(all_symbols)} coin...", flush=True)
+        print(f"🔍 Đang lọc kèo Tỷ lệ thắng cao cho {len(all_symbols)} coin...", flush=True)
         
         candidates = []
         for symbol in all_symbols:

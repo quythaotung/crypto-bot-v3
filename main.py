@@ -10,7 +10,7 @@ from flask import Flask
 DEBUG_MODE = True                  # In log chi tiết ra Render
 COOLDOWN_SECONDS = 300             # Giãn cách giữa các vòng quét toàn sàn (5 phút)
 MIN_TURNOVER_24H = 5_000_000       # Turnover 24h tối thiểu $5M USD
-MAX_ALERTS_PER_CYCLE = 3           # Tối đa gửi Top 3 COIN SIÊU KHỎE mỗi vòng quét
+MAX_ALERTS_PER_CYCLE = 3           # Tối đa gửi Top 3 COIN SIÊU ĐẸP mỗi vòng quét
 MIN_WINRATE_SCORE = 85             # CHỈ BÁO KÈO ĐẠT TỪ 85/100 ĐIỂM TỶ LỆ THẮNG CAO
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -28,7 +28,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Multi-Timeframe H4/H1/M15 Bot Active 24/7!"
+    return "Bybit Anti-Chase & RSI Bottoming Bot Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -56,11 +56,11 @@ def send_telegram_direct_message(text):
 
 def send_pnl_summary():
     if not signals_history:
-        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\n🟢 Bot đang hoạt động 24/7!\n⏳ Chưa có tín hiệu H4/H1/M15 mới phát ra."
+        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\n🟢 Bot đang hoạt động 24/7!\n⏳ Chưa có tín hiệu chuẩn RSI Bottoming (>=85đ) nào phát ra."
         send_telegram_direct_message(msg)
         return
 
-    msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH HIGH WIN-RATE:</b>\n"
+    msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH REAL-TIME:</b>\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
     total_pnl_pct = 0.0
     
@@ -98,7 +98,7 @@ def process_telegram_commands():
                     if text in ["/pnl", "/summary", "pnl"]:
                         send_pnl_summary()
                     elif text in ["/start", "/ping", "ping"]:
-                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot H4/H1/M15 đang hoạt động 24/7!")
+                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot Anti-Chase RSI đang hoạt động 24/7!")
         except Exception as e:
             print(f"Lỗi luồng Telegram Listener: {e}", flush=True)
         time.sleep(2)
@@ -215,6 +215,27 @@ def get_closed_klines(symbol, interval, limit=50):
         pass
     return []
 
+def calculate_rsi(candles, period=14):
+    if len(candles) < period + 1: return []
+    closes = [c['close'] for c in candles]
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i-1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+    
+    rsi_values = []
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    rsi_values.append(100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
+        
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rsi_values.append(100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
+    return rsi_values
+
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1: return 0.0
     tr_list = []
@@ -267,7 +288,7 @@ def calculate_sma_volume(candles, period=20):
     return sum(vols) / period
 
 # ==============================================================================
-# 4. ENGINE TỔNG HỢP: QUÉT KHUNG H4, H1 VÀ M15 (HIGH WIN-RATE)
+# 4. ENGINE TỔNG HỢP: QUÉT KHUNG H4, H1 VÀ M15 (CHỐNG MUA ĐỦI - CHUẨN RSI 40-55)
 # ==============================================================================
 
 def evaluate_symbol_setups(symbol, btc_h1_candles):
@@ -275,13 +296,127 @@ def evaluate_symbol_setups(symbol, btc_h1_candles):
         return None
 
     # --------------------------------------------------------------------------
-    # ENGINE 1: QUÉT KHUNG H4 (H4 REJECTION & PUMP)
+    # ENGINE 1: QUÉT KHUNG M15 (EARLY BUY ENTRY - BẮT SỚM NỀN TÍCH LŨY)
+    # --------------------------------------------------------------------------
+    m15_candles = get_closed_klines(symbol, "15", limit=30)
+    if len(m15_candles) >= 22:
+        last_m15 = m15_candles[-1]
+        body_pct = (last_m15['close'] - last_m15['open']) / last_m15['open'] * 100
+        change_4_candles = (last_m15['close'] - m15_candles[-4]['close']) / m15_candles[-4]['close'] * 100
+        
+        # BỘ LỌC CHỐNG CHASE: Không bắt nếu nến xanh dài > 3.0% hoặc đã pump > 8.0%
+        if body_pct <= 3.0 and change_4_candles <= 8.0:
+            rsi_m15_vals = calculate_rsi(m15_candles, 14)
+            if len(rsi_m15_vals) >= 3:
+                curr_rsi = rsi_m15_vals[-1]
+                prev_rsi = min(rsi_m15_vals[-3:-1])
+                
+                # BẮT BUỘC RSI HOÀN TRẢ VỀ DƯỚI 40 - 55 VÀ ĐANG TẠO ĐÁY BẬT LÊN
+                if 40.0 <= curr_rsi <= 55.0 and curr_rsi > prev_rsi:
+                    avg_vol_m15 = calculate_sma_volume(m15_candles[:-1], 20)
+                    vol_ratio_m15 = last_m15['volume'] / avg_vol_m15 if avg_vol_m15 > 0 else 0.0
+                    taker_m15_pct = get_taker_buy_pct(symbol, "5m")
+
+                    if vol_ratio_m15 >= 1.5 and taker_m15_pct >= 60.0:
+                        atr15m = calculate_atr(m15_candles, 14)
+                        entry = last_m15['close']
+                        sl = last_m15['low'] - (0.15 * atr15m)
+                        risk = entry - sl
+                        if risk > 0:
+                            tp1 = entry + (risk * 1.6)
+                            tp2 = entry + (risk * 2.6)
+                            score_m15 = int(85 + min(vol_ratio_m15 * 2, 10))
+                            
+                            if score_m15 >= MIN_WINRATE_SCORE:
+                                return {
+                                    'engine_tag': 'M15 EARLY BUY',
+                                    'title': '⚡️ [EARLY LONG M15] - RSI HỒI NỀN TẠO ĐÁY',
+                                    'symbol': symbol,
+                                    'entry': entry,
+                                    'sl': sl,
+                                    'tp1': tp1,
+                                    'tp2': tp2,
+                                    'risk_pct': (risk / entry) * 100,
+                                    'tp1_pct': ((tp1 - entry) / entry) * 100,
+                                    'tp2_pct': ((tp2 - entry) / entry) * 100,
+                                    'rsi_val': curr_rsi,
+                                    'vol_ratio': vol_ratio_m15,
+                                    'oi_pct': get_open_interest_pct(symbol, "15m"),
+                                    'taker_pct': taker_m15_pct,
+                                    'score': score_m15,
+                                    'timestamp': last_m15['timestamp'],
+                                    'signal_id': f"M15_RSI_{symbol}_{last_m15['timestamp']}"
+                                }
+
+    # --------------------------------------------------------------------------
+    # ENGINE 2: QUÉT KHUNG H1 (LEADING COIN & RECLAIM SUPPORT)
+    # --------------------------------------------------------------------------
+    h1_candles = get_closed_klines(symbol, "60", limit=30)
+    if len(h1_candles) >= 22 and btc_h1_candles and len(btc_h1_candles) >= 6:
+        last_h1 = h1_candles[-1]
+        body_pct_h1 = (last_h1['close'] - last_h1['open']) / last_h1['open'] * 100
+        change_4h = (last_h1['close'] - h1_candles[-4]['close']) / h1_candles[-4]['close'] * 100
+
+        # BỘ LỌC CHỐNG ĐU ĐỈNH: Thân nến H1 <= 3.5% và Tăng 4h <= 10.0%
+        if body_pct_h1 <= 3.5 and change_4h <= 10.0:
+            rsi_h1_vals = calculate_rsi(h1_candles, 14)
+            if len(rsi_h1_vals) >= 3:
+                curr_rsi_h1 = rsi_h1_vals[-1]
+                prev_rsi_h1 = min(rsi_h1_vals[-3:-1])
+
+                # RSI PHẢI NẰM Ở DẢI 40 - 55 VÀ TẠO ĐÁY
+                if 40.0 <= curr_rsi_h1 <= 55.0 and curr_rsi_h1 > prev_rsi_h1:
+                    sym_chg_4h = (last_h1['close'] - h1_candles[-4]['close']) / h1_candles[-4]['close'] * 100
+                    btc_chg_4h = (btc_h1_candles[-1]['close'] - btc_h1_candles[-4]['close']) / btc_h1_candles[-4]['close'] * 100
+                    relative_strength = sym_chg_4h - btc_chg_4h
+
+                    avg_vol_h1 = calculate_sma_volume(h1_candles[:-1], 20)
+                    vol_ratio_h1 = last_h1['volume'] / avg_vol_h1 if avg_vol_h1 > 0 else 0.0
+                    oi_h1_pct = get_open_interest_pct(symbol, "1h")
+                    taker_h1_pct = get_taker_buy_pct(symbol, "1h")
+
+                    if relative_strength >= 0.5 and vol_ratio_h1 >= 1.6 and oi_h1_pct >= 1.5 and taker_h1_pct >= 60.0:
+                        atr1h = calculate_atr(h1_candles, 14)
+                        entry = last_h1['close']
+                        sl = min([c['low'] for c in h1_candles[-4:]]) - (0.15 * atr1h)
+                        risk = entry - sl
+                        if risk > 0:
+                            tp1 = entry + (risk * 1.6)
+                            tp2 = entry + (risk * 2.6)
+                            score = int(83 + min(relative_strength * 2, 7) + min(vol_ratio_h1 * 2, 6))
+                            
+                            if score >= MIN_WINRATE_SCORE:
+                                return {
+                                    'engine_tag': 'H1 RECLAIM',
+                                    'title': '🔥 [HIGH WIN-RATE LONG H1] - NỀN TÍCH LŨY',
+                                    'symbol': symbol,
+                                    'entry': entry,
+                                    'sl': sl,
+                                    'tp1': tp1,
+                                    'tp2': tp2,
+                                    'risk_pct': (risk / entry) * 100,
+                                    'tp1_pct': ((tp1 - entry) / entry) * 100,
+                                    'tp2_pct': ((tp2 - entry) / entry) * 100,
+                                    'rsi_val': curr_rsi_h1,
+                                    'vol_ratio': vol_ratio_h1,
+                                    'oi_pct': oi_h1_pct,
+                                    'taker_pct': taker_h1_pct,
+                                    'score': score,
+                                    'timestamp': last_h1['timestamp'],
+                                    'signal_id': f"H1_RSI_{symbol}_{last_h1['timestamp']}"
+                                }
+
+    # --------------------------------------------------------------------------
+    # ENGINE 3: QUÉT KHUNG H4 (H4 SWEEP & RECOVERY)
     # --------------------------------------------------------------------------
     h4_candles = get_closed_klines(symbol, "240", limit=30)
     if len(h4_candles) >= 22:
         last_h4 = h4_candles[-1]
         h4_range = last_h4['high'] - last_h4['low']
-        if h4_range > 0:
+        change_16h = (last_h4['close'] - h4_candles[-4]['close']) / h4_candles[-4]['close'] * 100
+
+        # Chống đu đỉnh H4 (Giá 16 tiếng không vọt quá 12%)
+        if h4_range > 0 and change_16h <= 12.0:
             lower_wick_h4 = min(last_h4['open'], last_h4['close']) - last_h4['low']
             wick_ratio_h4 = lower_wick_h4 / h4_range
             
@@ -289,7 +424,7 @@ def evaluate_symbol_setups(symbol, btc_h1_candles):
             vol_ratio_h4 = last_h4['volume'] / avg_vol_h4 if avg_vol_h4 > 0 else 0.0
             oi_h4_pct = get_open_interest_pct(symbol, "4h")
 
-            if wick_ratio_h4 >= 0.35 and vol_ratio_h4 >= 1.8 and oi_h4_pct >= 3.0:
+            if wick_ratio_h4 >= 0.35 and vol_ratio_h4 >= 1.8 and oi_h4_pct >= 2.5:
                 atr4h = calculate_atr(h4_candles, 14)
                 entry = last_h4['close']
                 sl = last_h4['low'] - (0.15 * atr4h)
@@ -300,7 +435,7 @@ def evaluate_symbol_setups(symbol, btc_h1_candles):
                     
                     return {
                         'engine_tag': 'H4 REJECTION',
-                        'title': '🚀 [H4 REJECTION & PUMP] - TÍN HIỆU KHUNG H4',
+                        'title': '🚀 [H4 SWEEP & RECOVERY] - TÍCH LŨY CẮN SL RÚT CHÂN',
                         'symbol': symbol,
                         'entry': entry,
                         'sl': sl,
@@ -309,104 +444,14 @@ def evaluate_symbol_setups(symbol, btc_h1_candles):
                         'risk_pct': (risk / entry) * 100,
                         'tp1_pct': ((tp1 - entry) / entry) * 100,
                         'tp2_pct': ((tp2 - entry) / entry) * 100,
+                        'rsi_val': 50.0,
                         'vol_ratio': vol_ratio_h4,
                         'oi_pct': oi_h4_pct,
                         'taker_pct': get_taker_buy_pct(symbol, "4h"),
-                        'score': 90,
+                        'score': 88,
                         'timestamp': last_h4['timestamp'],
-                        'signal_id': f"H4_REJ_{symbol}_{last_h4['timestamp']}"
+                        'signal_id': f"H4_SWEEP_{symbol}_{last_h4['timestamp']}"
                     }
-
-    # --------------------------------------------------------------------------
-    # ENGINE 2: QUÉT KHUNG H1 (LEADING COIN & BREAKOUT)
-    # --------------------------------------------------------------------------
-    h1_candles = get_closed_klines(symbol, "60", limit=30)
-    if len(h1_candles) >= 22 and btc_h1_candles and len(btc_h1_candles) >= 6:
-        last_h1 = h1_candles[-1]
-        
-        sym_chg_4h = (last_h1['close'] - h1_candles[-4]['close']) / h1_candles[-4]['close'] * 100
-        btc_chg_4h = (btc_h1_candles[-1]['close'] - btc_h1_candles[-4]['close']) / btc_h1_candles[-4]['close'] * 100
-        relative_strength = sym_chg_4h - btc_chg_4h
-
-        avg_vol_h1 = calculate_sma_volume(h1_candles[:-1], 20)
-        vol_ratio_h1 = last_h1['volume'] / avg_vol_h1 if avg_vol_h1 > 0 else 0.0
-        oi_h1_pct = get_open_interest_pct(symbol, "1h")
-        taker_h1_pct = get_taker_buy_pct(symbol, "1h")
-
-        if relative_strength >= 0.8 and vol_ratio_h1 >= 1.8 and oi_h1_pct >= 2.0 and taker_h1_pct >= 65.0:
-            atr1h = calculate_atr(h1_candles, 14)
-            entry = last_h1['close']
-            sl = min([c['low'] for c in h1_candles[-5:]]) - (0.15 * atr1h)
-            risk = entry - sl
-            if risk > 0:
-                tp1 = entry + (risk * 1.6)
-                tp2 = entry + (risk * 2.6)
-                score = int(82 + min(relative_strength * 2, 8) + min(vol_ratio_h1 * 2, 6))
-                
-                if score >= MIN_WINRATE_SCORE:
-                    return {
-                        'engine_tag': 'H1 LEADING',
-                        'title': '🔥 [HIGH WIN-RATE LONG H1] - LEADING COIN',
-                        'symbol': symbol,
-                        'entry': entry,
-                        'sl': sl,
-                        'tp1': tp1,
-                        'tp2': tp2,
-                        'risk_pct': (risk / entry) * 100,
-                        'tp1_pct': ((tp1 - entry) / entry) * 100,
-                        'tp2_pct': ((tp2 - entry) / entry) * 100,
-                        'vol_ratio': vol_ratio_h1,
-                        'oi_pct': oi_h1_pct,
-                        'taker_pct': taker_h1_pct,
-                        'score': score,
-                        'timestamp': last_h1['timestamp'],
-                        'signal_id': f"H1_LEAD_{symbol}_{last_h1['timestamp']}"
-                    }
-
-    # --------------------------------------------------------------------------
-    # ENGINE 3: QUÉT KHUNG M15 (EARLY BUY ENTRY)
-    # --------------------------------------------------------------------------
-    m15_candles = get_closed_klines(symbol, "15", limit=30)
-    if len(m15_candles) >= 22:
-        last_m15 = m15_candles[-1]
-        m15_range = last_m15['high'] - last_m15['low']
-        if m15_range > 0:
-            lower_wick_m15 = min(last_m15['open'], last_m15['close']) - last_m15['low']
-            wick_ratio_m15 = lower_wick_m15 / m15_range
-            
-            avg_vol_m15 = calculate_sma_volume(m15_candles[:-1], 20)
-            vol_ratio_m15 = last_m15['volume'] / avg_vol_m15 if avg_vol_m15 > 0 else 0.0
-            taker_m15_pct = get_taker_buy_pct(symbol, "5m")
-
-            if (wick_ratio_m15 >= 0.30 or last_m15['close'] > m15_candles[-2]['high']) and vol_ratio_m15 >= 1.8 and taker_m15_pct >= 65.0:
-                atr15m = calculate_atr(m15_candles, 14)
-                entry = last_m15['close']
-                sl = last_m15['low'] - (0.15 * atr15m)
-                risk = entry - sl
-                if risk > 0:
-                    tp1 = entry + (risk * 1.6)
-                    tp2 = entry + (risk * 2.6)
-                    score_m15 = int(85 + min(vol_ratio_m15 * 2, 10))
-                    
-                    if score_m15 >= MIN_WINRATE_SCORE:
-                        return {
-                            'engine_tag': 'M15 EARLY BUY',
-                            'title': '⚡️ [EARLY LONG M15] - TÍN HIỆU BẮT SỚM',
-                            'symbol': symbol,
-                            'entry': entry,
-                            'sl': sl,
-                            'tp1': tp1,
-                            'tp2': tp2,
-                            'risk_pct': (risk / entry) * 100,
-                            'tp1_pct': ((tp1 - entry) / entry) * 100,
-                            'tp2_pct': ((tp2 - entry) / entry) * 100,
-                            'vol_ratio': vol_ratio_m15,
-                            'oi_pct': get_open_interest_pct(symbol, "15m"),
-                            'taker_pct': taker_m15_pct,
-                            'score': score_m15,
-                            'timestamp': last_m15['timestamp'],
-                            'signal_id': f"M15_EARLY_{symbol}_{last_m15['timestamp']}"
-                        }
 
     return None
 
@@ -427,6 +472,7 @@ def send_telegram_signal(sig):
     msg = f"""<b>{sig['title']}</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
 🪙 Coin: <b>#{sig['symbol']}</b> (Score: <b>{sig['score']}/100</b>)
+📉 RSI Hồi Đáy: <b>{sig['rsi_val']:.1f}</b> (Vùng tích lũy an toàn)
 
 🔥 <b>Dấu hiệu dòng tiền nổ:</b>
 • Volume: <b>+{sig['vol_ratio']:.2f}x SMA20</b>
@@ -448,11 +494,11 @@ def send_telegram_signal(sig):
 # 6. MAIN LOOP RUNNER
 # ==============================================================================
 def run_radar_loop():
-    print("⚡️ Bắt đầu Radar Multi-Timeframe H4/H1/M15 Bot...", flush=True)
+    print("⚡️ Bắt đầu Radar Anti-Chase & RSI Bottoming Bot...", flush=True)
     while True:
         btc_h1 = get_closed_klines("BTCUSDT", "60", limit=30)
         all_symbols = get_all_bybit_usdt_symbols()
-        print(f"🔍 Đang rà soát H4/H1/M15 cho {len(all_symbols)} coin...", flush=True)
+        print(f"🔍 Đang rà soát RSI 40-55 & Chống Mua Đuổi cho {len(all_symbols)} coin...", flush=True)
         
         candidates = []
         for symbol in all_symbols:

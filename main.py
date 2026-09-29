@@ -5,13 +5,13 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION
+# CONFIGURATION - TỐI ƯU CHỐNG LOÃNG KÈO (HIGH WIN-RATE ONLY)
 # ==============================================================================
 DEBUG_MODE = True                  # In log chi tiết ra Render
-COOLDOWN_SECONDS = 10              # QUÉT THỊ TRƯỜNG LIÊN TỤC (Chỉ nghỉ 10s giữa các vòng)
-MIN_TURNOVER_24H = 5_000_000       # Turnover 24h tối thiểu $5M USD
-MAX_ALERTS_PER_CYCLE = 5           # Tối đa gửi Top 5 kèo đẹp nhất phát hiện được
-MIN_WINRATE_SCORE = 85             # CHỈ BÁO KÈO ĐẠT TỪ 85/100 ĐIỂM TRỞ LÊN
+COOLDOWN_SECONDS = 10              # Quét liên tục (chỉ nghỉ 10s giữa các vòng)
+MIN_TURNOVER_24H = 8_000_000       # Turnover 24h tối thiểu $8M USD (Chỉ lọc coin thanh khoản lớn)
+MAX_ALERTS_PER_CYCLE = 2           # Tối đa gửi Top 2 KÈO SIÊU ĐẸP mỗi lượt quét
+MIN_WINRATE_SCORE = 88             # NÂNG MỨC ĐIỂM UY TÍN LÊN 88/100 (CHỐNG LOÃNG KÈO)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -28,7 +28,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Real-time Instant Alert Bot Active 24/7!"
+    return "Bybit High Win-Rate Strict Filter Bot Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -56,11 +56,11 @@ def send_telegram_direct_message(text):
 
 def send_pnl_summary():
     if not signals_history:
-        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\n🟢 Bot đang chạy Real-time liên tục!\n⏳ Chưa có tín hiệu chuẩn Retest/Support (>=85đ) nào phát ra."
+        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\n🟢 Bot đang chạy lọc kèo khắt khe 24/7!\n⏳ Chưa có tín hiệu Tỷ Lệ Thắng Cao (>=88đ) nào phát ra."
         send_telegram_direct_message(msg)
         return
 
-    msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH REAL-TIME:</b>\n"
+    msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL CÁC LỆNH HIGH WIN-RATE:</b>\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
     total_pnl_pct = 0.0
     
@@ -98,7 +98,7 @@ def process_telegram_commands():
                     if text in ["/pnl", "/summary", "pnl"]:
                         send_pnl_summary()
                     elif text in ["/start", "/ping", "ping"]:
-                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot Bắn Tín Hiệu Tức Thì đang hoạt động 24/7!")
+                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot High Win-Rate đang lọc kèo 24/7!")
         except Exception as e:
             print(f"Lỗi luồng Telegram Listener: {e}", flush=True)
         time.sleep(2)
@@ -288,7 +288,7 @@ def calculate_sma_volume(candles, period=20):
     return sum(vols) / period
 
 # ==============================================================================
-# 4. CORE ENGINE: QUÉT CÁC ĐIỀU KIỆN KỸ THUẬT RẮC RẮC (H1 RETEST / M15 EARLY)
+# 4. CORE ENGINE: BỘ LỌC NGHIÊM NGẶT (STRICT HIGH WIN-RATE)
 # ==============================================================================
 
 def evaluate_symbol_setups(symbol, btc_h1_candles):
@@ -296,106 +296,115 @@ def evaluate_symbol_setups(symbol, btc_h1_candles):
         return None
 
     # --------------------------------------------------------------------------
-    # ENGINE 1: QUÉT H1 SUPPORT RETEST
+    # ENGINE 1: QUÉT RETEST MỨC HỖ TRỢ H1 (SUPPORT RETEST)
     # --------------------------------------------------------------------------
     h1_candles = get_closed_klines(symbol, "60", limit=30)
     if len(h1_candles) >= 22:
         last_h1 = h1_candles[-1]
-        recent_highs = [c['high'] for c in h1_candles[-15:-3]]
-        if recent_highs:
-            support_level = max(recent_highs)
-            curr_price = last_h1['close']
-            dist_to_supp = abs(curr_price - support_level) / support_level * 100
-            
-            if dist_to_supp <= 1.2 or (last_h1['low'] <= support_level <= last_h1['high']):
-                taker_h1_pct = get_taker_buy_pct(symbol, "1h")
-                oi_h1_pct = get_open_interest_pct(symbol, "1h")
+        body_pct = (last_h1['close'] - last_h1['open']) / last_h1['open'] * 100
+        change_4_candles = (last_h1['close'] - h1_candles[-4]['close']) / h1_candles[-4]['close'] * 100
+
+        # CHỐNG MUA ĐỦI: Bắt buộc không đu nến xanh dài (> 3.0%) hoặc chóp nến (tăng > 8%)
+        if body_pct <= 3.0 and change_4_candles <= 8.0:
+            recent_highs = [c['high'] for c in h1_candles[-15:-3]]
+            if recent_highs:
+                support_level = max(recent_highs)
+                curr_price = last_h1['close']
+                dist_to_supp = abs(curr_price - support_level) / support_level * 100
                 
-                h1_range = last_h1['high'] - last_h1['low']
-                lower_wick = (min(last_h1['open'], last_h1['close']) - last_h1['low'])
-                wick_ratio = lower_wick / h1_range if h1_range > 0 else 0
-                
-                if (wick_ratio >= 0.25 or last_h1['close'] > last_h1['open']) and taker_h1_pct >= 58.0:
-                    atr1h = calculate_atr(h1_candles, 14)
-                    entry = curr_price
-                    sl = min(last_h1['low'], support_level) - (0.15 * atr1h)
-                    risk = entry - sl
+                if dist_to_supp <= 1.0 or (last_h1['low'] <= support_level <= last_h1['high']):
+                    taker_h1_pct = get_taker_buy_pct(symbol, "1h")
+                    oi_h1_pct = get_open_interest_pct(symbol, "1h")
                     
-                    if risk > 0:
-                        tp1 = entry + (risk * 1.6)
-                        tp2 = entry + (risk * 2.6)
-                        score = int(87 + min(wick_ratio * 20, 8))
+                    h1_range = last_h1['high'] - last_h1['low']
+                    lower_wick = (min(last_h1['open'], last_h1['close']) - last_h1['low'])
+                    wick_ratio = lower_wick / h1_range if h1_range > 0 else 0
+                    
+                    if (wick_ratio >= 0.30 or last_h1['close'] > last_h1['open']) and taker_h1_pct >= 62.0 and oi_h1_pct >= 1.0:
+                        atr1h = calculate_atr(h1_candles, 14)
+                        entry = curr_price
+                        sl = min(last_h1['low'], support_level) - (0.15 * atr1h)
+                        risk = entry - sl
                         
-                        if score >= MIN_WINRATE_SCORE:
-                            return {
-                                'engine_tag': 'SUPPORT RETEST',
-                                'title': '🎯 [H1 SUPPORT RETEST] - RECLAIM VÙNG RETEST ĐẸP',
-                                'symbol': symbol,
-                                'entry': entry,
-                                'sl': sl,
-                                'tp1': tp1,
-                                'tp2': tp2,
-                                'risk_pct': (risk / entry) * 100,
-                                'tp1_pct': ((tp1 - entry) / entry) * 100,
-                                'tp2_pct': ((tp2 - entry) / entry) * 100,
-                                'vol_ratio': last_h1['volume'] / calculate_sma_volume(h1_candles[:-1], 20),
-                                'oi_pct': oi_h1_pct,
-                                'taker_pct': taker_h1_pct,
-                                'score': score,
-                                'timestamp': last_h1['timestamp'],
-                                'signal_id': f"RETEST_{symbol}_{last_h1['timestamp']}"
-                            }
+                        if risk > 0:
+                            tp1 = entry + (risk * 1.6)
+                            tp2 = entry + (risk * 2.6)
+                            score = int(88 + min(wick_ratio * 20, 8))
+                            
+                            if score >= MIN_WINRATE_SCORE:
+                                return {
+                                    'engine_tag': 'SUPPORT RETEST',
+                                    'title': '🎯 [H1 SUPPORT RETEST] - RECLAIM RETEST ĐẸP',
+                                    'symbol': symbol,
+                                    'entry': entry,
+                                    'sl': sl,
+                                    'tp1': tp1,
+                                    'tp2': tp2,
+                                    'risk_pct': (risk / entry) * 100,
+                                    'tp1_pct': ((tp1 - entry) / entry) * 100,
+                                    'tp2_pct': ((tp2 - entry) / entry) * 100,
+                                    'vol_ratio': last_h1['volume'] / calculate_sma_volume(h1_candles[:-1], 20),
+                                    'oi_pct': oi_h1_pct,
+                                    'taker_pct': taker_h1_pct,
+                                    'score': score,
+                                    'timestamp': last_h1['timestamp'],
+                                    'signal_id': f"RETEST_{symbol}_{last_h1['timestamp']}"
+                                }
 
     # --------------------------------------------------------------------------
-    # ENGINE 2: QUÉT M15 EARLY BUY
+    # ENGINE 2: QUÉT BẮT SỚM M15 (EARLY BUY - CHUẨN RSI 40-55 ĐÁY)
     # --------------------------------------------------------------------------
     m15_candles = get_closed_klines(symbol, "15", limit=30)
     if len(m15_candles) >= 22:
         last_m15 = m15_candles[-1]
-        rsi_m15_vals = calculate_rsi(m15_candles, 14)
-        if len(rsi_m15_vals) >= 3:
-            curr_rsi = rsi_m15_vals[-1]
-            prev_rsi = min(rsi_m15_vals[-3:-1])
-            
-            if 40.0 <= curr_rsi <= 55.0 and curr_rsi > prev_rsi:
-                avg_vol_m15 = calculate_sma_volume(m15_candles[:-1], 20)
-                vol_ratio_m15 = last_m15['volume'] / avg_vol_m15 if avg_vol_m15 > 0 else 0.0
-                taker_m15_pct = get_taker_buy_pct(symbol, "5m")
+        body_m15_pct = (last_m15['close'] - last_m15['open']) / last_m15['open'] * 100
+        
+        if body_m15_pct <= 2.5:
+            rsi_m15_vals = calculate_rsi(m15_candles, 14)
+            if len(rsi_m15_vals) >= 3:
+                curr_rsi = rsi_m15_vals[-1]
+                prev_rsi = min(rsi_m15_vals[-3:-1])
+                
+                # BẮT BUỘC RSI CHUẨN 40 - 55 VÀ TẠO ĐÁY BẮT ĐẦU ĐI LÊN
+                if 40.0 <= curr_rsi <= 55.0 and curr_rsi > prev_rsi:
+                    avg_vol_m15 = calculate_sma_volume(m15_candles[:-1], 20)
+                    vol_ratio_m15 = last_m15['volume'] / avg_vol_m15 if avg_vol_m15 > 0 else 0.0
+                    taker_m15_pct = get_taker_buy_pct(symbol, "5m")
 
-                if vol_ratio_m15 >= 1.5 and taker_m15_pct >= 62.0:
-                    atr15m = calculate_atr(m15_candles, 14)
-                    entry = last_m15['close']
-                    sl = last_m15['low'] - (0.15 * atr15m)
-                    risk = entry - sl
-                    if risk > 0:
-                        tp1 = entry + (risk * 1.6)
-                        tp2 = entry + (risk * 2.6)
-                        score_m15 = int(85 + min(vol_ratio_m15 * 2, 10))
-                        
-                        if score_m15 >= MIN_WINRATE_SCORE:
-                            return {
-                                'engine_tag': 'M15 EARLY BUY',
-                                'title': '⚡️ [EARLY LONG M15] - RSI HỒI NỀN TẠO ĐÁY',
-                                'symbol': symbol,
-                                'entry': entry,
-                                'sl': sl,
-                                'tp1': tp1,
-                                'tp2': tp2,
-                                'risk_pct': (risk / entry) * 100,
-                                'tp1_pct': ((tp1 - entry) / entry) * 100,
-                                'tp2_pct': ((tp2 - entry) / entry) * 100,
-                                'vol_ratio': vol_ratio_m15,
-                                'oi_pct': get_open_interest_pct(symbol, "15m"),
-                                'taker_pct': taker_m15_pct,
-                                'score': score_m15,
-                                'timestamp': last_m15['timestamp'],
-                                'signal_id': f"M15_EARLY_{symbol}_{last_m15['timestamp']}"
-                            }
+                    if vol_ratio_m15 >= 1.8 and taker_m15_pct >= 65.0:
+                        atr15m = calculate_atr(m15_candles, 14)
+                        entry = last_m15['close']
+                        sl = last_m15['low'] - (0.15 * atr15m)
+                        risk = entry - sl
+                        if risk > 0:
+                            tp1 = entry + (risk * 1.6)
+                            tp2 = entry + (risk * 2.6)
+                            score_m15 = int(88 + min(vol_ratio_m15 * 2, 8))
+                            
+                            if score_m15 >= MIN_WINRATE_SCORE:
+                                return {
+                                    'engine_tag': 'M15 EARLY BUY',
+                                    'title': '⚡️ [EARLY LONG M15] - RSI TẠO ĐÁY NỀN AN TOÀN',
+                                    'symbol': symbol,
+                                    'entry': entry,
+                                    'sl': sl,
+                                    'tp1': tp1,
+                                    'tp2': tp2,
+                                    'risk_pct': (risk / entry) * 100,
+                                    'tp1_pct': ((tp1 - entry) / entry) * 100,
+                                    'tp2_pct': ((tp2 - entry) / entry) * 100,
+                                    'vol_ratio': vol_ratio_m15,
+                                    'oi_pct': get_open_interest_pct(symbol, "15m"),
+                                    'taker_pct': taker_m15_pct,
+                                    'score': score_m15,
+                                    'timestamp': last_m15['timestamp'],
+                                    'signal_id': f"M15_STRICT_{symbol}_{last_m15['timestamp']}"
+                                }
 
     return None
 
 # ==============================================================================
-# 5. GIAO DIỆN TELEGRAM CHUẨN ĐẸP
+# 5. GIAO DIỆN TELEGRAM CHUẨN ĐẸP VÀ RÕ RÀNG
 # ==============================================================================
 def send_telegram_signal(sig):
     global signal_counter
@@ -426,32 +435,31 @@ def send_telegram_signal(sig):
 👉 <i>Đã bật theo dõi giá Real-time 24/7!</i>"""
 
     send_telegram_direct_message(msg)
-    print(f"✅ ĐÃ PHÁT HIỆN KÈO TỨC THÌ #{sig['id']} [{sig['engine_tag']}] cho {sig['symbol']} (Score: {sig['score']})", flush=True)
+    print(f"✅ [TÍN HIỆU CAO CẤP] #{sig['id']} [{sig['engine_tag']}] cho {sig['symbol']} (Score: {sig['score']})", flush=True)
 
 # ==============================================================================
 # 6. MAIN LOOP RUNNER
 # ==============================================================================
 def run_radar_loop():
-    print("⚡️ Bắt đầu Radar Quét Liên Tục Bắn Tín Hiệu Tức Thì...", flush=True)
+    print("⚡️ Bắt đầu Radar Quét Lọc Kèo Tỷ Lệ Thắng Cao (Strict Filter)...", flush=True)
     while True:
         btc_h1 = get_closed_klines("BTCUSDT", "60", limit=30)
         all_symbols = get_all_bybit_usdt_symbols()
-        print(f"🔍 [REALTIME SCAN] Đang rà soát {len(all_symbols)} coin...", flush=True)
+        print(f"🔍 [STRICT SCAN] Đang lọc kèo Win-Rate cao cho {len(all_symbols)} coin...", flush=True)
         
         candidates = []
         for symbol in all_symbols:
             try:
                 sig = evaluate_symbol_setups(symbol, btc_h1)
                 if sig and sig['signal_id'] not in processed_signal_ids:
-                    # BẮN NGAY LẬP TỨC NẾU TÌM THẤY KÈO SIÊU ĐẸP
                     processed_signal_ids.add(sig['signal_id'])
                     send_telegram_signal(sig)
                     candidates.append(sig)
             except Exception:
                 pass
-            time.sleep(0.08) # Tối ưu tốc độ quét
+            time.sleep(0.08)
 
-        print(f"✅ Hoàn tất 1 lượt quét. Chờ {COOLDOWN_SECONDS}s quét lượt tiếp...", flush=True)
+        print(f"✅ Hoàn tất 1 lượt quét. Chờ {COOLDOWN_SECONDS}s quét tiếp...", flush=True)
         time.sleep(COOLDOWN_SECONDS)
 
 if __name__ == "__main__":

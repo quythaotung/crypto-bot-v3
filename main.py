@@ -5,12 +5,12 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION - HIGH WINRATE TIMEFRAME ISOLATED BOT
+# CONFIGURATION - HIGH VOLUME & ORDER FLOW ENHANCED BOT
 # ==============================================================================
 DEBUG_MODE = True                  
 COOLDOWN_SECONDS = 10              
-MIN_TURNOVER_24H = 8_000_000       # Chỉ lọc coin thanh khoản tốt (>= $8M)
-MIN_WINRATE_SCORE = 80             # Nâng tiêu chuẩn điểm lọc setup lên >= 80
+MIN_TURNOVER_24H = 8_000_000       # Nâng thanh khoản 24h >= $8M USD để đảm bảo dòng tiền thật
+MIN_WINRATE_SCORE = 78             # Ngưỡng điểm uy tín kích hoạt alert (>= 78)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -28,7 +28,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Precise SL/TP Timeframe Isolated Bot Active 24/7!"
+    return "Bybit Volume & Order Flow Enhanced Bot Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -56,7 +56,7 @@ def send_telegram_direct_message(text):
 
 def send_pnl_summary():
     if not signals_history:
-        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\n🟢 Bot đang vận hành 24/7!\n⏳ Chưa có tín hiệu chuẩn Kỹ Thuật nào phát ra từ lần khởi động gần nhất."
+        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\n🟢 Bot đang vận hành 24/7!\n⏳ Chưa có tín hiệu chuẩn Dòng Tiền nào phát ra từ lần khởi động gần nhất."
         send_telegram_direct_message(msg)
         return
 
@@ -98,7 +98,7 @@ def process_telegram_commands():
                     if text in ["/pnl", "/summary", "pnl"]:
                         send_pnl_summary()
                     elif text in ["/start", "/ping", "ping"]:
-                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot Precise SL/TP đang hoạt động 24/7!")
+                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot Volume Enhanced đang hoạt động 24/7!")
         except Exception as e:
             print(f"Lỗi luồng Telegram Listener: {e}", flush=True)
         time.sleep(2)
@@ -207,7 +207,7 @@ def get_all_bybit_usdt_symbols():
         res = requests.get(url, timeout=10).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             tickers = res["result"]["list"]
-            # BỎ MÃ ETF & CHỨNG KHOÁN MỸ
+            # BỎ CÁC MÃ ETF VÀ CHỨNG KHOÁN MỸ
             excluded = ['3L', '3S', '2L', '2S', 'QQQ', 'SPCX', 'SPY', 'DIA', 'IWM', 'TLT']
             symbols = [
                 t['symbol'] for t in tickers 
@@ -325,24 +325,15 @@ def calculate_sma_volume(candles, period=20):
     vols = [c['volume'] for c in candles[-period:]]
     return sum(vols) / period
 
-# ==============================================================================
-# 4. HÂN TÌM CẢN KỸ THUẬT CHUẨN KHUNG (KEY SWING HIGHS & RESISTANCE ZONES)
-# ==============================================================================
 def find_valid_timeframe_targets(candles, entry_price):
-    """
-    Tự động lọc các điểm kháng cự có 'Lực' (Key Swing Highs) trên đúng khung thời gian.
-    Chỉ chọn điểm có ít nhất 2 nến xung quanh thấp hơn để loại bỏ râu nhiễu.
-    """
     swing_highs = []
     for i in range(2, len(candles) - 2):
         c = candles[i]
-        # Điều kiện Key Swing High: Đỉnh cao hơn 2 nến trước và 2 nến sau
         if (c['high'] > candles[i-1]['high'] and c['high'] > candles[i-2]['high'] and
             c['high'] > candles[i+1]['high'] and c['high'] > candles[i+2]['high']):
-            if c['high'] > entry_price * 1.006: # Phải cao hơn Entry tối thiểu 0.6%
+            if c['high'] > entry_price * 1.006:
                 swing_highs.append(c['high'])
                 
-    # Loại bỏ các mốc quá sát nhau (cách nhau dưới 0.4%)
     unique_targets = []
     for target in sorted(swing_highs):
         if not unique_targets or (target - unique_targets[-1]) / unique_targets[-1] * 100 >= 0.4:
@@ -351,20 +342,105 @@ def find_valid_timeframe_targets(candles, entry_price):
     return unique_targets
 
 # ==============================================================================
-# 5. ENGINE: H1 BREAKOUT -> BASE -> RECLAIM (SL/TP THUẦN H1 100%)
+# 4. ENGINE 1: H1 SUPPORT SWEEP (BẮT NẾN RÚT CHÂN NGAY HỖ TRỢ CỨNG)
+# ==============================================================================
+def evaluate_h1_support_sweep(symbol):
+    if get_24h_turnover(symbol) < MIN_TURNOVER_24H: return None
+    
+    now = time.time()
+    if symbol in symbol_cooldowns and (now - symbol_cooldowns[symbol]) < 14400: return None
+
+    h1_candles = get_closed_klines(symbol, "60", limit=60)
+    if len(h1_candles) < 30: return None
+
+    last_h1 = h1_candles[-1]
+    curr_price = last_h1['close']
+
+    # 1. TÌM VÙNG HỖ TRỢ CỨNG H1 (Key Swing Low trong 15-40 nến trước)
+    recent_h1_lows = [c['low'] for c in h1_candles[-40:-5]]
+    if not recent_h1_lows: return None
+    key_support = min(recent_h1_lows)
+
+    # 2. ĐIỀU KIỆN RÚT CHÂN CỦA NẾN MỚI ĐÓNG
+    h1_range = last_h1['high'] - last_h1['low']
+    if h1_range <= 0: return None
+
+    lower_wick = (min(last_h1['open'], last_h1['close']) - last_h1['low'])
+    wick_ratio = lower_wick / h1_range
+
+    # Nến phải chọc sát/thủng key_support rồi rút chân (Râu dưới >= 35%) VÀ đóng nến xanh hoặc đóng trên support
+    is_sweep = (last_h1['low'] <= key_support * 1.008) and (curr_price >= key_support) and (wick_ratio >= 0.35)
+    if not is_sweep: return None
+
+    # 3. CHẤM ĐIỂM DÒNG TIỀN (ORDER FLOW SCORE)
+    avg_vol_h1 = calculate_sma_volume(h1_candles[:-1], 20)
+    vol_ratio = last_h1['volume'] / avg_vol_h1 if avg_vol_h1 > 0 else 1.0
+    
+    taker_h1 = get_taker_buy_pct(symbol, "1h")
+    oi_pct = get_open_interest_pct(symbol, "1h")
+
+    # Điểm cộng uy tín mạnh về Volume & CVD
+    vol_score = 15 if vol_ratio >= 2.0 else (10 if vol_ratio >= 1.4 else 5)
+    cvd_score = 15 if taker_h1 >= 65.0 else (10 if taker_h1 >= 58.0 else 0)
+    oi_score = 10 if oi_pct >= 2.0 else (5 if oi_pct >= 0.5 else 0)
+    
+    # Bonus nến xanh rút chân đẹp
+    candle_bonus = 10 if last_h1['close'] > last_h1['open'] else 5
+
+    total_score = 40 + vol_score + cvd_score + oi_score + candle_bonus
+    if total_score < MIN_WINRATE_SCORE: return None
+
+    # 4. TÍNH SL/TP THUẦN H1 (SL dưới đáy Sweep Low + ATR Buffer 0.35)
+    h1_atr = calculate_atr(h1_candles, 14)
+    sl_price = last_h1['low'] - (0.35 * h1_atr)
+    risk = curr_price - sl_price
+    if risk <= 0: return None
+
+    h1_targets = find_valid_timeframe_targets(h1_candles, curr_price)
+    tp1_price = h1_targets[0] if len(h1_targets) >= 1 else curr_price + (h1_atr * 1.8)
+    tp2_price = h1_targets[1] if len(h1_targets) >= 2 else tp1_price + (h1_atr * 2.5)
+    tp3_price = h1_targets[2] if len(h1_targets) >= 3 else tp2_price + (h1_atr * 3.2)
+
+    if (tp1_price - curr_price) <= (risk * 1.0): return None
+
+    symbol_cooldowns[symbol] = now
+
+    return {
+        'signal_timeframe': 'H1',
+        'engine_tag': 'H1 SUPPORT SWEEP',
+        'title': '⚡️ H1 SUPPORT SWEEP',
+        'symbol': symbol,
+        'entry': curr_price,
+        'entry_low': key_support,
+        'entry_high': curr_price,
+        'sl': sl_price,
+        'sl_reason': 'H1 Sweep Low + ATR Buffer',
+        'tp1': tp1_price,
+        'tp1_reason': 'H1 Key Swing High',
+        'tp2': tp2_price,
+        'tp2_reason': 'H1 Resistance Zone',
+        'tp3': tp3_price,
+        'tp3_reason': 'H1 Supply Zone',
+        'score': total_score,
+        'setup_quality': 'HIGH WIN-RATE SWEEP',
+        'risk_pct': (risk / curr_price) * 100,
+        'vol_ratio': vol_ratio,
+        'oi_pct': oi_pct,
+        'taker_pct': taker_h1,
+        'timestamp': last_h1['timestamp'],
+        'signal_id': f"H1_SWEEP_{symbol}_{last_h1['timestamp']}"
+    }
+
+# ==============================================================================
+# 5. ENGINE 2: H1 BREAKOUT -> BASE -> RECLAIM
 # ==============================================================================
 def evaluate_h1_breakout_base_reclaim(symbol, btc_h1_candles):
-    if get_24h_turnover(symbol) < MIN_TURNOVER_24H: 
-        return None
+    if get_24h_turnover(symbol) < MIN_TURNOVER_24H: return None
 
-    # LỌC TRÙNG KÈO (Chỉ phát 1 lần trong 4 tiếng cho mỗi symbol)
     now = time.time()
-    if symbol in symbol_cooldowns and (now - symbol_cooldowns[symbol]) < 14400:
-        return None
+    if symbol in symbol_cooldowns and (now - symbol_cooldowns[symbol]) < 14400: return None
 
-    signal_timeframe = "H1"
-
-    # 1. H4 CONTEXT FILTER ONLY (Chỉ dùng làm bối cảnh)
+    # 1. H4 CONTEXT
     h4_candles = get_closed_klines(symbol, "240", limit=60)
     if len(h4_candles) < 30: return None
 
@@ -381,17 +457,13 @@ def evaluate_h1_breakout_base_reclaim(symbol, btc_h1_candles):
     
     h4_pass = False
     h4_score = 0
-    if ema89_h4 and curr_h4_close > ema89_h4[-1]:
-        h4_pass, h4_score = True, 15
-    elif min(recent_h4_lows) >= min(prev_h4_lows):
-        h4_pass, h4_score = True, 12
-    elif not is_h4_dumping:
-        h4_pass, h4_score = True, 10
+    if ema89_h4 and curr_h4_close > ema89_h4[-1]: h4_pass, h4_score = True, 15
+    elif min(recent_h4_lows) >= min(prev_h4_lows): h4_pass, h4_score = True, 12
+    elif not is_h4_dumping: h4_pass, h4_score = True, 10
 
-    if not h4_pass or (is_h4_dumping and ema89_h4 and curr_h4_close < ema89_h4[-1]):
-        return None
+    if not h4_pass or (is_h4_dumping and ema89_h4 and curr_h4_close < ema89_h4[-1]): return None
 
-    # 2. PHÁT HIỆN H1 BREAKOUT
+    # 2. H1 BREAKOUT
     h1_candles = get_closed_klines(symbol, "60", limit=60)
     if len(h1_candles) < 30: return None
 
@@ -413,10 +485,9 @@ def evaluate_h1_breakout_base_reclaim(symbol, btc_h1_candles):
 
     if not breakout_candle: return None
 
-    breakout_score = 20
     breakout_vol_ratio = breakout_candle['volume'] / calculate_sma_volume(h1_candles[:breakout_idx], 20) if calculate_sma_volume(h1_candles[:breakout_idx], 20) > 0 else 1.0
 
-    # 3. PHÁT HIỆN H1 BASE SAU BREAKOUT
+    # 3. BASE
     base_candles = h1_candles[breakout_idx+1:]
     if len(base_candles) < 2 or len(base_candles) > 9: return None
 
@@ -430,7 +501,7 @@ def evaluate_h1_breakout_base_reclaim(symbol, btc_h1_candles):
     is_vol_drying = avg_base_vol < breakout_candle['volume']
     base_score = 15 if is_vol_drying else 10
 
-    # 4. H1 RECLAIM ENTRY
+    # 4. RECLAIM
     last_h1 = h1_candles[-1]
     curr_price = last_h1['close']
 
@@ -440,44 +511,34 @@ def evaluate_h1_breakout_base_reclaim(symbol, btc_h1_candles):
     if not (reclaim_type_a or reclaim_type_b): return None
     reclaim_score = 20 if reclaim_type_a else 16
 
-    # 5. FLOW CONFIRMATION
+    # 5. DÒNG TIỀN (ORDER FLOW ENHANCED SCORE)
     taker_h1 = get_taker_buy_pct(symbol, "1h")
-    cvd_score = 10 if taker_h1 >= 60.0 else (5 if taker_h1 >= 50.0 else -10)
+    cvd_score = 15 if taker_h1 >= 65.0 else (10 if taker_h1 >= 55.0 else -5)
     
     oi_pct = get_open_interest_pct(symbol, "1h")
-    oi_score = 5 if oi_pct >= 1.5 else (3 if oi_pct >= 0 else -5)
+    oi_score = 10 if oi_pct >= 2.0 else (5 if oi_pct >= 0.5 else 0)
 
-    vol_score = 10 if breakout_vol_ratio >= 1.5 else 5
-    if last_h1['volume'] > avg_base_vol: vol_score += 5
-    btc_score = 5
+    vol_score = 15 if breakout_vol_ratio >= 1.8 else (10 if breakout_vol_ratio >= 1.3 else 5)
 
-    total_score = min(h4_score + breakout_score + base_score + reclaim_score + vol_score + cvd_score + oi_score + btc_score, 100)
+    total_score = min(h4_score + 20 + base_score + reclaim_score + vol_score + cvd_score + oi_score, 100)
     if total_score < MIN_WINRATE_SCORE: return None
 
-    # 6. ANTI-CHASE FILTER H1
+    # ANTI-CHASE
     dist_from_breakout = (curr_price - breakout_level) / breakout_level * 100
     if dist_from_breakout > 1.5 or curr_price > base_high * 1.012: return None
 
-    entry_low = min(breakout_level, base_low)
-    entry_high = curr_price
     entry_mid = curr_price
-
-    # 7. SL CHUẨN H1 (SL DƯỚI BASE LOW + BUFFER ATR 0.35 TĂNG ĐỘ AN TOÀN)
     h1_atr = calculate_atr(h1_candles, 14)
     sl_price = base_low - (0.35 * h1_atr)
     risk = entry_mid - sl_price
     if risk <= 0: return None
 
-    # 8. TÍNH TP CHUẨN THUẦN H1 (CẢN H1 CÓ LỰC)
     h1_targets = find_valid_timeframe_targets(h1_candles, entry_mid)
-
     tp1_price = h1_targets[0] if len(h1_targets) >= 1 else entry_mid + (h1_atr * 1.8)
     tp2_price = h1_targets[1] if len(h1_targets) >= 2 else tp1_price + (h1_atr * 2.5)
     tp3_price = h1_targets[2] if len(h1_targets) >= 3 else tp2_price + (h1_atr * 3.2)
 
-    # 9. ROOM FILTER (ĐẢM BẢO WIN-RATE TP1 CAO)
-    if (tp1_price - entry_mid) <= (risk * 1.0) or ((tp1_price - entry_mid)/entry_mid * 100) < 0.8: 
-        return None
+    if (tp1_price - entry_mid) <= (risk * 1.0): return None
 
     setup_quality = "STRONG LONG SETUP" if total_score >= 85 else "LONG CANDIDATE"
     symbol_cooldowns[symbol] = now
@@ -488,8 +549,8 @@ def evaluate_h1_breakout_base_reclaim(symbol, btc_h1_candles):
         'title': '🟢 H1 LONG',
         'symbol': symbol,
         'entry': entry_mid,
-        'entry_low': entry_low,
-        'entry_high': entry_high,
+        'entry_low': min(breakout_level, base_low),
+        'entry_high': curr_price,
         'sl': sl_price,
         'sl_reason': 'H1 Retest Base Low + ATR Buffer',
         'tp1': tp1_price,
@@ -501,8 +562,6 @@ def evaluate_h1_breakout_base_reclaim(symbol, btc_h1_candles):
         'score': total_score,
         'setup_quality': setup_quality,
         'risk_pct': (risk / entry_mid) * 100,
-        'breakout_level': breakout_level,
-        'base_low': base_low,
         'vol_ratio': breakout_vol_ratio,
         'oi_pct': oi_pct,
         'taker_pct': taker_h1,
@@ -547,14 +606,13 @@ Reason: {sig['tp2_reason']}
 🚀 <b>{tf} TP3:</b> <code>{sig['tp3']:.4f}</code>
 Reason: {sig['tp3_reason']}
 
-📊 <b>Confirmation:</b>
-• {tf} Breakout & Base: ✓
-• Volume: +{sig['vol_ratio']:.1f}x SMA
-• Spot CVD: {sig['taker_pct']:.1f}%
-• OI: +{sig['oi_pct']:.2f}%
+📊 <b>Order Flow & Volume:</b>
+• Volume H1: +{sig['vol_ratio']:.1f}x SMA20
+• Lực Mua CVD: {sig['taker_pct']:.1f}%
+• Open Interest: +{sig['oi_pct']:.2f}%
 
 📐 <b>Structure:</b>
-{tf} Breakout → Base → Reclaim
+{tf} Key Support → Sweep / Reclaim
 
 🌐 <b>Context:</b> H4 Context Bullish
 
@@ -567,15 +625,23 @@ Reason: {sig['tp3_reason']}
 # 7. MAIN LOOP RUNNER
 # ==============================================================================
 def run_radar_loop():
-    print("⚡️ Bắt đầu Radar Quét Lọc Cấu Trúc Precise SL/TP (H1/H4)...", flush=True)
+    print("⚡️ Bắt đầu Radar Quét Lọc Cấu Trúc Volume & Order Flow (H1/H4)...", flush=True)
     while True:
         btc_h1 = get_closed_klines("BTCUSDT", "60", limit=30)
         all_symbols = get_all_bybit_usdt_symbols()
-        print(f"🔍 [SCANNING PRECISE TIMEFRAME] Đang quét {len(all_symbols)} coin...", flush=True)
+        print(f"🔍 [SCANNING ENHANCED ORDERFLOW] Đang quét {len(all_symbols)} coin...", flush=True)
         
         candidates = []
         for symbol in all_symbols:
             try:
+                # 1. Quét H1 Support Sweep (Nến rút chân hỗ trợ)
+                sig_sweep = evaluate_h1_support_sweep(symbol)
+                if sig_sweep and sig_sweep['signal_id'] not in processed_signal_ids:
+                    processed_signal_ids.add(sig_sweep['signal_id'])
+                    send_telegram_signal(sig_sweep)
+                    candidates.append(sig_sweep)
+
+                # 2. Quét H1 Breakout Base Reclaim
                 sig_h1 = evaluate_h1_breakout_base_reclaim(symbol, btc_h1)
                 if sig_h1 and sig_h1['signal_id'] not in processed_signal_ids:
                     processed_signal_ids.add(sig_h1['signal_id'])

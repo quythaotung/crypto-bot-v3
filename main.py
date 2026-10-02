@@ -1,24 +1,24 @@
 import time
 import requests
 import os
+import numpy as np
 from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION - H1 SQUEEZE EXPLOSION ENGINE
+# CONFIGURATION - STRATEGY: long-h1-h4-trend-flow-v1
 # ==============================================================================
-DEBUG_MODE = True                  # In log chi tiết 5 trạng thái minh bạch ra Render
-COOLDOWN_SECONDS = 10              # Quét liên tục real-time
-MIN_TURNOVER_24H = 10_000_000      # Lọc coin thanh khoản 24h >= $10M USD
-MIN_ALERT_SCORE = 80               # Ngưỡng phát lệnh (80-84: CANDIDATE, 85-89: LONG H1 SQUEEZE, >=90: SQUEEZE EXPLOSION)
+DEBUG_MODE = True                  
+COOLDOWN_SECONDS = 15              
+MIN_TURNOVER_24H = 10_000_000      # $10M USD minimum 24h quote volume
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 signals_history = []
-active_signals = []                # Danh sách theo dõi TP/SL real-time
+active_signals = []                
 processed_signal_ids = set()
-symbol_cooldowns = {}              # Quản lý giãn cách gọi lệnh theo symbol
+symbol_cooldowns = {}              
 signal_counter = 0
 
 # ==============================================================================
@@ -28,7 +28,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit H1 Squeeze Explosion Bot Active 24/7!"
+    return "Bot long-h1-h4-trend-flow-v1 Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -56,7 +56,7 @@ def send_telegram_direct_message(text):
 
 def send_pnl_summary():
     if not signals_history:
-        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL:</b>\n\n🟢 Bot H1 Squeeze Explosion đang chạy 24/7!\n⏳ Chưa có tín hiệu bùng nổ nào phát ra từ lần khởi động gần nhất."
+        msg = "📊 <b>BÁO CÁO TỔNG HỢP PnL (PAPER TRADING):</b>\n\n🟢 Bot <code>long-h1-h4-trend-flow-v1</code> đang vận hành 24/7!\n⏳ Chưa có tín hiệu chuẩn Trend-Flow nào phát ra từ lần khởi động gần nhất."
         send_telegram_direct_message(msg)
         return
 
@@ -73,7 +73,7 @@ def send_pnl_summary():
         status = sig.get('status_text', '⏳ Đang theo dõi')
         icon = "🟢" if pnl_pct >= 0 else "🔴"
         
-        msg += f"<b>#{sig['id']} [SQUEEZE LONG] {sig['symbol']}</b> (Score: {sig['score']}/100)\n"
+        msg += f"<b>#{sig['id']} [{sig['setup_name']}] {sig['symbol']}</b>\n"
         msg += f"• Entry: <code>{sig['entry']:.4f}</code> | Hiện tại: <code>{curr_price:.4f}</code> ({icon} <b>{pnl_pct:+.2f}%</b>)\n"
         msg += f"• Trạng thái: <b>{status}</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"
         total_pnl_pct += pnl_pct
@@ -98,13 +98,13 @@ def process_telegram_commands():
                     if text in ["/pnl", "/summary", "pnl"]:
                         send_pnl_summary()
                     elif text in ["/start", "/ping", "ping"]:
-                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot H1 Squeeze Explosion đang hoạt động 24/7!")
+                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot strategy <code>long-h1-h4-trend-flow-v1</code> đang hoạt động 24/7!")
         except Exception as e:
             print(f"Lỗi luồng Telegram Listener: {e}", flush=True)
         time.sleep(2)
 
 # ==============================================================================
-# 2. REAL-TIME MONITORING (TP / SL / CHASE WARNING / INVALID)
+# 2. REAL-TIME MONITORING (PAPER TRADING TRACKER)
 # ==============================================================================
 def process_active_signals_tracker():
     while True:
@@ -116,28 +116,30 @@ def process_active_signals_tracker():
                     if not curr_price:
                         continue
 
-                    # CANCEL NẾU GIÁ CHẠY VỌT QUÁ ENTRY ZONE
+                    tf = sig['signal_timeframe']
+
+                    # CANCEL NẾU GIÁ CHẠY QÚA XA ENTRY ZONE BEFORE RETEST
                     if not sig.get('entered', False):
-                        if curr_price > sig['entry_high'] * 1.015:
-                            sig['status_text'] = "⚠️ CANCEL (Giá vượt quá Entry Zone)"
-                            msg = f"⚠️ <b>[CẢNH BÁO CHASE PUMP] #{sig['id']} - {sig['symbol']}</b>\nGiá (<code>{curr_price:.4f}</code>) đã rời quá xa Entry Zone. Tự động hủy lệnh!"
+                        if curr_price > sig['entry_high'] * 1.018:
+                            sig['status_text'] = f"⚠️ CANCEL (Vọt xa Entry Zone)"
+                            msg = f"⚠️ <b>[CẢNH BÁO CHASE PUMP] #{sig['id']} - {sig['symbol']}</b>\nGiá (<code>{curr_price:.4f}</code>) đã chạy vọt quá xa Entry Zone. Tự động hủy lệnh PAPER!"
                             send_telegram_direct_message(msg)
                             if sig in active_signals: active_signals.remove(sig)
                             continue
                         elif curr_price <= sig['entry_high']:
                             sig['entered'] = True
 
-                    # 1. CHẠM TP1
+                    # 1. CHẠM TP1 (Bảo toàn vốn)
                     if not sig['hit_tp1'] and curr_price >= sig['tp1']:
                         sig['hit_tp1'] = True
-                        sig['status_text'] = "🎯 Hit TP1 (Bảo toàn vốn)"
+                        sig['status_text'] = f"🎯 Hit TP1 (Đã bảo toàn vốn)"
                         pnl_pct = ((curr_price - sig['entry']) / sig['entry']) * 100
                         
                         msg = f"""🎯 <b>[CHẠM TP1 STRUCTURE] #{sig['id']} - {sig['symbol']}</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
 📍 Entry: <code>{sig['entry']:.4f}</code>
 🚀 Giá Hiện Tại: <code>{curr_price:.4f}</code> (<b>+{pnl_pct:.2f}%</b>)
-🎯 TP1 Target: <code>{sig['tp1']:.4f}</code> (<b>+{sig['tp1_pct']:.1f}%</b>)
+🎯 TP1 Target: <code>{sig['tp1']:.4f}</code>
 ━━━━━━━━━━━━━━━━━━━━━━━
 ✅ <b>ĐÃ CẢN TP1 THÀNH CÔNG!</b>
 🛡 <i>Tự động HỦY cảnh báo SL. Dời SL về Breakeven để gồng TP2/TP3!</i>"""
@@ -146,30 +148,45 @@ def process_active_signals_tracker():
                     # 2. CHẠM TP2
                     elif sig['hit_tp1'] and not sig['hit_tp2'] and curr_price >= sig['tp2']:
                         sig['hit_tp2'] = True
-                        sig['status_text'] = "🚀 Hit TP2 Target"
+                        sig['status_text'] = f"🚀 Hit TP2"
                         pnl_pct = ((curr_price - sig['entry']) / sig['entry']) * 100
                         
                         msg = f"""🚀 <b>[CHẠM TP2 STRUCTURE] #{sig['id']} - {sig['symbol']}</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
 📍 Entry: <code>{sig['entry']:.4f}</code>
 🔥 Giá Hiện Tại: <code>{curr_price:.4f}</code> (<b>+{pnl_pct:.2f}%</b>)
-🚀 TP2 Target: <code>{sig['tp2']:.4f}</code> (<b>+{sig['tp2_pct']:.1f}%</b>)
+🚀 TP2 Target: <code>{sig['tp2']:.4f}</code>
 ━━━━━━━━━━━━━━━━━━━━━━━
-🏆 <b>BÙNG NỔ THÀNH CÔNG TẠI VÙNG RESISTANCE TIẾP THEO!</b>"""
+🏆 <b>CHỐT LỜI THÀNH CÔNG TẠI KHÁNG CỰ {tf}!</b>"""
                         send_telegram_direct_message(msg)
 
-                    # 3. HIT SL
-                    elif not sig['hit_tp1'] and curr_price <= sig['sl']:
-                        sig['status_text'] = "🛑 Hit SL (INVALIDATED)"
+                    # 3. CHẠM TP3
+                    elif sig['hit_tp2'] and sig.get('tp3') and curr_price >= sig['tp3']:
+                        sig['status_text'] = f"🔥 Hit TP3 Major Target"
                         pnl_pct = ((curr_price - sig['entry']) / sig['entry']) * 100
                         
-                        msg = f"""🛑 <b>[CẢNH BÁO HIT SL - SQUEEZE INVALID] #{sig['id']} - {sig['symbol']}</b>
+                        msg = f"""🔥 <b>[CHẠM TP3 MAJOR STRUCTURE] #{sig['id']} - {sig['symbol']}</b>
+━━━━━━━━━━━━━━━━━━━━━━━
+📍 Entry: <code>{sig['entry']:.4f}</code>
+🔥 Giá Hiện Tại: <code>{curr_price:.4f}</code> (<b>+{pnl_pct:.2f}%</b>)
+🔥 TP3 Target: <code>{sig['tp3']:.4f}</code>
+━━━━━━━━━━━━━━━━━━━━━━━
+🏆 <b>HOÀN THÀNH MỤC TIÊU CẤU TRÚC THUẦN {tf}!</b>"""
+                        send_telegram_direct_message(msg)
+                        if sig in active_signals: active_signals.remove(sig)
+
+                    # 4. HIT SL
+                    elif not sig['hit_tp1'] and curr_price <= sig['sl']:
+                        sig['status_text'] = f"🛑 Hit SL (INVALIDATED)"
+                        pnl_pct = ((curr_price - sig['entry']) / sig['entry']) * 100
+                        
+                        msg = f"""🛑 <b>[CẢNH BÁO HIT SL - INVALIDATED] #{sig['id']} - {sig['symbol']}</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
 📍 Entry: <code>{sig['entry']:.4f}</code>
 🛑 Giá Hiện Tại: <code>{curr_price:.4f}</code> (<b>{pnl_pct:.2f}%</b>)
 🛑 Mốc SL Cấu Trúc: <code>{sig['sl']:.4f}</code>
 ━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ <i>Gãy mốc Hỗ trợ Nền Tích Lũy. Dừng lệnh an toàn!</i>"""
+⚠️ <i>Vi phạm mốc Hỗ trợ Cấu trúc H1/H4. Dừng lệnh an toàn!</i>"""
                         send_telegram_direct_message(msg)
                         if sig in active_signals: active_signals.remove(sig)
                 except Exception as inner_e:
@@ -180,7 +197,7 @@ def process_active_signals_tracker():
         time.sleep(10)
 
 # ==============================================================================
-# 3. BYBIT API & INDICATORS HELPERS
+# 3. BYBIT API & TECHNICAL INDICATORS
 # ==============================================================================
 BASE_URL = "https://api.bybit.com"
 
@@ -198,7 +215,6 @@ def get_all_bybit_usdt_symbols():
                     parsed_list.append({
                         'symbol': sym,
                         'turnover24h': float(t.get('turnover24h', 0)),
-                        'price24hPcnt': float(t.get('price24hPcnt', 0)) * 100,
                         'fundingRate': float(t.get('fundingRate', 0)) * 100,
                         'lastPrice': float(t.get('lastPrice', 0))
                     })
@@ -207,13 +223,13 @@ def get_all_bybit_usdt_symbols():
         pass
     return []
 
-def get_closed_klines(symbol, interval, limit=100):
-    url = f"{BASE_URL}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit}"
+def get_closed_klines(symbol, interval, category="linear", limit=200):
+    url = f"{BASE_URL}/v5/market/kline?category={category}&symbol={symbol}&interval={interval}&limit={limit}"
     try:
         res = requests.get(url, timeout=10).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             raw_list = res["result"]["list"]
-            closed_candles = raw_list[1:]
+            closed_candles = raw_list[1:] # Loại bỏ nến đang chạy
             parsed = []
             for c in reversed(closed_candles):
                 parsed.append({
@@ -222,7 +238,8 @@ def get_closed_klines(symbol, interval, limit=100):
                     'high': float(c[2]),
                     'low': float(c[3]),
                     'close': float(c[4]),
-                    'volume': float(c[5])
+                    'volume': float(c[5]),
+                    'turnover': float(c[6])
                 })
             return parsed
     except Exception:
@@ -241,6 +258,26 @@ def calculate_ema(candles, period):
         ema_values.append(new_ema)
     return ema_values
 
+def calculate_rsi(candles, period=14):
+    if len(candles) < period + 1: return []
+    closes = [c['close'] for c in candles]
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i-1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+    
+    rsi_values = []
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    rsi_values.append(100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
+        
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rsi_values.append(100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
+    return rsi_values
+
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1: return 0.0
     tr_list = []
@@ -252,7 +289,7 @@ def calculate_atr(candles, period=14):
     return sum(tr_list[-period:]) / period if tr_list else 0.0
 
 def get_open_interest_pct(symbol, interval_str="1h"):
-    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval_str}&limit=3"
+    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval_str}&limit=4"
     try:
         res = requests.get(url, timeout=10).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
@@ -265,303 +302,315 @@ def get_open_interest_pct(symbol, interval_str="1h"):
         pass
     return 0.0
 
-def get_taker_buy_pct(symbol, interval_str="1h"):
-    url = f"{BASE_URL}/v5/market/account-ratio?category=linear&symbol={symbol}&period={interval_str}&limit=2"
+def get_taker_buy_ratios(symbol, category="linear", interval_str="1h", limit=6):
+    url = f"{BASE_URL}/v5/market/account-ratio?category={category}&symbol={symbol}&period={interval_str}&limit={limit}"
     try:
         res = requests.get(url, timeout=10).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
-            data = res["result"]["list"]
-            if len(data) >= 1:
-                return float(data[0].get("buyRatio", 0.5)) * 100
+            return [float(x.get("buyRatio", 0.5)) * 100 for x in res["result"]["list"]]
     except Exception:
         pass
-    return 50.0
+    return [50.0] * limit
 
-def calculate_sma_volume(candles, period=20):
-    if len(candles) < period: return 0
-    vols = [c['volume'] for c in candles[-period:]]
-    return sum(vols) / period
-
-# ==============================================================================
-# 4. CORE ENGINE: H1 SQUEEZE EXPLOSION (BASE SEARCH & ORDER FLOW EXPANSION)
-# ==============================================================================
-
-def find_accumulation_base(h1_candles):
+def calculate_cvd_series(candles, taker_buy_ratios):
     """
-    Tìm nền tích lũy (Base) trong 20-50 nến H1 gần nhất:
-    - Độ dài: 4-20 nến
-    - Xây dựng Base High (Breakout Level) và Base Low
+    Tính toán Delta từng nến:
+    delta = 2 * taker_buy_quote - quote_volume
+    Trả về danh sách CVD tích lũy.
     """
-    n = len(h1_candles)
-    if n < 30: return None
+    cvd_series = []
+    current_cvd = 0.0
+    for i, c in enumerate(candles[-len(taker_buy_ratios):]):
+        ratio = taker_buy_ratios[i] / 100.0 if i < len(taker_buy_ratios) else 0.5
+        quote_vol = c['turnover']
+        taker_buy_quote = quote_vol * ratio
+        delta = (2 * taker_buy_quote) - quote_vol
+        current_cvd += delta
+        cvd_series.append(current_cvd)
+    return cvd_series
 
-    for base_len in range(4, 21):
-        for i in range(n - base_len - 1, max(0, n - 45), -1):
-            base_candles = h1_candles[i:i+base_len]
-            b_high = max([c['high'] for c in base_candles])
-            b_low = min([c['low'] for c in base_candles])
+def find_valid_structure_targets(candles, entry_price):
+    swing_highs = []
+    for i in range(2, len(candles) - 2):
+        c = candles[i]
+        if (c['high'] > candles[i-1]['high'] and c['high'] > candles[i-2]['high'] and
+            c['high'] > candles[i+1]['high'] and c['high'] > candles[i+2]['high']):
+            if c['high'] > entry_price * 1.008:
+                swing_highs.append(c['high'])
+                
+    unique_targets = []
+    for target in sorted(swing_highs):
+        if not unique_targets or (target - unique_targets[-1]) / unique_targets[-1] * 100 >= 0.5:
+            unique_targets.append(target)
             
-            # Kiểm tra biên độ hẹp (Base Range <= 6%)
-            range_pct = (b_high - b_low) / b_low * 100
-            if range_pct <= 6.5:
-                return {
-                    'base_high': b_high,
-                    'base_low': b_low,
-                    'base_len': base_len,
-                    'start_idx': i,
-                    'end_idx': i + base_len
-                }
-    return None
+    return unique_targets
 
-def find_up_to_3_resistances(h1_candles, h4_candles, entry_price):
-    targets = []
-    for i in range(2, len(h1_candles) - 2):
-        c = h1_candles[i]
-        if (c['high'] > h1_candles[i-1]['high'] and c['high'] > h1_candles[i-2]['high'] and
-            c['high'] > h1_candles[i+1]['high'] and c['high'] > h1_candles[i+2]['high']):
-            if c['high'] > entry_price * 1.005:
-                targets.append(c['high'])
+# ==============================================================================
+# 4. HARD GATE & FLOW EVALUATION (STRATEGY: long-h1-h4-trend-flow-v1)
+# ==============================================================================
 
-    for i in range(2, len(h4_candles) - 2):
-        c = h4_candles[i]
-        if (c['high'] > h4_candles[i-1]['high'] and c['high'] > h4_candles[i+1]['high']):
-            if c['high'] > entry_price * 1.005:
-                targets.append(c['high'])
+def check_h4_hard_gate(h4_candles, btc_h4_candles):
+    """
+    Kiem tra Hard Gate H4 cho chieu LONG:
+    1. Giá đóng H4 > EMA34 H4 và EMA89 H4
+    2. EMA34 H4 > EMA89 H4
+    3. EMA34 & EMA89 H4 không dốc xuống (EMA34_curr > EMA34_t-3)
+    4. Cấu trúc H4 chưa tạo Lower Low mới (Higher Low / Holding)
+    5. BTC không rơi tự do
+    """
+    if len(h4_candles) < 90: return False, "Thiếu dữ liệu H4"
 
-    unique_targets = sorted(list(set(targets)))
-    valid_targets = []
-    for t in unique_targets:
-        if not valid_targets or (t - valid_targets[-1]) / valid_targets[-1] * 100 >= 0.8:
-            valid_targets.append(t)
+    ema34_h4 = calculate_ema(h4_candles, 34)
+    ema89_h4 = calculate_ema(h4_candles, 89)
 
-    return valid_targets[:3]
+    if not ema34_h4 or not ema89_h4: return False, "Lỗi EMA H4"
 
-def evaluate_h1_squeeze_explosion(ticker_data, btc_h1_candles):
+    last_h4 = h4_candles[-1]
+    curr_close = last_h4['close']
+
+    # 1 & 2. Kiem tra vi tri EMA
+    if not (curr_close > ema34_h4[-1] and curr_close > ema89_h4[-1] and ema34_h4[-1] > ema89_h4[-1]):
+        return False, "Không thỏa Price > EMA34 > EMA89 H4"
+
+    # 3. Kiem tra do doc EMA34
+    if len(ema34_h4) >= 4 and ema34_h4[-1] <= ema34_h4[-4]:
+        return False, "EMA34 H4 đang dốc xuống"
+
+    # 4. Kiem tra Structure Lower Low H4
+    recent_lows = [c['low'] for c in h4_candles[-12:-1]]
+    prev_lows = [c['low'] for c in h4_candles[-24:-12]]
+    if recent_lows and prev_lows and min(recent_lows) < min(prev_lows):
+        return False, "H4 vùa tao Lower Low moi"
+
+    # 5. BTC Context Check
+    if btc_h4_candles:
+        btc_ema34 = calculate_ema(btc_h4_candles, 34)
+        if btc_ema34 and btc_h4_candles[-1]['close'] < btc_ema34[-1] * 0.975:
+            return False, "BTC đang o trang thai RISK_OFF"
+
+    return True, "PASSED H4 HARD GATE"
+
+def check_h1_hard_gate(h1_candles):
+    """
+    Kiem tra Hard Gate H1:
+    1. Giá đóng H1 > EMA89 H1
+    2. EMA34 H1 >= EMA89 H1
+    3. Không LONG nếu H1 vừa đóng dưới EMA89
+    """
+    if len(h1_candles) < 90: return False
+
+    ema34_h1 = calculate_ema(h1_candles, 34)
+    ema89_h1 = calculate_ema(h1_candles, 89)
+
+    if not ema34_h1 or not ema89_h1: return False
+
+    last_h1 = h1_candles[-1]
+    if last_h1['close'] <= ema89_h1[-1]: return False
+    if ema34_h1[-1] < ema89_h1[-1]: return False
+
+    return True
+
+def evaluate_flow_conditions(symbol, h1_candles, futures_taker, spot_taker, spot_candles):
+    """
+    Danh gia Bo loc Dong Tien & CVD (Toi thieu 4/6 dieu kien):
+    1. Spot taker-buy ratio >= 53% (ít nhat 2/3 nén H1)
+    2. Spot CVD H1 slope duong
+    3. Futures taker-buy ratio >= 52%
+    4. Futures CVD H1 không tao lower-low
+    5. Spot volume H1 >= 1.2x median volume 20 nén H1
+    6. Pullback CVD giu Higher Low
+    """
+    score_count = 0
+
+    # 1. Spot Taker Ratio >= 53% (2/3 nén)
+    high_spot_count = sum(1 for r in spot_taker[:3] if r >= 53.0)
+    if high_spot_count >= 2: score_count += 1
+
+    # 2. Spot CVD Slope Dương
+    spot_cvd = calculate_cvd_series(spot_candles, spot_taker) if spot_candles else []
+    if len(spot_cvd) >= 3 and spot_cvd[-1] > spot_cvd[-3]: score_count += 1
+
+    # 3. Futures Taker Ratio >= 52%
+    if futures_taker and futures_taker[0] >= 52.0: score_count += 1
+
+    # 4. Futures CVD không tạo Lower Low
+    futures_cvd = calculate_cvd_series(h1_candles, futures_taker)
+    if len(futures_cvd) >= 3 and futures_cvd[-1] >= min(futures_cvd): score_count += 1
+
+    # 5. Spot Volume H1 >= 1.2x Median 20 nến
+    if spot_candles and len(spot_candles) >= 20:
+        vols = [c['volume'] for c in spot_candles[-20:]]
+        median_vol = float(np.median(vols))
+        if spot_candles[-1]['volume'] >= 1.2 * median_vol: score_count += 1
+
+    # 6. Pullback CVD Higher Low
+    if len(futures_cvd) >= 4 and futures_cvd[-1] > futures_cvd[-4]: score_count += 1
+
+    # Hard Rejects Check
+    if len(spot_cvd) >= 2 and len(futures_cvd) >= 2:
+        if (spot_cvd[-1] < spot_cvd[-2]) and (futures_cvd[-1] < futures_cvd[-2]):
+            return False, "HARD REJECT: Spot & Futures CVD cung giam"
+
+    return (score_count >= 4), f"Flow Score: {score_count}/6"
+
+# ==============================================================================
+# 5. EVALUATE SETUPS (SETUP A & SETUP B)
+# ==============================================================================
+
+def evaluate_long_h1_h4_strategy(ticker_data, btc_h4_candles):
     symbol = ticker_data['symbol']
     turnover = ticker_data['turnover24h']
+    funding = ticker_data['fundingRate']
 
+    # 0. CHECK TURNOVER & FUNDING RATE HARD GATE (-0.03% den +0.04%)
     if turnover < MIN_TURNOVER_24H: return None
+    if not (-0.03 <= funding <= 0.04):
+        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT: Funding Rate ({funding:+.3f}%) ngoai khoang cho phep", flush=True)
+        return None
 
-    h1_candles = get_closed_klines(symbol, "60", limit=60)
-    if len(h1_candles) < 40: return None
+    now = time.time()
+    if symbol in symbol_cooldowns and (now - symbol_cooldowns[symbol]) < 14400: return None
 
-    h4_candles = get_closed_klines(symbol, "240", limit=60)
-    if len(h4_candles) < 30: return None
+    # Fetch closed klines
+    h4_candles = get_closed_klines(symbol, "240", category="linear", limit=100)
+    h1_candles = get_closed_klines(symbol, "60", category="linear", limit=100)
+    spot_h1_candles = get_closed_klines(symbol, "60", category="spot", limit=60)
+
+    if not h4_candles or not h1_candles: return None
+
+    # 1. HARD GATE H4 & H1
+    h4_pass, h4_msg = check_h4_hard_gate(h4_candles, btc_h4_candles)
+    if not h4_pass:
+        if DEBUG_MODE: print(f"[{symbol}] ⏳ WATCH ONLY: {h4_msg}", flush=True)
+        return None
+
+    if not check_h1_hard_gate(h1_candles):
+        if DEBUG_MODE: print(f"[{symbol}] ⏳ WATCH ONLY: Khong thoa H1 Hard Gate", flush=True)
+        return None
+
+    # Order flow data
+    futures_taker = get_taker_buy_ratios(symbol, category="linear", interval_str="1h", limit=6)
+    spot_taker = get_taker_buy_ratios(symbol, category="spot", interval_str="1h", limit=6)
+
+    flow_pass, flow_msg = evaluate_flow_conditions(symbol, h1_candles, futures_taker, spot_taker, spot_h1_candles)
+    if not flow_pass:
+        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT FLOW: {flow_msg}", flush=True)
+        return None
+
+    # Technical Indicators
+    rsi_h1 = calculate_rsi(h1_candles, 14)
+    rsi_h4 = calculate_rsi(h4_candles, 14)
+    ema34_h1 = calculate_ema(h1_candles, 34)
+    h1_atr = calculate_atr(h1_candles, 14)
+
+    if not rsi_h1 or not rsi_h4 or not ema34_h1 or h1_atr <= 0: return None
 
     last_h1 = h1_candles[-1]
     curr_price = last_h1['close']
-    h1_atr = calculate_atr(h1_candles, 14)
-    if h1_atr <= 0: return None
 
-    # --- 1. HARD FILTER: CHECK H4 BEARISH MẠNH ---
-    ema34_h4_list = calculate_ema(h4_candles, 34)
-    ema89_h4_list = calculate_ema(h4_candles, 89)
-    if ema34_h4_list and ema89_h4_list:
-        e34_curr = ema34_h4_list[-1]
-        e89_curr = ema89_h4_list[-1]
-        if h4_candles[-1]['close'] < e34_curr and e34_curr < e89_curr:
-            if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT: H4 Bearish (Price < EMA34 < EMA89)", flush=True)
-            return None
-
-    # --- 2. TÌM NỀN TÍCH LŨY (BASE) ---
-    base_info = find_accumulation_base(h1_candles)
-    if not base_info:
-        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT: Không tìm thấy Base tích lũy hợp lệ", flush=True)
+    # RSI FILTERS: RESTRICTION CHECK
+    if rsi_h1[-1] > 68.0 and (curr_price - ema34_h1[-1])/ema34_h1[-1] * 100 > 2.0:
+        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT RSI: H1 RSI > 68 qua xa ho tro", flush=True)
+        return None
+    if rsi_h4[-1] > 72.0:
+        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT RSI: H4 RSI > 72 (Overbought)", flush=True)
         return None
 
-    b_high = base_info['base_high']
-    b_low = base_info['base_low']
-    b_len = base_info['base_len']
-    breakout_level = b_high
+    setup_type = None
+    setup_name = ""
 
-    # --- 3. KIỂM TRA ĐIỀU KIỆN BREAKOUT H1 ---
-    is_breakout = last_h1['close'] > breakout_level and (last_h1['close'] - breakout_level) >= (0.10 * h1_atr)
-    is_retesting = (b_low <= curr_price <= breakout_level + 0.30 * h1_atr) and last_h1['low'] >= b_low * 0.995
+    # --------------------------------------------------------------------------
+    # EVALUATE SETUP B — H4 Swing Continuation (Ưu tiên cao hơn)
+    # --------------------------------------------------------------------------
+    is_setup_b = False
+    if len(rsi_h4) >= 4:
+        rsi_h4_recent = rsi_h4[-4:-1]
+        if any(45.0 <= r <= 50.0 for r in rsi_h4_recent) and rsi_h4[-1] > 50.0:
+            if last_h1['close'] > ema34_h1[-1]:
+                is_setup_b = True
+                setup_type = "SETUP_B"
+                setup_name = "H4 SWING CONTINUATION"
 
-    dist_from_breakout = curr_price - breakout_level
+    # --------------------------------------------------------------------------
+    # EVALUATE SETUP A — H1 Trend Pullback (Nếu không đạt Setup B)
+    # --------------------------------------------------------------------------
+    is_setup_a = False
+    if not is_setup_b and len(rsi_h1) >= 4:
+        rsi_h1_recent = rsi_h1[-4:-1]
+        if any(45.0 <= r <= 50.0 for r in rsi_h1_recent) and rsi_h1[-1] > 50.0 and rsi_h1[-1] > rsi_h1[-2]:
+            # Trigger candle closed above support / EMA34
+            if last_h1['close'] >= ema34_h1[-1] * 0.998:
+                is_setup_a = True
+                setup_type = "SETUP_A"
+                setup_name = "H1 TREND PULLBACK"
 
-    # --- HARD FILTER: CHASE WARNING (> 1.0 ATR hoặc > 4% chưa retest) ---
-    if dist_from_breakout > (1.0 * h1_atr):
-        if DEBUG_MODE: print(f"[{symbol}] ❌ HARD REJECT: Giá cách Breakout Level > 1.0 ATR ({dist_from_breakout/h1_atr:.2f} ATR)", flush=True)
+    if not (is_setup_a or is_setup_b): return None
+
+    # --------------------------------------------------------------------------
+    # CALCULATE ENTRY, SL & REAL STRUCTURE TARGETS
+    # --------------------------------------------------------------------------
+    # Support & Retest Lows
+    recent_h1_lows = [c['low'] for c in h1_candles[-6:]]
+    support_low = min(recent_h1_lows)
+    
+    # SL dat duoi diem sai cau truc + ATR buffer (0.25 * ATR)
+    sl_price = support_low - (0.25 * h1_atr)
+    risk_pct = (curr_price - sl_price) / curr_price * 100
+
+    # Strict SL Rules
+    if risk_pct > 3.0:
+        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT SL: Risk qua lon ({risk_pct:.2f}% > 3.0%)", flush=True)
         return None
 
-    if (curr_price - breakout_level) / breakout_level * 100 > 4.0 and last_h1['low'] > breakout_level + 0.30 * h1_atr:
-        if DEBUG_MODE: print(f"[{symbol}] ⏳ WAITING FOR RETEST: Giá đã pump > 4% chưa retest nền", flush=True)
-        return None
-
-    # --- 4. EXPANSION ORDER FLOW METRICS ---
-    avg_vol_20 = calculate_sma_volume(h1_candles[:-1], 20)
-    rvol = last_h1['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
-
-    # HARD FILTER: VOLUME H1 < 1.3x SMA20
-    if rvol < 1.3:
-        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT: Volume H1 yếu ({rvol:.1f}x < 1.3x SMA20)", flush=True)
-        return None
-
-    taker_h1 = get_taker_buy_pct(symbol, "1h")
-    # HARD FILTER: CVD < 55%
-    if taker_h1 < 55.0:
-        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT: CVD/Taker Buy thấp ({taker_h1:.1f}% < 55%)", flush=True)
-        return None
-
-    oi_pct_h1 = get_open_interest_pct(symbol, "1h")
-
-    # ==========================================================================
-    # BẮT ĐẦU CHẤM ĐIỂM BASE SCORE (100 ĐIỂM)
-    # ==========================================================================
-
-    # A. Volume Score (20đ)
-    if rvol >= 2.5: score_vol = 20
-    elif rvol >= 2.0: score_vol = 16
-    elif rvol >= 1.5: score_vol = 12
-    elif rvol >= 1.2: score_vol = 7
-    elif rvol >= 1.0: score_vol = 3
-    else: score_vol = 0
-
-    # B. Open Interest Score (20đ)
-    if oi_pct_h1 >= 8.0: score_oi = 20
-    elif oi_pct_h1 >= 5.0: score_oi = 16
-    elif oi_pct_h1 >= 3.0: score_oi = 12
-    elif oi_pct_h1 >= 1.0: score_oi = 7
-    elif oi_pct_h1 >= 0.0: score_oi = 3
-    else: score_oi = 0
-
-    # C. CVD Score (20đ)
-    if taker_h1 >= 80.0: score_cvd = 20
-    elif taker_h1 >= 70.0: score_cvd = 16
-    elif taker_h1 >= 60.0: score_cvd = 12
-    elif taker_h1 >= 55.0: score_cvd = 7
-    elif taker_h1 >= 50.0: score_cvd = 3
-    else: score_cvd = 0
-
-    # D. Price Structure Score (15đ)
-    score_struct = 0
-    if is_breakout: score_struct += 5
-    if is_retesting: score_struct += 5
-    if last_h1['close'] > breakout_level: score_struct += 5
-    score_struct = min(score_struct, 15)
-
-    # E. Base Quality Score (20đ)
-    if b_len >= 16: score_base = 20
-    elif b_len >= 11: score_base = 15
-    elif b_len >= 7: score_base = 10
-    elif b_len >= 4: score_base = 5
-    else: score_base = 0
-
-    # F. H4 Context Score (5đ)
-    score_h4 = 0
-    if ema34_h4_list:
-        if h4_candles[-1]['close'] > ema34_h4_list[-1]: score_h4 += 2
-        if ema89_h4_list and ema34_h4_list[-1] > ema89_h4_list[-1]: score_h4 += 2
-        if len(ema34_h4_list) >= 2 and ema34_h4_list[-1] > ema34_h4_list[-2]: score_h4 += 1
-    score_h4 = min(score_h4, 5)
-
-    total_score = score_vol + score_oi + score_cvd + score_struct + score_base + score_h4
-
-    if total_score < MIN_ALERT_SCORE:
-        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT: Score chỉ đạt {total_score}/100 (<{MIN_ALERT_SCORE})", flush=True)
-        return None
-
-    # --- 5. CALCULATE ENTRY, SL, TP & RR FILTER ---
-    entry_zone_low = breakout_level
-    entry_zone_high = min(curr_price, breakout_level + (0.30 * h1_atr))
-    if is_retesting:
-        entry_zone_low = breakout_level - (0.20 * h1_atr)
-        entry_zone_high = breakout_level + (0.20 * h1_atr)
-
-    entry_mid = curr_price
-
-    # Stop Loss = Base Low / Sweep Low - 0.15 ATR
-    sweep_low = min([c['low'] for c in h1_candles[-5:]])
-    sl_price = min(b_low, sweep_low) - (0.15 * h1_atr)
-    risk_pct = (entry_mid - sl_price) / entry_mid * 100
-
-    # HARD FILTER SL
-    if risk_pct > 2.5:
-        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT: SL > 2.5% ({risk_pct:.2f}%)", flush=True)
-        return None
-    if 2.0 < risk_pct <= 2.5 and total_score < 90:
-        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT: Risk 2.0-2.5% yêu cầu Score >= 90 (Hiện tại: {total_score})", flush=True)
-        return None
-
-    # DÒ TÌM PUMP ROOM VÀ BỘ 3 RESISTANCE
-    targets = find_up_to_3_resistances(h1_candles, h4_candles, entry_mid)
-    tp1_price, tp2_price = None, None
-    pump_room_pct = 0.0
-
-    if targets:
-        r1_pct = (targets[0] - entry_mid) / entry_mid * 100
-        if r1_pct >= 5.0:
-            tp1_price = targets[0]
-            tp2_price = targets[1] if len(targets) >= 2 else tp1_price * 1.06
-            pump_room_pct = r1_pct
-        elif len(targets) >= 2 and (targets[1] - entry_mid) / entry_mid * 100 >= 5.0:
-            tp1_price = targets[1]
-            tp2_price = targets[2] if len(targets) >= 3 else tp1_price * 1.08
-            pump_room_pct = (targets[1] - entry_mid) / entry_mid * 100
-
-    if not tp1_price:
-        fallback_tp1 = entry_mid + (h1_atr * 2.8)
-        fallback_pct = (fallback_tp1 - entry_mid) / entry_mid * 100
-        if fallback_pct >= 5.0:
-            tp1_price = fallback_tp1
-            tp2_price = fallback_tp1 * 1.08
-            pump_room_pct = fallback_pct
-
-    # HARD FILTER: PUMP ROOM < 5.0%
-    if pump_room_pct < 5.0 or not tp1_price:
-        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT: Pump Room < 5.0% (+{pump_room_pct:.1f}%)", flush=True)
-        return None
-
-    # HARD FILTER: RISK / REWARD TP1 >= 2.5R
-    tp1_dist = tp1_price - entry_mid
-    sl_dist = entry_mid - sl_price
-    rr_ratio = tp1_dist / sl_dist if sl_dist > 0 else 0
-
-    if rr_ratio < 2.5:
-        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT: Risk/Reward TP1 < 2.5R (Hiện tại: {rr_ratio:.1f}R)", flush=True)
-        return None
-
-    # --- SETUP LABEL PHÂN LOẠI ---
-    if total_score >= 90:
-        setup_label = "🚀 LONG H1 SQUEEZE EXPLOSION"
-    elif total_score >= 85:
-        setup_label = "🔥 LONG H1 SQUEEZE"
+    # Finder Target
+    h1_targets = find_valid_structure_targets(h1_candles, curr_price)
+    if not h1_targets:
+        fallback_tp1 = curr_price + (h1_atr * 2.2)
+        fallback_tp2 = fallback_tp1 + (h1_atr * 2.8)
+        tp1_price, tp2_price = fallback_tp1, fallback_tp2
     else:
-        setup_label = "LONG CANDIDATE"
+        tp1_price = h1_targets[0]
+        tp2_price = h1_targets[1] if len(h1_targets) >= 2 else tp1_price + (h1_atr * 2.5)
 
-    now = time.time()
+    tp3_price = tp2_price + (h1_atr * 3.0)
+
+    # Risk Reward Verification (Minimum TP1 RR >= 1.5)
+    tp1_reward = (tp1_price - curr_price) / curr_price * 100
+    if tp1_reward / risk_pct < 1.3:
+        if DEBUG_MODE: print(f"[{symbol}] ❌ REJECT RR: Tỷ le R:R TP1 qua thap ({tp1_reward/risk_pct:.2f}R)", flush=True)
+        return None
+
     symbol_cooldowns[symbol] = now
 
     return {
         'signal_timeframe': 'H1',
-        'engine_tag': 'H1 SQUEEZE EXPLOSION',
-        'title': f"🚀 [{setup_label}] #{symbol}",
+        'strategy': 'long-h1-h4-trend-flow-v1',
+        'setup_type': setup_type,
+        'setup_name': setup_name,
         'symbol': symbol,
-        'entry': entry_mid,
-        'entry_low': entry_zone_low,
-        'entry_high': entry_zone_high,
-        'base_high': b_high,
-        'base_low': b_low,
+        'entry': curr_price,
+        'entry_low': max(support_low, curr_price - (0.2 * h1_atr)),
+        'entry_high': curr_price,
         'sl': sl_price,
+        'sl_reason': 'H1 Structural Support Low + ATR Buffer',
         'tp1': tp1_price,
+        'tp1_reason': 'H1 Swing High Resistance',
         'tp2': tp2_price,
-        'tp1_pct': (tp1_price - entry_mid) / entry_mid * 100,
-        'tp2_pct': (tp2_price - entry_mid) / entry_mid * 100,
+        'tp2_reason': 'H1 Major Resistance Target',
+        'tp3': tp3_price,
+        'tp3_reason': 'H4 Supply Target',
         'risk_pct': risk_pct,
-        'score': total_score,
-        'setup_label': setup_label,
-        'rvol': rvol,
-        'oi_pct': oi_pct_h1,
-        'taker_pct': taker_h1,
-        'pump_room_pct': pump_room_pct,
-        'rr_ratio': rr_ratio,
+        'funding': funding,
+        'rsi_h1': rsi_h1[-1],
+        'rsi_h4': rsi_h4[-1],
+        'spot_taker': spot_taker[0] if spot_taker else 50.0,
+        'futures_taker': futures_taker[0] if futures_taker else 50.0,
         'timestamp': last_h1['timestamp'],
-        'signal_id': f"SQUEEZE_{symbol}_{last_h1['timestamp']}"
+        'signal_id': f"TREND_FLOW_{symbol}_{last_h1['timestamp']}"
     }
 
 # ==============================================================================
-# 5. TELEGRAM ALERT FORMATTER (CHUẨN FORMAT 100% YÊU CẦU)
+# 6. TELEGRAM SIGNAL FORMATTER
 # ==============================================================================
 def send_telegram_signal(sig):
     global signal_counter
@@ -569,64 +618,66 @@ def send_telegram_signal(sig):
     sig['id'] = signal_counter
     sig['hit_tp1'] = False
     sig['hit_tp2'] = False
-    sig['status_text'] = '⏳ Đang theo dõi real-time'
+    sig['status_text'] = '⏳ Đang theo dõi real-time (PAPER)'
     
     signals_history.append(sig)
     active_signals.append(sig)
 
-    msg = f"""🚀 <b>[{sig['setup_label']}] #{sig['symbol']}</b>
--------------------------------------
-⭐️ <b>Điểm Uy Tín</b>: <code>{sig['score']}/100</code>
+    msg = f"""🔥 <b>[PAPER TRADING] LONG SIGNAL</b>
+<b>Strategy:</b> <code>long-h1-h4-trend-flow-v1</code>
 
-🔥 <b>H1 BREAKOUT + ORDER FLOW EXPANSION</b>:
-• Volume H1: <code>+{sig['rvol']:.1f}x SMA20</code>
-• Open Interest: <code>{sig['oi_pct']:+.1f}%</code>
-• Lực Mua CVD: <code>{sig['taker_pct']:.0f}%</code>
-• Trạng Thái: <code>Breakout Nền Tích Lũy</code>
--------------------------------------
-🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG)</b>:
+#{sig['symbol']}
 
-📍 <b>Entry Zone</b>:
-<code>{sig['entry_low']:.4f} – {sig['entry_high']:.4f}</code>
+🟢 <b>Setup: {sig['setup_name']} ({sig['setup_type']})</b>
 
-🛑 <b>Stop Loss</b>:
-<code>{sig['sl']:.4f}</code>
+📍 <b>Entry Zone:</b>
+<code>{sig['entry_low']:.4f}</code> – <code>{sig['entry_high']:.4f}</code>
 
-🎯 <b>Take Profit 1</b>:
-<code>{sig['tp1']:.4f}</code> <code>(+{sig['tp1_pct']:.1f}%)</code>
+🛑 <b>Stop Loss:</b> <code>{sig['sl']:.4f}</code>
+Reason: {sig['sl_reason']} (-{sig['risk_pct']:.2f}%)
 
-🚀 <b>Take Profit 2</b>:
-<code>{sig['tp2']:.4f}</code> <code>(+{sig['tp2_pct']:.1f}%)</code>
+🎯 <b>TP1 Target:</b> <code>{sig['tp1']:.4f}</code>
+Reason: {sig['tp1_reason']}
 
--------------------------------------
-📊 <b>Pump Room</b>: <code>{sig['pump_room_pct']:.1f}%</code>
-⚖️ <b>Risk/Reward TP1</b>: <code>{sig['rr_ratio']:.1f}R</code>
+🎯 <b>TP2 Target:</b> <code>{sig['tp2']:.4f}</code>
+Reason: {sig['tp2_reason']}
 
-👉 <b>CHECK CHART H1 & BẮT SÓNG SỚM</b>
-⚠️ <b>KHÔNG CHASE nếu giá rời Entry Zone</b>"""
+🚀 <b>TP3 Target:</b> <code>{sig['tp3']:.4f}</code>
+Reason: {sig['tp3_reason']}
+
+📊 <b>Metrics & Order Flow:</b>
+• RSI H1: <code>{sig['rsi_h1']:.1f}</code> | RSI H4: <code>{sig['rsi_h4']:.1f}</code>
+• Spot Taker Buy: <code>{sig['spot_taker']:.1f}%</code>
+• Futures Taker Buy: <code>{sig['futures_taker']:.1f}%</code>
+• Funding Rate: <code>{sig['funding']:+.3f}%</code>
+
+📐 <b>Structure Alignment:</b>
+H4 Uptrend Hard Gate PASSED → H1 Trigger Retest
+
+⚠️ <i>Lệnh thử nghiệm PAPER TRADING. Không chase nếu rời Entry Zone.</i>"""
 
     send_telegram_direct_message(msg)
-    print(f"✅ [ALERT BẮN TELEGRAM SQUEEZE EXPLOSION] #{sig['id']} {sig['symbol']} (Score: {sig['score']})", flush=True)
+    print(f"✅ [ALERT BẮN TELEGRAM] #{sig['id']} {sig['symbol']} [{sig['setup_name']}]", flush=True)
 
 # ==============================================================================
-# 6. MAIN LOOP RUNNER
+# 7. MAIN RADAR LOOP
 # ==============================================================================
 def run_radar_loop():
-    print("⚡️ Bắt đầu Radar Quét H1 Squeeze Explosion (QNT Style)...", flush=True)
+    print("⚡️ Bắt đầu Radar Strategy: long-h1-h4-trend-flow-v1...", flush=True)
     while True:
-        btc_h1 = get_closed_klines("BTCUSDT", "60", limit=30)
+        btc_h4 = get_closed_klines("BTCUSDT", "240", category="linear", limit=50)
         all_tickers = get_all_bybit_usdt_symbols()
-        print(f"🔍 [SQUEEZE SCAN] Đang rà soát nền tích lũy & bùng nổ cho {len(all_tickers)} coin...", flush=True)
+        print(f"🔍 [TREND FLOW SCAN] Đang rà soát Hard Gate & Trigger cho {len(all_tickers)} coin...", flush=True)
         
         candidates = []
         for ticker in all_tickers:
             try:
-                sig = evaluate_h1_squeeze_explosion(ticker, btc_h1)
+                sig = evaluate_long_h1_h4_strategy(ticker, btc_h4)
                 if sig and sig['signal_id'] not in processed_signal_ids:
                     processed_signal_ids.add(sig['signal_id'])
                     send_telegram_signal(sig)
                     candidates.append(sig)
-            except Exception:
+            except Exception as e:
                 pass
             time.sleep(0.08)
 

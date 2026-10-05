@@ -5,12 +5,12 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION - CRYPTO-ONLY H1 SQUEEZE EXPLOSION ENGINE
+# CONFIGURATION - CRYPTO PURE ENGINE WITH REAL-TIME /scan COMMAND
 # ==============================================================================
 DEBUG_MODE = True                  
 COOLDOWN_SECONDS = 15              
 MIN_FUTURES_TURNOVER_24H = 10_000_000  # $10M USD 24h Crypto Turnover
-MIN_ALERT_SCORE = 80               # Chỉ bắn Telegram từ 80 điểm trở lên
+MIN_ALERT_SCORE = 80               # Chỉ bắn Telegram tự động từ 80 điểm trở lên
 MIN_TP1_PERCENT = 3.5              # TP1 tối thiểu từ +3.5% trở lên
 MIN_CVD_PERCENT = 60.0             # Lực mua CVD tối thiểu từ 60%
 
@@ -26,7 +26,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot Crypto Pure H1 Squeeze Explosion Active 24/7!"
+    return "Bot Crypto Pure H1 Squeeze Explosion with /scan Command Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -46,11 +46,7 @@ BASE_URL = "https://api.bybit.com"
 def get_all_bybit_crypto_symbols():
     """
     Chỉ lấy các cặp Crypto USDT Perp.
-    Loại bỏ tuyệt đối:
-    - Kim loại quý/Hàng hóa: XAU, XAG, WTI, USOIL,...
-    - Cổ phiếu Mỹ: NVDA, TSLA, AAPL, AMZN, META, MSFT,...
-    - Chỉ số: QQQ, SPX, NDX, DIA, IWM, TLT,...
-    - Leveraged Tokens: 3L, 3S, 2L, 2S
+    Loại bỏ tuyệt đối: Cổ phiếu, Vàng (XAU), Chỉ số, Kim loại quý, Hàng hóa.
     """
     url = f"{BASE_URL}/v5/market/tickers?category=linear"
     try:
@@ -58,7 +54,6 @@ def get_all_bybit_crypto_symbols():
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             tickers = res["result"]["list"]
             
-            # Danh sách đen loại trừ cổ phiếu, hàng hóa, chỉ số
             non_crypto_keywords = [
                 'XAU', 'XAG', 'WTI', 'USOIL', 'BRENT', 'COPPER', 'SILVER', 'GOLD',
                 'QQQ', 'SPCX', 'SPY', 'DIA', 'IWM', 'TLT', 'NDX', 'SPX',
@@ -69,7 +64,6 @@ def get_all_bybit_crypto_symbols():
             parsed_list = []
             for t in tickers:
                 sym = t['symbol']
-                # Bắt buộc kết thúc bằng USDT và không chứa bất kỳ từ khóa non-crypto nào
                 if sym.endswith('USDT') and not sym.startswith(('USDC', 'BUSD', 'DAI')):
                     if not any(k in sym for k in non_crypto_keywords):
                         parsed_list.append({
@@ -148,7 +142,7 @@ def calculate_sma_volume(candles, period=20):
 # ==============================================================================
 # EVALUATE HIGH-PROFIT & HIGH-MOMENTUM SQUEEZE SETUP
 # ==============================================================================
-def evaluate_squeeze_explosion_setup(ticker_data):
+def evaluate_squeeze_explosion_setup(ticker_data, is_manual_scan=False):
     symbol = ticker_data['symbol']
     fut_turnover = ticker_data['turnover24h']
     funding = ticker_data['fundingRate']
@@ -157,7 +151,8 @@ def evaluate_squeeze_explosion_setup(ticker_data):
     if funding > 0.06 or funding < -0.06: return None
 
     now = time.time()
-    if symbol in symbol_cooldowns and (now - symbol_cooldowns[symbol]) < 21600: return None
+    if not is_manual_scan and symbol in symbol_cooldowns and (now - symbol_cooldowns[symbol]) < 21600:
+        return None
 
     h1_candles = get_closed_klines(symbol, "60", category="linear", limit=60)
     if not h1_candles or len(h1_candles) < 30: return None
@@ -167,26 +162,19 @@ def evaluate_squeeze_explosion_setup(ticker_data):
     h1_atr = calculate_atr(h1_candles, 14)
     if h1_atr <= 0: return None
 
-    # Order flow metrics
     spot_taker = get_taker_ratios(symbol, category="spot", limit=5)
     cvd_buy_pct = spot_taker[0] if spot_taker else 50.0
 
-    # 1. BỘ LỌC CỨNG CVD: Taker buy >= 60%
     if cvd_buy_pct < MIN_CVD_PERCENT: return None
 
     oi_h1_pct = get_open_interest_pct(symbol, "1h")
+    if oi_h1_pct < 1.0: return None
 
-    # 2. BỘ LỌC CỨNG OI: Tiền bơm OI phải dương (>= +1.5%)
-    if oi_h1_pct < 1.5: return None
-
-    # Volume ratio
     avg_vol_20 = calculate_sma_volume(h1_candles[:-1], 20)
     vvol_ratio = last_h1['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
 
-    # 3. BỘ LỌC CỨNG VOLUME: Volume H1 phải >= 1.5x SMA20
-    if vvol_ratio < 1.5: return None
+    if vvol_ratio < 1.3: return None
 
-    # Base high / low
     recent_lows = [c['low'] for c in h1_candles[-12:-1]]
     recent_highs = [c['high'] for c in h1_candles[-12:-1]]
     base_low = min(recent_lows)
@@ -200,34 +188,28 @@ def evaluate_squeeze_explosion_setup(ticker_data):
 
     if not (is_breakout or is_holding): return None
 
-    # SL & TP Calculations (Thiết lập TP Cao & Chuẩn Cấu Trúc)
     sl_price = base_low - (0.15 * h1_atr)
     risk_pct = (curr_price - sl_price) / curr_price * 100
 
     if risk_pct > 3.5: return None
 
-    # Tính TP dựa trên ATR nâng cao để đảm bảo "Đủ Xăng" cán mốc
     tp1_price = max(curr_price + (h1_atr * 3.2), curr_price * (1 + MIN_TP1_PERCENT / 100))
     tp2_price = tp1_price + (h1_atr * 4.5)
 
     tp1_pct = (tp1_price - curr_price) / curr_price * 100
     tp2_pct = (tp2_price - curr_price) / curr_price * 100
 
-    # BỘ LỌC CỨNG: Reject thẳng các coin có TP1 < MIN_TP1_PERCENT (+3.5%)
     if tp1_pct < MIN_TP1_PERCENT: return None
 
-    # --------------------------------------------------------------------------
-    # CHẤM ĐIỂM UY TÍN (0 - 100)
-    # --------------------------------------------------------------------------
     score = 40
 
     if vvol_ratio >= 2.5: score += 20
     elif vvol_ratio >= 2.0: score += 16
-    elif vvol_ratio >= 1.5: score += 12
+    elif vvol_ratio >= 1.3: score += 12
 
     if oi_h1_pct >= 5.0: score += 20
     elif oi_h1_pct >= 2.5: score += 15
-    elif oi_h1_pct >= 1.5: score += 10
+    elif oi_h1_pct >= 1.0: score += 10
 
     if cvd_buy_pct >= 80.0: score += 20
     elif cvd_buy_pct >= 70.0: score += 16
@@ -235,17 +217,18 @@ def evaluate_squeeze_explosion_setup(ticker_data):
 
     if is_breakout: score += 10
 
-    if score < MIN_ALERT_SCORE:
-        return None
+    # Đối với lệnh tự động, bắt buộc Score >= 80; Đối với /scan thủ công, lấy từ Score >= 75
+    min_threshold = MIN_ALERT_SCORE if not is_manual_scan else 75
+    if score < min_threshold: return None
 
     entry_zone_low = base_high if is_breakout else base_low
     entry_zone_high = curr_price
 
     fingerprint = f"{symbol}_{last_h1['timestamp']}_CRYPTO_SQUEEZE_{score}"
-    if fingerprint in processed_fingerprints: return None
-
-    processed_fingerprints.add(fingerprint)
-    symbol_cooldowns[symbol] = now
+    if not is_manual_scan:
+        if fingerprint in processed_fingerprints: return None
+        processed_fingerprints.add(fingerprint)
+        symbol_cooldowns[symbol] = now
 
     return {
         'symbol': symbol,
@@ -265,7 +248,68 @@ def evaluate_squeeze_explosion_setup(ticker_data):
     }
 
 # ==============================================================================
-# TELEGRAM ALERT FORMATTER
+# MANUAL SCANNER PROCESSOR (/scan COMMAND)
+# ==============================================================================
+def execute_manual_scan():
+    send_telegram_direct_message("🔍 <b>ĐANG SCAN REAL-TIME TOÀN BỘ THỊ TRƯỜNG CRYPTO...</b>\n⏳ Vui lòng chờ trong 15-30 giây để lọc ra các mã bùng nổ tốt nhất!")
+    
+    all_crypto_tickers = get_all_bybit_crypto_symbols()
+    matched_coins = []
+
+    for ticker in all_crypto_tickers:
+        try:
+            sig = evaluate_squeeze_explosion_setup(ticker, is_manual_scan=True)
+            if sig:
+                matched_coins.append(sig)
+        except Exception:
+            pass
+        time.sleep(0.03)
+
+    if not matched_coins:
+        send_telegram_direct_message("📊 <b>KẾT QUẢ /SCAN REAL-TIME:</b>\n\nChưa có coin Crypto nào đáp ứng đủ tiêu chí bùng nổ (Score ≥ 75, TP1 ≥ +3.5%, Volume/CVD mạnh) tại thời điểm này.")
+        return
+
+    # Sắp xếp theo điểm Uy Tín giảm dần
+    matched_coins.sort(key=lambda x: x['score'], reverse=True)
+    top_candidates = matched_coins[:5]
+
+    msg = f"🚀 <b>KẾT QUẢ SCAN REAL-TIME — TOP {len(top_candidates)} COIN BÙNG NỔ</b>\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    for sig in top_candidates:
+        msg += f"🔥 <b>#{sig['symbol']}</b> (Điểm: <code>{sig['score']}/100</code>)\n"
+        msg += f"• Volume H1: <code>+{sig['vvol_ratio']:.1f}x</code> | OI: <code>{sig['oi_pct']:+.1f}%</code> | CVD Buy: <code>{sig['cvd_buy']:.0f}%</code>\n"
+        msg += f"📍 Entry Zone: <code>{sig['entry_low']:.4f} – {sig['entry_high']:.4f}</code>\n"
+        msg += f"🛑 Stop Loss: <code>{sig['sl']:.4f}</code>\n"
+        msg += f"🎯 TP1: <code>{sig['tp1']:.4f}</code> (<b>+{sig['tp1_pct']:.1f}%</b>) | TP2: <code>{sig['tp2']:.4f}</code> (<b>+{sig['tp2_pct']:.1f}%</b>)\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
+
+    msg += "👉 <i>Gửi tín hiệu chi tiết tự động khi có biến động nổ đà sóng tăng!</i>"
+    send_telegram_direct_message(msg)
+
+def process_telegram_commands():
+    last_update_id = 0
+    print("🤖 Bật luồng Telegram Listener (/scan, /ping)...", flush=True)
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=10"
+            res = requests.get(url, timeout=12).json()
+            if res.get("ok") and res.get("result"):
+                for update in res["result"]:
+                    last_update_id = update["update_id"]
+                    message = update.get("message", {})
+                    text = message.get("text", "").strip().lower()
+                    
+                    if text in ["/scan", "scan"]:
+                        Thread(target=execute_manual_scan, daemon=True).start()
+                    elif text in ["/start", "/ping", "ping"]:
+                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot Crypto Squeeze Scanner đang chạy 24/7. Nhập <b>/scan</b> để tìm coin ngay!")
+        except Exception as e:
+            print(f"Lỗi Telegram Listener: {e}", flush=True)
+        time.sleep(2)
+
+# ==============================================================================
+# TELEGRAM ALERT FORMATTER (TỰ ĐỘNG BẮN SIGNAL)
 # ==============================================================================
 def send_telegram_signal(sig):
     global signal_counter
@@ -310,10 +354,10 @@ def run_radar_loop():
     while True:
         try:
             all_crypto_tickers = get_all_bybit_crypto_symbols()
-            print(f"🔍 [CRYPTO SCANNER] Đang rà soát {len(all_crypto_tickers)} coin Crypto (Lọc bỏ triệt để Cổ phiếu/Vàng)...", flush=True)
+            print(f"🔍 [CRYPTO SCANNER] Đang rà soát {len(all_crypto_tickers)} coin Crypto...", flush=True)
             for ticker in all_crypto_tickers:
                 try:
-                    sig = evaluate_squeeze_explosion_setup(ticker)
+                    sig = evaluate_squeeze_explosion_setup(ticker, is_manual_scan=False)
                     if sig:
                         send_telegram_signal(sig)
                 except Exception:
@@ -327,4 +371,5 @@ def run_radar_loop():
 
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
+    Thread(target=process_telegram_commands, daemon=True).start()
     run_radar_loop()

@@ -8,11 +8,11 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION - H1 TREND-FLOW STRATEGY & FAST SNAPSHOT ENGINE
+# CONFIGURATION - H1 PINBAR SWEEP & TREND RECLAIM STRATEGY
 # ==============================================================================
 DEBUG_MODE = True                  
-COOLDOWN_SECONDS = 20              
-MIN_FUTURES_TURNOVER_24H = 8_000_000   # $8M USD Minimum Turnover (Mở rộng cho altcoin)
+COOLDOWN_SECONDS = 15              
+MIN_FUTURES_TURNOVER_24H = 8_000_000   # $8M USD Minimum Turnover
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -26,7 +26,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot H1 Trend-Flow Signal Engine Active 24/7!"
+    return "Bot H1 Pinbar Sweep & Trend Engine Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -78,7 +78,7 @@ def get_all_bybit_crypto_symbols():
         print(f"Lỗi lấy Tickers: {e}", flush=True)
     return []
 
-def get_closed_klines(symbol, interval, category="linear", limit=30):
+def get_closed_klines(symbol, interval, category="linear", limit=35):
     url = f"{BASE_URL}/v5/market/kline?category={category}&symbol={symbol}&interval={interval}&limit={limit}"
     try:
         res = requests.get(url, timeout=3).json()
@@ -155,10 +155,10 @@ def calculate_atr(candles, period=14):
     return sum(tr_list[-period:]) / period if tr_list else 0.0
 
 # ==============================================================================
-# 1. ACCURATE H1 LONG STRATEGY EVALUATOR (CỰC CHUẨN ĐIỂM VÀO)
+# H1 PINBAR SWEEP & RECLAIM EVALUATOR (GTC STYLE)
 # ==============================================================================
 
-def evaluate_h1_long_setup(t):
+def evaluate_h1_pinbar_sweep_setup(t):
     sym = t['symbol']
     funding = t['fundingRate']
 
@@ -172,49 +172,57 @@ def evaluate_h1_long_setup(t):
     if not h1_candles or len(h1_candles) < 22: return None
 
     last_h1 = h1_candles[-1]
-    curr_price = last_h1['close']
+    open_1h = last_h1['open']
+    close_1h = last_h1['close']
+    high_1h = last_h1['high']
+    low_1h = last_h1['low']
+
     h1_atr = calculate_atr(h1_candles, 14)
     ema34_h1 = calculate_ema(h1_candles, 34)
     rsi_h1 = calculate_rsi(h1_candles, 14)
 
     if not ema34_h1 or not rsi_h1 or h1_atr <= 0: return None
 
-    # HARD GATE H1: Giá đóng > EMA34 H1 & RSI H1 Vừa Reclaim 50 (50 - 65)
-    if not (curr_price >= ema34_h1[-1] * 0.998 and 48.0 <= rsi_h1[-1] <= 68.0):
-        return None
+    # 1. TÍNH RÂU NẾN DƯỚI (LOWER WICK SWEEP)
+    total_range = high_1h - low_1h
+    if total_range <= 0: return None
 
-    # Kiếm tra Volume H1 có sự đột biến nhẹ (>= 1.2x trung bình 20 nến)
+    lower_wick = min(open_1h, close_1h) - low_1h
+    lower_wick_pct = (lower_wick / total_range) * 100
+
+    # BỘ LỌC CỨNG SWEEP: Râu dưới phải chiếm >= 35% chiều dài nến H1
+    is_sweep = lower_wick_pct >= 35.0
+
+    # 2. ĐIỀU KIỆN GIÁ ĐÓNG NẾN & RSI H1
+    is_reclaim = close_1h >= ema34_h1[-1] * 0.996 and rsi_h1[-1] >= 48.0
+
+    if not (is_sweep or is_reclaim): return None
+
+    # Volume Ratio H1
     vols = [c['volume'] for c in h1_candles[-21:-1]]
     avg_vol = np.mean(vols) if vols else 1.0
     vol_ratio = last_h1['volume'] / avg_vol if avg_vol > 0 else 1.0
 
-    if vol_ratio < 1.15: return None
+    if vol_ratio < 1.1: return None
 
-    # Tính mốc Hỗ trợ & SL Cấu Trúc
-    recent_lows = [c['low'] for c in h1_candles[-4:]]
-    support_low = min(recent_lows)
-    
-    sl_price = max(support_low - (0.25 * h1_atr), curr_price * 0.965)
-    risk_pct = (curr_price - sl_price) / curr_price * 100
+    # Mốc SL dưới chân râu nến vừa quét (Liquidity Low)
+    sl_price = low_1h - (0.15 * h1_atr)
+    risk_pct = (close_1h - sl_price) / close_1h * 100
 
-    if risk_pct > 4.5 or risk_pct < 0.8: return None # Giới hạn Risk hợp lý
+    if risk_pct > 4.2 or risk_pct < 0.6: return None
 
-    tp1_price = curr_price + (h1_atr * 2.5)
-    tp2_price = curr_price + (h1_atr * 4.2)
+    tp1_price = close_1h + (h1_atr * 2.8)
+    tp2_price = close_1h + (h1_atr * 4.8)
 
-    tp1_pct = (tp1_price - curr_price) / curr_price * 100
-    tp2_pct = (tp2_price - curr_price) / curr_price * 100
+    tp1_pct = (tp1_price - close_1h) / close_1h * 100
+    tp2_pct = (tp2_price - close_1h) / close_1h * 100
 
-    if tp1_pct < 2.5: return None
+    score = 65
+    if is_sweep: score += 15
+    if vol_ratio >= 1.8: score += 10
+    if 50.0 <= rsi_h1[-1] <= 65.0: score += 10
 
-    # Chấm điểm Setup
-    score = 60
-    if vol_ratio >= 2.0: score += 20
-    elif vol_ratio >= 1.3: score += 10
-
-    if 52.0 <= rsi_h1[-1] <= 62.0: score += 20
-
-    fingerprint = f"{sym}_{last_h1['timestamp']}_H1_SETUP_{score}"
+    fingerprint = f"{sym}_{last_h1['timestamp']}_H1_SWEEP_{score}"
     if fingerprint in processed_fingerprints: return None
 
     processed_fingerprints.add(fingerprint)
@@ -223,9 +231,9 @@ def evaluate_h1_long_setup(t):
     return {
         'symbol': sym,
         'score': score,
-        'entry_low': support_low,
-        'entry_high': curr_price,
-        'entry': curr_price,
+        'entry_low': low_1h,
+        'entry_high': close_1h,
+        'entry': close_1h,
         'sl': sl_price,
         'risk_pct': risk_pct,
         'tp1': tp1_price,
@@ -234,6 +242,7 @@ def evaluate_h1_long_setup(t):
         'tp2_pct': tp2_pct,
         'rsi_h1': rsi_h1[-1],
         'vol_ratio': vol_ratio,
+        'lower_wick_pct': lower_wick_pct,
         'funding': funding
     }
 
@@ -242,13 +251,14 @@ def send_h1_telegram_signal(sig):
     signal_counter += 1
     sig['id'] = signal_counter
 
-    msg = f"""🔥 <b>[LONG H1 SETUP XÁC NHẬN] #{sig['symbol']}</b>
+    msg = f"""🧲 <b>[LONG H1 SWEEP & PINBAR RECLAIM] #{sig['symbol']}</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
 ⭐️ <b>Điểm Uy Tín:</b> <code>{sig['score']}/100</code>
 
-🟢 <b>TÍN HIỆU H1 TREND RECLAIM:</b>
+🔥 <b>DẤU HIỆU CÁ MẬP RŨ HÀNG SWEEP H1:</b>
+• Râu Dưới 1H: <code>{sig['lower_wick_pct']:.1f}%</code> (Quét Liquidity)
 • Volume H1: <code>+{sig['vol_ratio']:.1f}x</code> Median20
-• RSI H1: <code>{sig['rsi_h1']:.1f}</code> (Vừa vượt 50)
+• RSI H1: <code>{sig['rsi_h1']:.1f}</code> (Vừa bứt phá)
 • Funding Rate: <code>{sig['funding']:+.3f}%</code>
 
 🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG):</b>
@@ -260,20 +270,20 @@ def send_h1_telegram_signal(sig):
 👉 <b>CHECK CHART H1 & BẮT SÓNG NGAY!</b>"""
 
     send_telegram_direct_message(msg)
-    print(f"✅ [ALERT LONG H1] Đã bắn tín hiệu #{sig['id']} {sig['symbol']} (Score: {sig['score']})", flush=True)
+    print(f"✅ [ALERT SWEEP H1] Đã bắn tín hiệu #{sig['id']} {sig['symbol']} (Score: {sig['score']})", flush=True)
 
 def run_radar_loop():
-    print("⚡️️ Bắt đầu Luồng Radar H1 Auto Signal Scanner...", flush=True)
+    print("⚡️ Bắt đầu Luồng Radar H1 Auto Signal Scanner...", flush=True)
     while True:
         try:
             all_tickers = get_all_bybit_crypto_symbols()
-            print(f"🔍 [RADAR AUTO H1] Đang rà soát {len(all_tickers)} altcoins...", flush=True)
+            print(f"🔍 [RADAR AUTO H1] Đang rà soát Pinbar Sweep cho {len(all_tickers)} altcoins...", flush=True)
             
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                results = list(executor.map(evaluate_h1_long_setup, all_tickers))
+            with ThreadPoolExecutor(max_workers=12) as executor:
+                results = list(executor.map(evaluate_h1_pinbar_sweep_setup, all_tickers))
 
             for sig in results:
-                if sig and sig['score'] >= 75:
+                if sig and sig['score'] >= 70:
                     send_h1_telegram_signal(sig)
 
         except Exception as e:
@@ -283,7 +293,7 @@ def run_radar_loop():
         time.sleep(COOLDOWN_SECONDS)
 
 # ==============================================================================
-# 2. FAST SNAPSHOT PROCESSOR FOR /scan COMMAND (<3s)
+# FAST SNAPSHOT PROCESSOR FOR /scan COMMAND (<3s)
 # ==============================================================================
 
 def analyze_single_coin_snapshot(t):

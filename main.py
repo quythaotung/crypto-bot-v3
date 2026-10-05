@@ -8,25 +8,25 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION - H1 STRATEGY & FULL SNAPSHOT REPORT ENGINE
+# CONFIGURATION - H1/5M REALTIME REVERSAL ENGINE (LONG & SHORT)
 # ==============================================================================
 DEBUG_MODE = True                  
-COOLDOWN_SECONDS = 15              
+SCAN_INTERVAL_SECONDS = 300            # Cứ mỗi 5 phút quét 1 lần toàn thị trường
 MIN_FUTURES_TURNOVER_24H = 8_000_000   # $8M USD Minimum Turnover
+MIN_ALERT_SCORE = 80                   # Chỉ gửi Telegram chính từ 80 điểm trở lên
+COOLDOWN_ALERT_SECONDS = 1800          # Cooldown 30 phút cùng 1 coin trừ khi score tăng mạnh
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-signals_history = []
-processed_fingerprints = set()
-symbol_cooldowns = {}              
+processed_signals = {}                 # Lưu cooldown & score gần nhất
 signal_counter = 0
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot H1 Strategy & Full Snapshot Scanner Active 24/7!"
+    return "Bot Realtime H1/5M Reversal Engine (LONG & SHORT) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -37,20 +37,20 @@ def send_telegram_direct_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=5)
+        requests.post(url, json=payload, timeout=6)
     except Exception as e:
         print(f"Lỗi gửi Telegram: {e}", flush=True)
 
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# FAST API HELPERS
+# DATA FETCHING HELPERS
 # ==============================================================================
 
 def get_all_bybit_crypto_symbols():
     url = f"{BASE_URL}/v5/market/tickers?category=linear"
     try:
-        res = requests.get(url, timeout=4).json()
+        res = requests.get(url, timeout=5).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             tickers = res["result"]["list"]
             non_crypto_keywords = [
@@ -78,15 +78,15 @@ def get_all_bybit_crypto_symbols():
         print(f"Lỗi lấy Tickers: {e}", flush=True)
     return []
 
-def get_closed_klines(symbol, interval, category="linear", limit=35):
-    url = f"{BASE_URL}/v5/market/kline?category={category}&symbol={symbol}&interval={interval}&limit={limit}"
+def get_klines_with_current(symbol, interval, limit=30):
+    """Lấy danh sách Klines bao gồm cả nến đang chạy real-time"""
+    url = f"{BASE_URL}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit}"
     try:
-        res = requests.get(url, timeout=3).json()
+        res = requests.get(url, timeout=4).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             raw_list = res["result"]["list"]
-            closed_candles = raw_list[1:]
             parsed = []
-            for c in reversed(closed_candles):
+            for c in reversed(raw_list):
                 parsed.append({
                     'timestamp': int(c[0]),
                     'open': float(c[1]),
@@ -100,7 +100,7 @@ def get_closed_klines(symbol, interval, category="linear", limit=35):
         pass
     return []
 
-def get_open_interest_pct(symbol, interval_str="30m"):
+def get_open_interest_pct(symbol, interval_str="5m"):
     url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval_str}&limit=3"
     try:
         res = requests.get(url, timeout=3).json()
@@ -113,6 +113,16 @@ def get_open_interest_pct(symbol, interval_str="30m"):
     except Exception:
         pass
     return 0.0
+
+def get_taker_buy_sell_ratio(symbol, interval_str="5m"):
+    url = f"{BASE_URL}/v5/market/account-ratio?category=spot&symbol={symbol}&period={interval_str}&limit=2"
+    try:
+        res = requests.get(url, timeout=3).json()
+        if res.get("retCode") == 0 and res.get("result", {}).get("list"):
+            return float(res["result"]["list"][0].get("buyRatio", 0.5)) * 100
+    except Exception:
+        pass
+    return 50.0
 
 def calculate_ema(candles, period):
     if len(candles) < period: return []
@@ -144,251 +154,245 @@ def calculate_rsi(candles, period=14):
         rsi_values.append(100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
     return rsi_values
 
-def calculate_atr(candles, period=14):
-    if len(candles) < period + 1: return 0.0
-    tr_list = []
-    for i in range(1, len(candles)):
-        high = candles[i]['high']
-        low = candles[i]['low']
-        prev_close = candles[i-1]['close']
-        tr_list.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
-    return sum(tr_list[-period:]) / period if tr_list else 0.0
+def get_btc_regime_context():
+    """Kiểm tra xu hướng BTC 5M/H1 để tính 5 điểm Market Regime"""
+    btc_klines = get_klines_with_current("BTCUSDT", "5", limit=10)
+    if not btc_klines or len(btc_klines) < 3: return "NEUTRAL", 3
+    change_5m = (btc_klines[-1]['close'] - btc_klines[-2]['open']) / btc_klines[-2]['open'] * 100
+    if change_5m <= -1.2:
+        return "BTC_DUMPING", 0
+    elif change_5m >= 1.2:
+        return "BTC_PUMPING", 5
+    return "STABLE", 3
 
 # ==============================================================================
-# 1. SNAPSHOT SCANNER PROCESSOR (/scan LỜI NHƯ MẪU 100%)
+# CORE REVERSAL EVALUATOR (LONG & SHORT 100-POINT SYSTEM)
 # ==============================================================================
 
-def analyze_single_coin_snapshot(t):
-    sym = t['symbol']
-    try:
-        h1_fut = get_closed_klines(sym, "60", category="linear", limit=22)
-        if not h1_fut or len(h1_fut) < 20: return None
+def evaluate_coin_reversal(ticker_data, btc_regime):
+    sym = ticker_data['symbol']
+    funding = ticker_data['fundingRate']
 
-        last_fut = h1_fut[-1]
-        p_change_1h = (last_fut['close'] - last_fut['open']) / last_fut['open'] * 100
+    # 1. LẤY DỮ LIỆU KLINE 5M VÀ H1
+    m5_candles = get_klines_with_current(sym, "5", limit=30)
+    h1_candles = get_klines_with_current(sym, "60", limit=30)
 
-        fut_vols_20 = [c['volume'] for c in h1_fut[-21:-1]]
-        avg_fut_vol = np.mean(fut_vols_20) if fut_vols_20 else 1.0
-        fut_vol_ratio = last_fut['volume'] / avg_fut_vol if avg_fut_vol > 0 else 1.0
-        spot_vol_ratio = max(0.5, fut_vol_ratio * 0.92)
-
-        oi_30m_pct = get_open_interest_pct(sym, interval_str="30m")
-
-        # Hệ thống chấm điểm Score
-        score = 40
-        if spot_vol_ratio >= 3.0: score += 20
-        elif spot_vol_ratio >= 1.2: score += 10
-
-        if fut_vol_ratio >= 2.5: score += 20
-        elif fut_vol_ratio >= 1.2: score += 10
-
-        if oi_30m_pct >= 2.0: score += 15
-        elif oi_30m_pct >= 0.3: score += 8
-
-        if p_change_1h >= 0.2: score += 5
-
-        return {
-            'symbol': sym,
-            'score': min(100, score),
-            'p_change_1h': p_change_1h,
-            'spot_vol_ratio': spot_vol_ratio,
-            'fut_vol_ratio': fut_vol_ratio,
-            'oi_30m_pct': oi_30m_pct
-        }
-    except Exception:
+    if not m5_candles or len(m5_candles) < 22 or not h1_candles or len(h1_candles) < 22:
         return None
 
+    last_5m = m5_candles[-1]
+    curr_price = last_5m['close']
+
+    # Kiểm tra biến động 5M
+    vols_5m_20 = [c['volume'] for c in m5_candles[-21:-1]]
+    avg_vol_5m = np.mean(vols_5m_20) if vols_5m_20 else 1.0
+    vol_5m_ratio = last_5m['volume'] / avg_vol_5m if avg_vol_5m > 0 else 1.0
+
+    # Lấy dữ liệu H1 đang chạy (In-progress Candle)
+    curr_h1 = h1_candles[-1]
+    prev_h1_swing_low = min([c['low'] for c in h1_candles[-6:-1]])
+    prev_h1_swing_high = max([c['high'] for c in h1_candles[-6:-1]])
+
+    open_h1, high_h1, low_h1, close_h1 = curr_h1['open'], curr_h1['high'], curr_h1['low'], curr_h1['close']
+    body_h1 = abs(close_h1 - open_h1)
+    lower_wick_h1 = min(open_h1, close_h1) - low_h1
+    upper_wick_h1 = high_h1 - max(open_h1, close_h1)
+
+    # Indicator H1
+    ema34_h1 = calculate_ema(h1_candles, 34)
+    ema89_h1 = calculate_ema(h1_candles, 89)
+    rsi_h1_list = calculate_rsi(h1_candles, 14)
+
+    if not ema34_h1 or not rsi_h1_list: return None
+    rsi_h1 = rsi_h1_list[-1]
+
+    # Orderflow
+    oi_pct_5m = get_open_interest_pct(sym, "5m")
+    taker_buy_pct = get_taker_buy_sell_ratio(sym, "5m")
+
+    # Anti-chase / Overextended Check
+    p_change_1h = (close_h1 - h1_candles[-3]['open']) / h1_candles[-3]['open'] * 100 if len(h1_candles) >= 3 else 0
+    if p_change_1h > 12.0 or p_change_1h < -12.0:
+        return None # Đã overextended quá xa
+
+    # --------------------------------------------------------------------------
+    # CHECK LONG REVERSAL
+    # --------------------------------------------------------------------------
+    is_long_sweep = (low_h1 < prev_h1_swing_low) and (close_h1 >= prev_h1_swing_low * 0.998)
+    wick_ratio_long = (lower_wick_h1 / body_h1) if body_h1 > 0 else 0.0
+
+    if is_long_sweep or (wick_ratio_long >= 1.5 and close_h1 >= open_h1):
+        # Chấm điểm LONG (Max 100)
+        s_sweep = 25 if is_long_sweep else 10
+        s_wick = 15 if wick_ratio_long >= 2.0 else (10 if wick_ratio_long >= 1.2 else 5)
+        s_reclaim = 15 if close_h1 >= prev_h1_swing_low else 8
+        s_vol = 10 if vol_5m_ratio >= 2.0 else (6 if vol_5m_ratio >= 1.4 else 2)
+        s_oi = 10 if oi_pct_5m >= 1.0 else 5
+        s_cvd = 10 if taker_buy_pct >= 62.0 else 4
+        s_ema = 5 if (abs(close_h1 - ema34_h1[-1])/close_h1 < 0.01 or (ema89_h1 and abs(close_h1 - ema89_h1[-1])/close_h1 < 0.01)) else 2
+        s_rsi = 5 if 35.0 <= rsi_h1 <= 58.0 else 2
+        s_btc = btc_regime[1]
+
+        score_long = s_sweep + s_wick + s_reclaim + s_vol + s_oi + s_cvd + s_ema + s_rsi + s_btc
+
+        if score_long >= MIN_ALERT_SCORE:
+            return {
+                'symbol': sym,
+                'side': 'LONG',
+                'score': score_long,
+                'entry': curr_price,
+                'is_sweep': is_long_sweep,
+                'wick_ratio': wick_ratio_long,
+                'vol_5m_ratio': vol_5m_ratio,
+                'oi_pct': oi_pct_5m,
+                'taker_buy': taker_buy_pct,
+                'rsi_h1': rsi_h1,
+                'funding': funding,
+                'timestamp': curr_h1['timestamp']
+            }
+
+    # --------------------------------------------------------------------------
+    # CHECK SHORT REVERSAL
+    # --------------------------------------------------------------------------
+    is_short_sweep = (high_h1 > prev_h1_swing_high) and (close_h1 <= prev_h1_swing_high * 1.002)
+    wick_ratio_short = (upper_wick_h1 / body_h1) if body_h1 > 0 else 0.0
+
+    if is_short_sweep or (wick_ratio_short >= 1.5 and close_h1 <= open_h1):
+        s_sweep = 25 if is_short_sweep else 10
+        s_wick = 15 if wick_ratio_short >= 2.0 else (10 if wick_ratio_short >= 1.2 else 5)
+        s_reclaim = 15 if close_h1 <= prev_h1_swing_high else 8
+        s_vol = 10 if vol_5m_ratio >= 2.0 else (6 if vol_5m_ratio >= 1.4 else 2)
+        s_oi = 10 if oi_pct_5m >= 1.0 else 5
+        s_cvd = 10 if taker_buy_pct <= 38.0 else 4
+        s_ema = 5 if (abs(close_h1 - ema34_h1[-1])/close_h1 < 0.01 or (ema89_h1 and abs(close_h1 - ema89_h1[-1])/close_h1 < 0.01)) else 2
+        s_rsi = 5 if 42.0 <= rsi_h1 <= 65.0 else 2
+        s_btc = 5 if btc_regime[0] == "BTC_DUMPING" else 3
+
+        score_short = s_sweep + s_wick + s_reclaim + s_vol + s_oi + s_cvd + s_ema + s_rsi + s_btc
+
+        if score_short >= MIN_ALERT_SCORE:
+            return {
+                'symbol': sym,
+                'side': 'SHORT',
+                'score': score_short,
+                'entry': curr_price,
+                'is_sweep': is_short_sweep,
+                'wick_ratio': wick_ratio_short,
+                'vol_5m_ratio': vol_5m_ratio,
+                'oi_pct': oi_pct_5m,
+                'taker_buy': taker_buy_pct,
+                'rsi_h1': rsi_h1,
+                'funding': funding,
+                'timestamp': curr_h1['timestamp']
+            }
+
+    return None
+
+# ==============================================================================
+# TELEGRAM ALERT FORMATTER
+# ==============================================================================
+
+def send_telegram_reversal_alert(sig, is_confirmed=False):
+    now_time = time.time()
+    sym = sig['symbol']
+    
+    # Anti-spam Cooldown Logic
+    if not is_confirmed:
+        if sym in processed_signals:
+            last_time, last_score = processed_signals[sym]
+            if (now_time - last_time < COOLDOWN_ALERT_SECONDS) and (sig['score'] <= last_score + 8):
+                return # Bỏ qua nếu chưa đủ 30p và score không tăng đột biến
+        processed_signals[sym] = (now_time, sig['score'])
+
+    sweep_icon = "✅" if sig['is_sweep'] else "❌"
+    side_icon = "🟢 LONG" if sig['side'] == 'LONG' else "🔴 SHORT"
+    header_title = f"✅ H1 REVERSAL CONFIRMED — {sig['side']}" if is_confirmed else f"🔥 EARLY H1 REVERSAL — {sig['side']}"
+    cvd_text = "Strong Buy" if sig['taker_buy'] >= 60 else ("Strong Sell" if sig['taker_buy'] <= 40 else "Neutral")
+
+    msg = f"""<b>{header_title}</b>
+🪙 <b>#{sig['symbol']}</b>
+⭐ <b>Score:</b> <code>{sig['score']}/100</code>
+📍 <b>Entry Zone:</b> <code>{sig['entry']:.4f}</code>
+🧲 <b>Liquidity Sweep:</b> {sweep_icon}
+🕯 <b>Wick Ratio:</b> <code>{sig['wick_ratio']:.1f}x Body</code>
+📈 <b>Volume 5M:</b> <code>{sig['vol_5m_ratio']:.1f}x</code>
+📊 <b>OI 5M:</b> <code>{sig['oi_pct']:+.1f}%</code>
+💰 <b>CVD Flow:</b> <code>{cvd_text} ({sig['taker_buy']:.0f}%)</code>
+📐 <b>EMA Status:</b> Reclaim Confluence
+📊 <b>RSI H1:</b> <code>{sig['rsi_h1']:.1f}</code>
+⚡️ <b>5M Momentum:</b> STRONG
+🧠 <b>H1 Structure:</b> REVERSAL ({sig['side']})
+
+⚠️ <b>Check H1 ngay.</b>"""
+
+    send_telegram_direct_message(msg)
+    print(f"✅ [SENT REVERSAL] {header_title} {sig['symbol']} Score: {sig['score']}", flush=True)
+
+# ==============================================================================
+# MANUAL /scan SNAPSHOT PROCESSOR
+# ==============================================================================
+
 def execute_manual_snapshot_scan():
-    send_telegram_direct_message("⚡️ <b>ĐANG QUÉT FAST SNAPSHOT...</b>\n⏳ Tổng hợp tình hình thị trường trong 2-3 giây!")
+    send_telegram_direct_message("⚡️ <b>ĐANG QUÉT SNAPSHOT ĐẢO CHIỀU REVERSAL 5M/H1...</b>\n⏳ Lọc ra Top coin có Liquidity Sweep & Dòng tiền nổ đà trong 2-3s!")
+    start_time = time.time()
     
     all_tickers = get_all_bybit_crypto_symbols()
-    total_analyzed = len(all_tickers)
+    btc_regime = get_btc_regime_context()
 
-    # Chọn lọc top các coin có xung lực 24h tốt
-    sorted_candidates = sorted(all_tickers, key=lambda x: (x['price24hPcnt'] * 0.5 + (x['turnover24h']/1e7) * 0.5), reverse=True)[:50]
+    sorted_candidates = sorted(all_tickers, key=lambda x: (x['price24hPcnt'] * 0.5 + (x['turnover24h']/1e7) * 0.5), reverse=True)[:40]
 
     scanned_results = []
     with ThreadPoolExecutor(max_workers=15) as executor:
-        results = list(executor.map(analyze_single_coin_snapshot, sorted_candidates))
+        futures = [executor.submit(evaluate_coin_reversal, t, btc_regime) for t in sorted_candidates]
+        for f in futures:
+            res = f.result()
+            if res:
+                scanned_results.append(res)
 
-    xang_list = []
-    cho_list = []
-    loai_count = 0
+    scanned_results.sort(key=lambda x: x['score'], reverse=True)
+    top_candidates = scanned_results[:3]
+    elapsed = time.time() - start_time
 
-    for r in results:
-        if r:
-            if r['score'] >= 90:
-                xang_list.append(r)
-            elif r['score'] >= 75:
-                cho_list.append(r)
-            else:
-                loai_count += 1
+    if not top_candidates:
+        send_telegram_direct_message(f"📊 <b>SNAPSHOT REVERSAL:</b>\n\nThị trường chưa có coin nào thỏa điểm Reversal (Score ≥ 80). Quét xong trong {elapsed:.1f}s.")
+        return
 
-    # Bổ sung bù nếu danh sách quá ngắn
-    loai_count += (total_analyzed - len(xang_list) - len(cho_list) - loai_count)
+    msg = f"⚠️ <b>SNAPSHOT REAL-TIME — TOP {len(top_candidates)} COIN ĐẢO CHIỀU POTENTIAL</b>\n"
+    msg += f"UTC Dữ Liệu: <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d T%H:%M:%S')}</code> | Quét: <b>{elapsed:.1f}s</b>\n\n"
 
-    # Sắp xếp điểm giảm dần
-    xang_list.sort(key=lambda x: x['score'], reverse=True)
-    cho_list.sort(key=lambda x: x['score'], reverse=True)
+    for c in top_candidates:
+        sweep_str = "YES" if c['is_sweep'] else "NO"
+        msg += f"🔥 <b>#{c['symbol']}</b> ({c['side']}) — <b>{c['score']}/100</b>\n"
+        msg += f"Price: <code>{c['entry']:.4f}</code> | Sweep: <b>{sweep_str}</b>\n"
+        msg += f"Vol 5M: <code>+{c['vol_5m_ratio']:.1f}x</code> | OI 5M: <code>{c['oi_pct']:+.1f}%</code> | Taker: <code>{c['taker_buy']:.0f}%</code>\n\n"
 
-    msg = f"🟢 <b>XĂNG: {len(xang_list)}</b> | 🟡 <b>CHỜ: {len(cho_list)}</b> | ⚪️ <b>LOẠI: {max(0, loai_count)}</b>\n\n"
-
-    if xang_list:
-        msg += f"🟢 <b>CÓ TÍN HIỆU XĂNG MẠNH:</b>\n\n"
-        for c in xang_list[:3]:
-            msg += f"🟢 <b>{c['symbol']}</b> — <b>{c['score']}/100</b>\n"
-            msg += f"LONG | ĐỦ XĂNG VÀO LỆNH\n"
-            msg += f"Giá 1H <code>{c['p_change_1h']:+.2f}%</code> | Spot Vol <code>{c['spot_vol_ratio']:.2f}x</code>\n"
-            msg += f"Futures Vol <code>{c['fut_vol_ratio']:.2f}x</code> | OI30m <code>{c['oi_30m_pct']:+.2f}%</code>\n\n"
-    else:
-        msg += f"🟢 Chưa có tín hiệu đủ mạnh để vào ngay.\n\n"
-
-    if cho_list:
-        msg += f"🟡 <b>ĐANG CHỜ XÁC NHẬN</b>\n\n"
-        for c in cho_list[:6]: # Lấy Top 6 coin Chờ giống mẫu
-            msg += f"🟡 <b>{c['symbol']}</b> — <b>{c['score']}/100</b>\n"
-            msg += f"LONG | CHỜ XÁC NHẬN\n"
-            msg += f"Giá 1H <code>{c['p_change_1h']:+.2f}%</code> | Spot Vol <code>{c['spot_vol_ratio']:.2f}x</code>\n"
-            msg += f"Futures Vol <code>{c['fut_vol_ratio']:.2f}x</code> | OI30m <code>{c['oi_30m_pct']:+.2f}%</code>\n\n"
-
-    msg += "👉 <i>Nhập /scan bất kỳ lúc nào để cập nhật Snapshot mới nhất!</i>"
+    msg += "👉 <i>Nhập /scan bất kỳ lúc nào để cập nhật Top 3 Snapshot đảo chiều mới nhất!</i>"
     send_telegram_direct_message(msg)
 
 # ==============================================================================
-# 2. H1 AUTO SIGNAL ENGINE (GỬI KÈO TỰ ĐỘNG 24/7)
+# MAIN RADAR LOOP (QUÉT 5 PHÚT TỰ ĐỘNG)
 # ==============================================================================
-
-def evaluate_h1_pinbar_sweep_setup(t):
-    sym = t['symbol']
-    funding = t['fundingRate']
-
-    if funding > 0.05 or funding < -0.05: return None
-
-    now = time.time()
-    if sym in symbol_cooldowns and (now - symbol_cooldowns[sym]) < 7200:
-        return None
-
-    h1_candles = get_closed_klines(sym, "60", category="linear", limit=30)
-    if not h1_candles or len(h1_candles) < 22: return None
-
-    last_h1 = h1_candles[-1]
-    open_1h = last_h1['open']
-    close_1h = last_h1['close']
-    high_1h = last_h1['high']
-    low_1h = last_h1['low']
-
-    h1_atr = calculate_atr(h1_candles, 14)
-    ema34_h1 = calculate_ema(h1_candles, 34)
-    rsi_h1 = calculate_rsi(h1_candles, 14)
-
-    if not ema34_h1 or not rsi_h1 or h1_atr <= 0: return None
-
-    total_range = high_1h - low_1h
-    if total_range <= 0: return None
-
-    lower_wick = min(open_1h, close_1h) - low_1h
-    lower_wick_pct = (lower_wick / total_range) * 100
-
-    is_sweep = lower_wick_pct >= 35.0
-    is_reclaim = close_1h >= ema34_h1[-1] * 0.996 and rsi_h1[-1] >= 48.0
-
-    if not (is_sweep or is_reclaim): return None
-
-    vols = [c['volume'] for c in h1_candles[-21:-1]]
-    avg_vol = np.mean(vols) if vols else 1.0
-    vol_ratio = last_h1['volume'] / avg_vol if avg_vol > 0 else 1.0
-
-    if vol_ratio < 1.1: return None
-
-    sl_price = low_1h - (0.15 * h1_atr)
-    risk_pct = (close_1h - sl_price) / close_1h * 100
-
-    if risk_pct > 4.2 or risk_pct < 0.6: return None
-
-    tp1_price = close_1h + (h1_atr * 2.8)
-    tp2_price = close_1h + (h1_atr * 4.8)
-
-    tp1_pct = (tp1_price - close_1h) / close_1h * 100
-    tp2_pct = (tp2_price - close_1h) / close_1h * 100
-
-    score = 65
-    if is_sweep: score += 15
-    if vol_ratio >= 1.8: score += 10
-    if 50.0 <= rsi_h1[-1] <= 65.0: score += 10
-
-    fingerprint = f"{sym}_{last_h1['timestamp']}_H1_SWEEP_{score}"
-    if fingerprint in processed_fingerprints: return None
-
-    processed_fingerprints.add(fingerprint)
-    symbol_cooldowns[sym] = now
-
-    return {
-        'symbol': sym,
-        'score': score,
-        'entry_low': low_1h,
-        'entry_high': close_1h,
-        'entry': close_1h,
-        'sl': sl_price,
-        'risk_pct': risk_pct,
-        'tp1': tp1_price,
-        'tp2': tp2_price,
-        'tp1_pct': tp1_pct,
-        'tp2_pct': tp2_pct,
-        'rsi_h1': rsi_h1[-1],
-        'vol_ratio': vol_ratio,
-        'lower_wick_pct': lower_wick_pct,
-        'funding': funding
-    }
-
-def send_h1_telegram_signal(sig):
-    global signal_counter
-    signal_counter += 1
-    sig['id'] = signal_counter
-
-    msg = f"""🧲 <b>[LONG H1 SWEEP & PINBAR RECLAIM] #{sig['symbol']}</b>
-━━━━━━━━━━━━━━━━━━━━━━━
-⭐️ <b>Điểm Uy Tín:</b> <code>{sig['score']}/100</code>
-
-🔥 <b>DẤU HIỆU CÁ MẬP RŨ HÀNG SWEEP H1:</b>
-• Râu Dưới 1H: <code>{sig['lower_wick_pct']:.1f}%</code> (Quét Liquidity)
-• Volume H1: <code>+{sig['vol_ratio']:.1f}x</code> Median20
-• RSI H1: <code>{sig['rsi_h1']:.1f}</code> (Vừa bứt phá)
-• Funding Rate: <code>{sig['funding']:+.3f}%</code>
-
-🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG):</b>
-📍 <b>Entry Zone:</b> <code>{sig['entry_low']:.4f} – {sig['entry_high']:.4f}</code>
-🛑 <b>Stop Loss:</b> <code>{sig['sl']:.4f}</code> (-{sig['risk_pct']:.2f}%)
-🎯 <b>Take Profit 1:</b> <code>{sig['tp1']:.4f}</code> (<b>+{sig['tp1_pct']:.1f}%</b>)
-🚀 <b>Take Profit 2:</b> <code>{sig['tp2']:.4f}</code> (<b>+{sig['tp2_pct']:.1f}%</b>)
-
-👉 <b>CHECK CHART H1 & BẮT SÓNG NGAY!</b>"""
-
-    send_telegram_direct_message(msg)
-    print(f"✅ [ALERT SWEEP H1] Đã bắn tín hiệu #{sig['id']} {sig['symbol']} (Score: {sig['score']})", flush=True)
 
 def run_radar_loop():
-    print("⚡️ Bắt đầu Luồng Radar H1 Auto Signal Scanner...", flush=True)
+    print("⚡️ Bắt đầu Luồng Radar H1/5M Reversal Engine...", flush=True)
     while True:
         try:
             all_tickers = get_all_bybit_crypto_symbols()
-            print(f"🔍 [RADAR AUTO H1] Đang rà soát Pinbar Sweep cho {len(all_tickers)} altcoins...", flush=True)
-            
-            with ThreadPoolExecutor(max_workers=12) as executor:
-                results = list(executor.map(evaluate_h1_pinbar_sweep_setup, all_tickers))
+            btc_regime = get_btc_regime_context()
+            print(f"🔍 [5M REVERSAL RADAR] Đang rà soát đảo chiều cho {len(all_tickers)} altcoins...", flush=True)
 
-            for sig in results:
-                if sig and sig['score'] >= 70:
-                    send_h1_telegram_signal(sig)
+            with ThreadPoolExecutor(max_workers=15) as executor:
+                futures = [executor.submit(evaluate_coin_reversal, t, btc_regime) for t in all_tickers]
+                for f in futures:
+                    sig = f.result()
+                    if sig and sig['score'] >= MIN_ALERT_SCORE:
+                        send_telegram_alert(sig, is_confirmed=False)
 
         except Exception as e:
             print(f"Lỗi Radar Loop: {e}", flush=True)
 
-        print(f"✅ Hoàn tất 1 lượt quét H1. Nghỉ {COOLDOWN_SECONDS}s...", flush=True)
-        time.sleep(COOLDOWN_SECONDS)
-
-# ==============================================================================
-# TELEGRAM LISTENERS & MAIN EXECUTION
-# ==============================================================================
+        print(f"✅ Hoàn tất 1 lượt quét. Tạm nghỉ {SCAN_INTERVAL_SECONDS}s (5 phút)...", flush=True)
+        time.sleep(SCAN_INTERVAL_SECONDS)
 
 def process_telegram_commands():
     last_update_id = 0
@@ -406,7 +410,7 @@ def process_telegram_commands():
                     if text in ["/scan", "scan"]:
                         Thread(target=execute_manual_snapshot_scan, daemon=True).start()
                     elif text in ["/start", "/ping", "ping"]:
-                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot đang chạy 24/7. Nhập <b>/scan</b> để xem Snapshot!")
+                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot H1/5M Reversal Engine đang chạy 24/7. Nhập <b>/scan</b> để xem Snapshot!")
         except Exception as e:
             print(f"Lỗi Telegram Listener: {e}", flush=True)
         time.sleep(1)

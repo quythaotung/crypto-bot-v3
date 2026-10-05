@@ -5,12 +5,14 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION - H1 SQUEEZE EXPLOSION (TELEGRAM ALERT ENGINE)
+# CONFIGURATION - CRYPTO-ONLY H1 SQUEEZE EXPLOSION ENGINE
 # ==============================================================================
 DEBUG_MODE = True                  
 COOLDOWN_SECONDS = 15              
-MIN_FUTURES_TURNOVER_24H = 10_000_000  # Lọc coin thanh khoản 24h >= $10M USD
-MIN_ALERT_SCORE = 80               # CHỈ BẮN TELEGRAM TỪ 80 ĐIỂM TRỞ LÊN
+MIN_FUTURES_TURNOVER_24H = 10_000_000  # $10M USD 24h Crypto Turnover
+MIN_ALERT_SCORE = 80               # Chỉ bắn Telegram từ 80 điểm trở lên
+MIN_TP1_PERCENT = 3.5              # TP1 tối thiểu từ +3.5% trở lên
+MIN_CVD_PERCENT = 60.0             # Lực mua CVD tối thiểu từ 60%
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -24,7 +26,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot H1 Squeeze Explosion (Score >= 80) Active 24/7!"
+    return "Bot Crypto Pure H1 Squeeze Explosion Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -41,23 +43,41 @@ def send_telegram_direct_message(text):
 
 BASE_URL = "https://api.bybit.com"
 
-def get_all_bybit_usdt_symbols():
+def get_all_bybit_crypto_symbols():
+    """
+    Chỉ lấy các cặp Crypto USDT Perp.
+    Loại bỏ tuyệt đối:
+    - Kim loại quý/Hàng hóa: XAU, XAG, WTI, USOIL,...
+    - Cổ phiếu Mỹ: NVDA, TSLA, AAPL, AMZN, META, MSFT,...
+    - Chỉ số: QQQ, SPX, NDX, DIA, IWM, TLT,...
+    - Leveraged Tokens: 3L, 3S, 2L, 2S
+    """
     url = f"{BASE_URL}/v5/market/tickers?category=linear"
     try:
         res = requests.get(url, timeout=10).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             tickers = res["result"]["list"]
-            excluded = ['3L', '3S', '2L', '2S', 'QQQ', 'SPCX', 'SPY']
+            
+            # Danh sách đen loại trừ cổ phiếu, hàng hóa, chỉ số
+            non_crypto_keywords = [
+                'XAU', 'XAG', 'WTI', 'USOIL', 'BRENT', 'COPPER', 'SILVER', 'GOLD',
+                'QQQ', 'SPCX', 'SPY', 'DIA', 'IWM', 'TLT', 'NDX', 'SPX',
+                'NVDA', 'TSLA', 'AAPL', 'AMZN', 'META', 'MSFT', 'GOOGL', 'NFLX', 'AMD', 'INTC',
+                '3L', '3S', '2L', '2S'
+            ]
+            
             parsed_list = []
             for t in tickers:
                 sym = t['symbol']
-                if sym.endswith('USDT') and not sym.startswith(('USDC', 'BUSD')) and not any(x in sym for x in excluded):
-                    parsed_list.append({
-                        'symbol': sym,
-                        'turnover24h': float(t.get('turnover24h', 0)),
-                        'fundingRate': float(t.get('fundingRate', 0)) * 100,
-                        'lastPrice': float(t.get('lastPrice', 0))
-                    })
+                # Bắt buộc kết thúc bằng USDT và không chứa bất kỳ từ khóa non-crypto nào
+                if sym.endswith('USDT') and not sym.startswith(('USDC', 'BUSD', 'DAI')):
+                    if not any(k in sym for k in non_crypto_keywords):
+                        parsed_list.append({
+                            'symbol': sym,
+                            'turnover24h': float(t.get('turnover24h', 0)),
+                            'fundingRate': float(t.get('fundingRate', 0)) * 100,
+                            'lastPrice': float(t.get('lastPrice', 0))
+                        })
             return parsed_list
     except Exception as e:
         print(f"Lỗi lấy Tickers từ Bybit: {e}", flush=True)
@@ -126,7 +146,7 @@ def calculate_sma_volume(candles, period=20):
     return sum(vols) / period
 
 # ==============================================================================
-# EVALUATE SQUEEZE SETUP (SCORE 0 - 100)
+# EVALUATE HIGH-PROFIT & HIGH-MOMENTUM SQUEEZE SETUP
 # ==============================================================================
 def evaluate_squeeze_explosion_setup(ticker_data):
     symbol = ticker_data['symbol']
@@ -147,14 +167,24 @@ def evaluate_squeeze_explosion_setup(ticker_data):
     h1_atr = calculate_atr(h1_candles, 14)
     if h1_atr <= 0: return None
 
-    # Order flow data
+    # Order flow metrics
     spot_taker = get_taker_ratios(symbol, category="spot", limit=5)
-    perp_taker = get_taker_ratios(symbol, category="linear", limit=5)
+    cvd_buy_pct = spot_taker[0] if spot_taker else 50.0
+
+    # 1. BỘ LỌC CỨNG CVD: Taker buy >= 60%
+    if cvd_buy_pct < MIN_CVD_PERCENT: return None
+
     oi_h1_pct = get_open_interest_pct(symbol, "1h")
+
+    # 2. BỘ LỌC CỨNG OI: Tiền bơm OI phải dương (>= +1.5%)
+    if oi_h1_pct < 1.5: return None
 
     # Volume ratio
     avg_vol_20 = calculate_sma_volume(h1_candles[:-1], 20)
     vvol_ratio = last_h1['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
+
+    # 3. BỘ LỌC CỨNG VOLUME: Volume H1 phải >= 1.5x SMA20
+    if vvol_ratio < 1.5: return None
 
     # Base high / low
     recent_lows = [c['low'] for c in h1_candles[-12:-1]]
@@ -170,48 +200,48 @@ def evaluate_squeeze_explosion_setup(ticker_data):
 
     if not (is_breakout or is_holding): return None
 
-    # SL & TP Calculations
+    # SL & TP Calculations (Thiết lập TP Cao & Chuẩn Cấu Trúc)
     sl_price = base_low - (0.15 * h1_atr)
     risk_pct = (curr_price - sl_price) / curr_price * 100
 
-    if risk_pct > 3.2: return None
+    if risk_pct > 3.5: return None
 
-    tp1_price = curr_price + (h1_atr * 2.5)
-    tp2_price = curr_price + (h1_atr * 4.2)
+    # Tính TP dựa trên ATR nâng cao để đảm bảo "Đủ Xăng" cán mốc
+    tp1_price = max(curr_price + (h1_atr * 3.2), curr_price * (1 + MIN_TP1_PERCENT / 100))
+    tp2_price = tp1_price + (h1_atr * 4.5)
+
+    tp1_pct = (tp1_price - curr_price) / curr_price * 100
+    tp2_pct = (tp2_price - curr_price) / curr_price * 100
+
+    # BỘ LỌC CỨNG: Reject thẳng các coin có TP1 < MIN_TP1_PERCENT (+3.5%)
+    if tp1_pct < MIN_TP1_PERCENT: return None
 
     # --------------------------------------------------------------------------
-    # HỆ THỐNG CHẤM ĐIỂM UY TÍN (0 - 100)
+    # CHẤM ĐIỂM UY TÍN (0 - 100)
     # --------------------------------------------------------------------------
-    score = 50
+    score = 40
 
-    # 1. Volume Expansion (+20đ)
     if vvol_ratio >= 2.5: score += 20
     elif vvol_ratio >= 2.0: score += 16
     elif vvol_ratio >= 1.5: score += 12
 
-    # 2. Open Interest (+15đ)
-    if oi_h1_pct >= 5.0: score += 15
-    elif oi_h1_pct >= 2.5: score += 10
-    elif oi_h1_pct >= 1.0: score += 5
+    if oi_h1_pct >= 5.0: score += 20
+    elif oi_h1_pct >= 2.5: score += 15
+    elif oi_h1_pct >= 1.5: score += 10
 
-    # 3. CVD Buy Ratio (+15đ)
-    if spot_taker[0] >= 80.0: score += 15
-    elif spot_taker[0] >= 65.0: score += 12
-    elif spot_taker[0] >= 55.0: score += 8
+    if cvd_buy_pct >= 80.0: score += 20
+    elif cvd_buy_pct >= 70.0: score += 16
+    elif cvd_buy_pct >= 60.0: score += 12
 
-    # 4. Breakout State (+10đ)
     if is_breakout: score += 10
 
-    # --------------------------------------------------------------------------
-    # CHỈ GIỮ LẠI LỆNH CÓ SCORE >= 80 ĐỂ BẮN TELEGRAM
-    # --------------------------------------------------------------------------
     if score < MIN_ALERT_SCORE:
         return None
 
     entry_zone_low = base_high if is_breakout else base_low
     entry_zone_high = curr_price
 
-    fingerprint = f"{symbol}_{last_h1['timestamp']}_SQUEEZE_{score}"
+    fingerprint = f"{symbol}_{last_h1['timestamp']}_CRYPTO_SQUEEZE_{score}"
     if fingerprint in processed_fingerprints: return None
 
     processed_fingerprints.add(fingerprint)
@@ -222,7 +252,7 @@ def evaluate_squeeze_explosion_setup(ticker_data):
         'score': score,
         'vvol_ratio': vvol_ratio,
         'oi_pct': oi_h1_pct,
-        'cvd_buy': spot_taker[0],
+        'cvd_buy': cvd_buy_pct,
         'status_text': "Breakout Nền Tích Lũy" if is_breakout else "Test Nền Tích Lũy Holding",
         'entry_low': entry_zone_low,
         'entry_high': entry_zone_high,
@@ -230,12 +260,12 @@ def evaluate_squeeze_explosion_setup(ticker_data):
         'sl': sl_price,
         'tp1': tp1_price,
         'tp2': tp2_price,
-        'tp1_pct': (tp1_price - curr_price) / curr_price * 100,
-        'tp2_pct': (tp2_price - curr_price) / curr_price * 100
+        'tp1_pct': tp1_pct,
+        'tp2_pct': tp2_pct
     }
 
 # ==============================================================================
-# TELEGRAM ALERT FORMATTER (ĐÚNG MẪU BẠN YÊU CẦU 100%)
+# TELEGRAM ALERT FORMATTER
 # ==============================================================================
 def send_telegram_signal(sig):
     global signal_counter
@@ -270,18 +300,18 @@ def send_telegram_signal(sig):
 👉 <b>CHECK CHART H1 & BẮT SÓNG NGAY!</b>"""
 
     send_telegram_direct_message(msg)
-    print(f"✅ [ALERT TELEGRAM] Đã bắn tín hiệu #{sig['id']} {sig['symbol']} (Score: {sig['score']})", flush=True)
+    print(f"✅ [ALERT TELEGRAM CRYPTO] Đã bắn tín hiệu #{sig['id']} {sig['symbol']} (Score: {sig['score']})", flush=True)
 
 # ==============================================================================
 # MAIN RADAR LOOP
 # ==============================================================================
 def run_radar_loop():
-    print(f"⚡️ Bắt đầu Radar Squeeze Explosion (Chỉ báo Score >= {MIN_ALERT_SCORE})...", flush=True)
+    print(f"⚡️ Bắt đầu Radar Crypto Squeeze Explosion (TP1 >= {MIN_TP1_PERCENT}% & CVD >= {MIN_CVD_PERCENT}%)...", flush=True)
     while True:
         try:
-            all_tickers = get_all_bybit_usdt_symbols()
-            print(f"🔍 [SCANNER] Đang rà soát {len(all_tickers)} coins (Lọc Score >= 80)...", flush=True)
-            for ticker in all_tickers:
+            all_crypto_tickers = get_all_bybit_crypto_symbols()
+            print(f"🔍 [CRYPTO SCANNER] Đang rà soát {len(all_crypto_tickers)} coin Crypto (Lọc bỏ triệt để Cổ phiếu/Vàng)...", flush=True)
+            for ticker in all_crypto_tickers:
                 try:
                     sig = evaluate_squeeze_explosion_setup(ticker)
                     if sig:

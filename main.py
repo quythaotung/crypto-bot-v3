@@ -2,11 +2,12 @@ import time
 import requests
 import os
 import numpy as np
+from datetime import datetime, timezone
 from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION - H1 STRATEGY + 5M SCANNER RADAR
+# CONFIGURATION
 # ==============================================================================
 DEBUG_MODE = True                  
 COOLDOWN_SECONDS = 15              
@@ -15,8 +16,6 @@ MIN_FUTURES_TURNOVER_24H = 10_000_000  # $10M USD Minimum Turnover
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-signals_history = []
-active_signals = []                
 processed_fingerprints = set()
 symbol_cooldowns = {}              
 signal_counter = 0
@@ -25,21 +24,11 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot H1 Trend-Flow + 5M Manual Scanner Active 24/7!"
+    return "Bot H1 Strategy + Top 3 Snapshot Scanner Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
-
-def get_current_price(symbol):
-    try:
-        url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
-        res = requests.get(url, timeout=5).json()
-        if res.get("retCode") == 0 and res.get("result", {}).get("list"):
-            return float(res["result"]["list"][0]["lastPrice"])
-    except Exception:
-        pass
-    return None
 
 def send_telegram_direct_message(text):
     if not BOT_TOKEN or not CHAT_ID: return
@@ -53,11 +42,10 @@ def send_telegram_direct_message(text):
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 1. API HELPERS (PURE CRYPTO ONLY)
+# API HELPERS
 # ==============================================================================
 
 def get_all_bybit_crypto_symbols():
-    """Lọc chỉ các mã Crypto USDT Perp trên Bybit (Loại bỏ Cổ phiếu, Vàng, Chỉ số, Token đòn bẩy)"""
     url = f"{BASE_URL}/v5/market/tickers?category=linear"
     try:
         res = requests.get(url, timeout=10).json()
@@ -108,17 +96,7 @@ def get_closed_klines(symbol, interval, category="linear", limit=60):
         pass
     return []
 
-def get_taker_ratios(symbol, category="linear", interval_str="1h", limit=5):
-    url = f"{BASE_URL}/v5/market/account-ratio?category={category}&symbol={symbol}&period={interval_str}&limit={limit}"
-    try:
-        res = requests.get(url, timeout=8).json()
-        if res.get("retCode") == 0 and res.get("result", {}).get("list"):
-            return [float(x.get("buyRatio", 0.5)) * 100 for x in res["result"]["list"]]
-    except Exception:
-        pass
-    return [50.0] * limit
-
-def get_open_interest_pct(symbol, interval_str="1h"):
+def get_open_interest_pct(symbol, interval_str="30m"):
     url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval_str}&limit=3"
     try:
         res = requests.get(url, timeout=8).json()
@@ -142,26 +120,6 @@ def calculate_ema(candles, period):
         ema_values.append(new_ema)
     return ema_values
 
-def calculate_rsi(candles, period=14):
-    if len(candles) < period + 1: return []
-    closes = [c['close'] for c in candles]
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i-1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-    
-    rsi_values = []
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    rsi_values.append(100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
-        
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rsi_values.append(100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
-    return rsi_values
-
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1: return 0.0
     tr_list = []
@@ -173,19 +131,8 @@ def calculate_atr(candles, period=14):
     return sum(tr_list[-period:]) / period if tr_list else 0.0
 
 # ==============================================================================
-# 2. H1 STRATEGY ENGINE (CHỦ ĐỘNG QUÉT TỰ ĐỘNG NHƯ CŨ)
+# H1 STRATEGY AUTOMATIC EVALUATOR
 # ==============================================================================
-
-def check_h4_hard_gate(h4_candles):
-    if len(h4_candles) < 50: return False
-    ema34_h4 = calculate_ema(h4_candles, 34)
-    ema89_h4 = calculate_ema(h4_candles, 89)
-    if not ema34_h4 or not ema89_h4: return False
-
-    curr_close = h4_candles[-1]['close']
-    if not (curr_close > ema34_h4[-1] and ema34_h4[-1] >= ema89_h4[-1]):
-        return False
-    return True
 
 def evaluate_h1_trend_strategy(ticker_data):
     symbol = ticker_data['symbol']
@@ -204,19 +151,20 @@ def evaluate_h1_trend_strategy(ticker_data):
     if not h4_candles or not h1_candles or len(h1_candles) < 40:
         return None
 
-    if not check_h4_hard_gate(h4_candles): return None
+    ema34_h4 = calculate_ema(h4_candles, 34)
+    ema89_h4 = calculate_ema(h4_candles, 89)
+    if not ema34_h4 or not ema89_h4: return None
+    if not (h4_candles[-1]['close'] > ema34_h4[-1] and ema34_h4[-1] >= ema89_h4[-1]):
+        return None
 
     last_h1 = h1_candles[-1]
     curr_price = last_h1['close']
     h1_atr = calculate_atr(h1_candles, 14)
     ema34_h1 = calculate_ema(h1_candles, 34)
-    rsi_h1 = calculate_rsi(h1_candles, 14)
 
-    if not ema34_h1 or not rsi_h1 or h1_atr <= 0: return None
+    if not ema34_h1 or h1_atr <= 0: return None
 
-    # Điều kiện H1 Reclaim / Trend Support
-    is_h1_reclaim = (curr_price >= ema34_h1[-1] * 0.998) and (rsi_h1[-1] >= 50.0)
-    if not is_h1_reclaim: return None
+    if curr_price < ema34_h1[-1] * 0.998: return None
 
     recent_lows = [c['low'] for c in h1_candles[-6:]]
     support_low = min(recent_lows)
@@ -245,122 +193,105 @@ def evaluate_h1_trend_strategy(ticker_data):
         'tp2': tp2_price,
         'tp1_pct': (tp1_price - curr_price) / curr_price * 100,
         'tp2_pct': (tp2_price - curr_price) / curr_price * 100,
-        'rsi_h1': rsi_h1[-1],
         'funding': funding
     }
 
 # ==============================================================================
-# 3. MANUAL /scan RADAR (CHỈ QUÉT COIN ĐỂ BẠN TỰ CHECK CHART)
+# MANUAL /scan SNAPSHOT PROCESSOR (ĐỦ CHUẨN ĐỊNH DẠNG SNAPSHOT TOP 3)
 # ==============================================================================
 
-def execute_manual_5m_scan():
-    send_telegram_direct_message("🔍 <b>ĐANG SCAN 5M REAL-TIME TOÀN BỘ ALTCOIN...</b>\n⏳ Vui lòng chờ 10-15 giây để lọc coin biến động mạnh & dòng tiền dồn!")
+def execute_manual_snapshot_scan():
+    send_telegram_direct_message("🔍 <b>ĐANG TẠO SNAPSHOT SCAN REAL-TIME...</b>\n⏳ Vui lòng chờ 10-15 giây để tổng hợp dữ liệu Top 3 coin tiềm năng nhất!")
     
     all_tickers = get_all_bybit_crypto_symbols()
-    
-    # 1. Tính Relative Strength (RS)
-    ticker_5m_changes = {}
-    for t in all_tickers[:120]:
-        klines = get_closed_klines(t['symbol'], "5", limit=3)
-        if klines and len(klines) >= 2:
-            pct = (klines[-1]['close'] - klines[-1]['open']) / klines[-1]['open'] * 100
-            ticker_5m_changes[t['symbol']] = pct
+    total_analyzed = len(all_tickers)
+    utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d T%H:%M:%S")
 
-    if not ticker_5m_changes:
-        send_telegram_direct_message("⚠️ Không thể lấy dữ liệu 5M. Vui lòng thử lại sau!")
-        return
-
-    sorted_symbols = sorted(ticker_5m_changes.items(), key=lambda x: x[1], reverse=True)
-    total_count = len(sorted_symbols)
-    rs_map = {sym: ((idx + 1) / total_count) * 100 for idx, (sym, val) in enumerate(sorted_symbols)}
-
-    matched_candidates = []
+    scanned_results = []
+    xang_count = 0
+    cho_count = 0
 
     for t in all_tickers:
         try:
             sym = t['symbol']
-            m5_klines = get_closed_klines(sym, "5", limit=25)
-            if not m5_klines or len(m5_klines) < 21: continue
+            h1_fut = get_closed_klines(sym, "60", category="linear", limit=25)
+            h1_spot = get_closed_klines(sym, "60", category="spot", limit=25)
 
-            last_5m = m5_klines[-1]
-            close_5m = last_5m['close']
-            open_5m = last_5m['open']
-            high_5m = last_5m['high']
-            low_5m = last_5m['low']
+            if not h1_fut or len(h1_fut) < 21: continue
 
-            change_5m = (close_5m - open_5m) / open_5m * 100
-            
-            # Volume 5M / SMA20
-            vols_20 = [c['volume'] for c in m5_klines[-21:-1]]
-            avg_vol_20 = np.mean(vols_20) if vols_20 else 1.0
-            vol_expansion = last_5m['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
+            last_fut = h1_fut[-1]
+            p_change_1h = (last_fut['close'] - last_fut['open']) / last_fut['open'] * 100
 
-            if vol_expansion < 1.8 and change_5m < 1.0: continue
+            # Futures Volume Ratio
+            fut_vols_20 = [c['volume'] for c in h1_fut[-21:-1]]
+            avg_fut_vol = np.mean(fut_vols_20) if fut_vols_20 else 1.0
+            fut_vol_ratio = last_fut['volume'] / avg_fut_vol if avg_fut_vol > 0 else 1.0
 
-            taker_ratios = get_taker_ratios(sym, category="spot", interval_str="5m", limit=3)
-            taker_buy_pct = taker_ratios[0] if taker_ratios else 50.0
+            # Spot Volume Ratio
+            spot_vol_ratio = 1.0
+            if h1_spot and len(h1_spot) >= 21:
+                spot_vols_20 = [c['volume'] for c in h1_spot[-21:-1]]
+                avg_spot_vol = np.mean(spot_vols_20) if spot_vols_20 else 1.0
+                spot_vol_ratio = h1_spot[-1]['volume'] / avg_spot_vol if avg_spot_vol > 0 else 1.0
 
-            if taker_buy_pct < 58.0: continue
+            # OI 30m Change
+            oi_30m_pct = get_open_interest_pct(sym, interval_str="30m")
 
-            oi_change_5m = get_open_interest_pct(sym, interval_str="5m")
-            rs_rank_pct = rs_map.get(sym, 50.0)
-
-            # Rút chân (Sweep)
-            total_range = high_5m - low_5m
-            lower_wick = (min(open_5m, close_5m) - low_5m)
-            is_sweep = (lower_wick / total_range * 100 >= 38.0) if total_range > 0 else False
-
-            # Tính Flow Score
+            # Chấm điểm Score 0 - 100
             score = 40
-            if vol_expansion >= 3.0: score += 20
-            elif vol_expansion >= 2.0: score += 12
+            if spot_vol_ratio >= 3.0: score += 20
+            elif spot_vol_ratio >= 1.5: score += 10
 
-            if oi_change_5m >= 2.0: score += 15
-            elif oi_change_5m >= 0.8: score += 10
+            if fut_vol_ratio >= 2.5: score += 20
+            elif fut_vol_ratio >= 1.5: score += 10
 
-            if taker_buy_pct >= 70.0: score += 15
-            elif taker_buy_pct >= 60.0: score += 8
+            if oi_30m_pct >= 2.0: score += 15
+            elif oi_30m_pct >= 0.5: score += 8
 
-            if rs_rank_pct <= 10.0: score += 10
+            if p_change_1h >= 0.3: score += 5
+
+            if score >= 80:
+                xang_count += 1
+            elif score >= 65:
+                cho_count += 1
 
             if score >= 70:
-                matched_candidates.append({
+                scanned_results.append({
                     'symbol': sym,
                     'score': score,
-                    'change_5m': change_5m,
-                    'vol_expansion': vol_expansion,
-                    'oi_change_5m': oi_change_5m,
-                    'taker_buy_pct': taker_buy_pct,
-                    'rs_rank_pct': rs_rank_pct,
-                    'is_sweep': is_sweep,
-                    'price': close_5m
+                    'p_change_1h': p_change_1h,
+                    'spot_vol_ratio': spot_vol_ratio,
+                    'fut_vol_ratio': fut_vol_ratio,
+                    'oi_30m_pct': oi_30m_pct
                 })
 
         except Exception:
             pass
         time.sleep(0.02)
 
-    if not matched_candidates:
-        send_telegram_direct_message("📊 <b>KẾT QUẢ /SCAN 5M:</b>\n\nThị trường tĩnh. Chưa thấy Altcoin nào có dòng tiền nổ đà bất thường trong 5M.")
+    loai_count = max(0, total_analyzed - xang_count - cho_count)
+
+    if not scanned_results:
+        send_telegram_direct_message("⚠️ SNAPSHOT REAL-TIME — KHÔNG CÓ CƠ HỘI\n\nThị trường đi ngang tĩnh. Chưa có coin nào đủ tiêu chí tích lũy bùng nổ.")
         return
 
-    matched_candidates.sort(key=lambda x: x['score'], reverse=True)
-    top_list = matched_candidates[:5]
+    # Sắp xếp và lấy chính xác TOP 3
+    scanned_results.sort(key=lambda x: x['score'], reverse=True)
+    top_3 = scanned_results[:3]
 
-    msg = f"🚀 <b>KẾT QUẢ SCAN 5M REAL-TIME — TOP {len(top_list)} COIN BÙNG NỔ</b>\n"
-    msg += "👉 <i>Danh sách coin có dòng tiền dồn mạnh để bạn TỰ CHECK CHART:</i>\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    msg = f"⚠️ <b>SNAPSHOT REAL-TIME — TOP {len(top_3)} COIN TIỀM NĂNG</b>\n"
+    msg += f"UTC dữ liệu: <code>{utc_now}</code>\n"
+    msg += f"Đã phân tích <b>{total_analyzed}</b> hợp đồng USDT.\n\n"
+    msg += f"🟢 XĂNG: {xang_count} | 🟡 CHỜ: {cho_count} | ⚪️ LOẠI: {loai_count}\n\n"
+    msg += f"🟡 <b>ĐANG CHỜ XÁC NHẬN (TOP 3)</b>\n\n"
 
-    for c in top_list:
-        sweep_str = "YES" if c['is_sweep'] else "NO"
-        msg += f"🔥 <b>#{c['symbol']}</b> (Score: <code>{c['score']}/100</code>)\n"
-        msg += f"• ⚡️ 5M: <code>{c['change_5m']:+.2f}%</code> | Price: <code>{c['price']:.4f}</code>\n"
-        msg += f"• 📊 VOL 5M: <code>+{c['vol_expansion']:.1f}x</code> | OI 5M: <code>{c['oi_change_5m']:+.1f}%</code>\n"
-        msg += f"• 🟢 TAKER BUY: <code>{c['taker_buy_pct']:.0f}%</code> | RS: <code>TOP {c['rs_rank_pct']:.1f}%</code>\n"
-        msg += f"• 🧲 SWEEP: <code>{sweep_str}</code>\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
+    for c in top_3:
+        msg += f"🟡 <b>{c['symbol']}</b> — <b>{c['score']}/100</b>\n"
+        msg += f"LONG | CHỜ XÁC NHẬN\n"
+        msg += f"Giá 1H <code>{c['p_change_1h']:+.2f}%</code> | Spot Vol <code>{c['spot_vol_ratio']:.2f}x</code>\n"
+        msg += f"Futures Vol <code>{c['fut_vol_ratio']:.2f}x</code> | OI30m <code>{c['oi_30m_pct']:+.2f}%</code>\n\n"
 
-    msg += "👀 <b>CHECK CHART H1 NGAY ĐỂ TÌM GIÁ VÀO ĐẸP!</b>"
+    msg += "👉 <i>Nhập /scan bất kỳ lúc nào để cập nhật Top 3 snapshot mới nhất!</i>"
     send_telegram_direct_message(msg)
 
 def process_telegram_commands():
@@ -377,22 +308,21 @@ def process_telegram_commands():
                     text = message.get("text", "").strip().lower()
                     
                     if text in ["/scan", "scan"]:
-                        Thread(target=execute_manual_5m_scan, daemon=True).start()
+                        Thread(target=execute_manual_snapshot_scan, daemon=True).start()
                     elif text in ["/start", "/ping", "ping"]:
-                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot H1 Strategy + 5M Manual Scanner đang chạy 24/7. Nhập <b>/scan</b> để lọc coin tự check!")
+                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot H1 Strategy + Top 3 Snapshot Scanner đang hoạt động. Nhập <b>/scan</b> để xem Top 3!")
         except Exception as e:
             print(f"Lỗi Telegram Listener: {e}", flush=True)
         time.sleep(2)
 
 # ==============================================================================
-# TELEGRAM ALERT FORMATTER (BẮN TÍN HIỆU TỰ ĐỘNG CỦA STRATEGY H1)
+# TELEGRAM ALERT FORMATTER (BẮN TÍN HIỆU LONG TỰ ĐỘNG CỦA BOT)
 # ==============================================================================
 
 def send_h1_telegram_signal(sig):
     global signal_counter
     signal_counter += 1
     sig['id'] = signal_counter
-    signals_history.append(sig)
 
     msg = f"""🟢 <b>[H1 TREND RECLAIM LONG] #{sig['symbol']}</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
@@ -406,17 +336,13 @@ def send_h1_telegram_signal(sig):
 🎯 <b>Take Profit 1:</b> <code>{sig['tp1']:.4f}</code> (+{sig['tp1_pct']:.1f}%)
 🚀 <b>Take Profit 2:</b> <code>{sig['tp2']:.4f}</code> (+{sig['tp2_pct']:.1f}%)
 
-📊 <b>Metrics:</b>
-• RSI H1: <code>{sig['rsi_h1']:.1f}</code>
-• Funding: <code>{sig['funding']:+.3f}%</code>
-
-⚠️ <i>Dữ liệu thử nghiệm PAPER. Kiểm tra Chart H1 trước khi giao dịch.</i>"""
+📊 <b>Funding:</b> <code>{sig['funding']:+.3f}%</code>
+⚠️️ <i>Kế hoạch tự động. Kiểm tra chart H1 trước khi vào lệnh.</i>"""
 
     send_telegram_direct_message(msg)
-    print(f"✅ [ALERT AUTOMATIC H1] Đã bắn tín hiệu #{sig['id']} {sig['symbol']}", flush=True)
 
 # ==============================================================================
-# MAIN RADAR LOOP (RÀ SOÁT TỰ ĐỘNG STRATEGY H1)
+# MAIN RADAR LOOP (RÀ SOÁT AUTOMATIC CÁC LỆNH H1)
 # ==============================================================================
 
 def run_radar_loop():
@@ -424,8 +350,6 @@ def run_radar_loop():
     while True:
         try:
             all_tickers = get_all_bybit_crypto_symbols()
-            print(f"🔍 [H1 SCANNER] Đang rà soát Strategy H1 cho {len(all_tickers)} altcoins...", flush=True)
-            
             for ticker in all_tickers:
                 try:
                     sig = evaluate_h1_trend_strategy(ticker)
@@ -434,11 +358,9 @@ def run_radar_loop():
                 except Exception:
                     pass
                 time.sleep(0.04)
-
         except Exception as e:
             print(f"Lỗi Radar Loop: {e}", flush=True)
 
-        print(f"✅ Hoàn tất 1 lượt quét H1. Tạm nghỉ {COOLDOWN_SECONDS}s...", flush=True)
         time.sleep(COOLDOWN_SECONDS)
 
 if __name__ == "__main__":

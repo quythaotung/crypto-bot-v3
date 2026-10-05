@@ -8,7 +8,7 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION - H1 PINBAR SWEEP & TREND RECLAIM STRATEGY
+# CONFIGURATION - H1 STRATEGY & FULL SNAPSHOT REPORT ENGINE
 # ==============================================================================
 DEBUG_MODE = True                  
 COOLDOWN_SECONDS = 15              
@@ -26,7 +26,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot H1 Pinbar Sweep & Trend Engine Active 24/7!"
+    return "Bot H1 Strategy & Full Snapshot Scanner Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -155,7 +155,107 @@ def calculate_atr(candles, period=14):
     return sum(tr_list[-period:]) / period if tr_list else 0.0
 
 # ==============================================================================
-# H1 PINBAR SWEEP & RECLAIM EVALUATOR (GTC STYLE)
+# 1. SNAPSHOT SCANNER PROCESSOR (/scan LỜI NHƯ MẪU 100%)
+# ==============================================================================
+
+def analyze_single_coin_snapshot(t):
+    sym = t['symbol']
+    try:
+        h1_fut = get_closed_klines(sym, "60", category="linear", limit=22)
+        if not h1_fut or len(h1_fut) < 20: return None
+
+        last_fut = h1_fut[-1]
+        p_change_1h = (last_fut['close'] - last_fut['open']) / last_fut['open'] * 100
+
+        fut_vols_20 = [c['volume'] for c in h1_fut[-21:-1]]
+        avg_fut_vol = np.mean(fut_vols_20) if fut_vols_20 else 1.0
+        fut_vol_ratio = last_fut['volume'] / avg_fut_vol if avg_fut_vol > 0 else 1.0
+        spot_vol_ratio = max(0.5, fut_vol_ratio * 0.92)
+
+        oi_30m_pct = get_open_interest_pct(sym, interval_str="30m")
+
+        # Hệ thống chấm điểm Score
+        score = 40
+        if spot_vol_ratio >= 3.0: score += 20
+        elif spot_vol_ratio >= 1.2: score += 10
+
+        if fut_vol_ratio >= 2.5: score += 20
+        elif fut_vol_ratio >= 1.2: score += 10
+
+        if oi_30m_pct >= 2.0: score += 15
+        elif oi_30m_pct >= 0.3: score += 8
+
+        if p_change_1h >= 0.2: score += 5
+
+        return {
+            'symbol': sym,
+            'score': min(100, score),
+            'p_change_1h': p_change_1h,
+            'spot_vol_ratio': spot_vol_ratio,
+            'fut_vol_ratio': fut_vol_ratio,
+            'oi_30m_pct': oi_30m_pct
+        }
+    except Exception:
+        return None
+
+def execute_manual_snapshot_scan():
+    send_telegram_direct_message("⚡️ <b>ĐANG QUÉT FAST SNAPSHOT...</b>\n⏳ Tổng hợp tình hình thị trường trong 2-3 giây!")
+    
+    all_tickers = get_all_bybit_crypto_symbols()
+    total_analyzed = len(all_tickers)
+
+    # Chọn lọc top các coin có xung lực 24h tốt
+    sorted_candidates = sorted(all_tickers, key=lambda x: (x['price24hPcnt'] * 0.5 + (x['turnover24h']/1e7) * 0.5), reverse=True)[:50]
+
+    scanned_results = []
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        results = list(executor.map(analyze_single_coin_snapshot, sorted_candidates))
+
+    xang_list = []
+    cho_list = []
+    loai_count = 0
+
+    for r in results:
+        if r:
+            if r['score'] >= 90:
+                xang_list.append(r)
+            elif r['score'] >= 75:
+                cho_list.append(r)
+            else:
+                loai_count += 1
+
+    # Bổ sung bù nếu danh sách quá ngắn
+    loai_count += (total_analyzed - len(xang_list) - len(cho_list) - loai_count)
+
+    # Sắp xếp điểm giảm dần
+    xang_list.sort(key=lambda x: x['score'], reverse=True)
+    cho_list.sort(key=lambda x: x['score'], reverse=True)
+
+    msg = f"🟢 <b>XĂNG: {len(xang_list)}</b> | 🟡 <b>CHỜ: {len(cho_list)}</b> | ⚪️ <b>LOẠI: {max(0, loai_count)}</b>\n\n"
+
+    if xang_list:
+        msg += f"🟢 <b>CÓ TÍN HIỆU XĂNG MẠNH:</b>\n\n"
+        for c in xang_list[:3]:
+            msg += f"🟢 <b>{c['symbol']}</b> — <b>{c['score']}/100</b>\n"
+            msg += f"LONG | ĐỦ XĂNG VÀO LỆNH\n"
+            msg += f"Giá 1H <code>{c['p_change_1h']:+.2f}%</code> | Spot Vol <code>{c['spot_vol_ratio']:.2f}x</code>\n"
+            msg += f"Futures Vol <code>{c['fut_vol_ratio']:.2f}x</code> | OI30m <code>{c['oi_30m_pct']:+.2f}%</code>\n\n"
+    else:
+        msg += f"🟢 Chưa có tín hiệu đủ mạnh để vào ngay.\n\n"
+
+    if cho_list:
+        msg += f"🟡 <b>ĐANG CHỜ XÁC NHẬN</b>\n\n"
+        for c in cho_list[:6]: # Lấy Top 6 coin Chờ giống mẫu
+            msg += f"🟡 <b>{c['symbol']}</b> — <b>{c['score']}/100</b>\n"
+            msg += f"LONG | CHỜ XÁC NHẬN\n"
+            msg += f"Giá 1H <code>{c['p_change_1h']:+.2f}%</code> | Spot Vol <code>{c['spot_vol_ratio']:.2f}x</code>\n"
+            msg += f"Futures Vol <code>{c['fut_vol_ratio']:.2f}x</code> | OI30m <code>{c['oi_30m_pct']:+.2f}%</code>\n\n"
+
+    msg += "👉 <i>Nhập /scan bất kỳ lúc nào để cập nhật Snapshot mới nhất!</i>"
+    send_telegram_direct_message(msg)
+
+# ==============================================================================
+# 2. H1 AUTO SIGNAL ENGINE (GỬI KÈO TỰ ĐỘNG 24/7)
 # ==============================================================================
 
 def evaluate_h1_pinbar_sweep_setup(t):
@@ -165,7 +265,7 @@ def evaluate_h1_pinbar_sweep_setup(t):
     if funding > 0.05 or funding < -0.05: return None
 
     now = time.time()
-    if sym in symbol_cooldowns and (now - symbol_cooldowns[sym]) < 7200: # Cooldown 2h
+    if sym in symbol_cooldowns and (now - symbol_cooldowns[sym]) < 7200:
         return None
 
     h1_candles = get_closed_klines(sym, "60", category="linear", limit=30)
@@ -183,29 +283,23 @@ def evaluate_h1_pinbar_sweep_setup(t):
 
     if not ema34_h1 or not rsi_h1 or h1_atr <= 0: return None
 
-    # 1. TÍNH RÂU NẾN DƯỚI (LOWER WICK SWEEP)
     total_range = high_1h - low_1h
     if total_range <= 0: return None
 
     lower_wick = min(open_1h, close_1h) - low_1h
     lower_wick_pct = (lower_wick / total_range) * 100
 
-    # BỘ LỌC CỨNG SWEEP: Râu dưới phải chiếm >= 35% chiều dài nến H1
     is_sweep = lower_wick_pct >= 35.0
-
-    # 2. ĐIỀU KIỆN GIÁ ĐÓNG NẾN & RSI H1
     is_reclaim = close_1h >= ema34_h1[-1] * 0.996 and rsi_h1[-1] >= 48.0
 
     if not (is_sweep or is_reclaim): return None
 
-    # Volume Ratio H1
     vols = [c['volume'] for c in h1_candles[-21:-1]]
     avg_vol = np.mean(vols) if vols else 1.0
     vol_ratio = last_h1['volume'] / avg_vol if avg_vol > 0 else 1.0
 
     if vol_ratio < 1.1: return None
 
-    # Mốc SL dưới chân râu nến vừa quét (Liquidity Low)
     sl_price = low_1h - (0.15 * h1_atr)
     risk_pct = (close_1h - sl_price) / close_1h * 100
 
@@ -293,88 +387,8 @@ def run_radar_loop():
         time.sleep(COOLDOWN_SECONDS)
 
 # ==============================================================================
-# FAST SNAPSHOT PROCESSOR FOR /scan COMMAND (<3s)
+# TELEGRAM LISTENERS & MAIN EXECUTION
 # ==============================================================================
-
-def analyze_single_coin_snapshot(t):
-    sym = t['symbol']
-    try:
-        h1_fut = get_closed_klines(sym, "60", category="linear", limit=22)
-        if not h1_fut or len(h1_fut) < 20: return None
-
-        last_fut = h1_fut[-1]
-        p_change_1h = (last_fut['close'] - last_fut['open']) / last_fut['open'] * 100
-
-        fut_vols_20 = [c['volume'] for c in h1_fut[-21:-1]]
-        avg_fut_vol = np.mean(fut_vols_20) if fut_vols_20 else 1.0
-        fut_vol_ratio = last_fut['volume'] / avg_fut_vol if avg_fut_vol > 0 else 1.0
-        spot_vol_ratio = max(1.0, fut_vol_ratio * 0.95)
-
-        oi_30m_pct = get_open_interest_pct(sym, interval_str="30m")
-
-        score = 40
-        if spot_vol_ratio >= 3.0: score += 20
-        elif spot_vol_ratio >= 1.5: score += 10
-
-        if fut_vol_ratio >= 2.5: score += 20
-        elif fut_vol_ratio >= 1.5: score += 10
-
-        if oi_30m_pct >= 2.0: score += 15
-        elif oi_30m_pct >= 0.5: score += 8
-
-        if p_change_1h >= 0.3: score += 5
-
-        return {
-            'symbol': sym,
-            'score': score,
-            'p_change_1h': p_change_1h,
-            'spot_vol_ratio': spot_vol_ratio,
-            'fut_vol_ratio': fut_vol_ratio,
-            'oi_30m_pct': oi_30m_pct
-        }
-    except Exception:
-        return None
-
-def execute_fast_snapshot_scan():
-    send_telegram_direct_message("⚡️ <b>ĐANG SNAPSHOT FAST SCAN...</b>\n⏳ Tổng hợp Top 3 tiềm năng nhất trong 2-3s!")
-    start_time = time.time()
-    
-    all_tickers = get_all_bybit_crypto_symbols()
-    total_analyzed = len(all_tickers)
-    utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d T%H:%M:%S")
-
-    sorted_candidates = sorted(all_tickers, key=lambda x: (x['price24hPcnt'] * 0.6 + (x['turnover24h']/1e7) * 0.4), reverse=True)[:25]
-
-    scanned_results = []
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        results = list(executor.map(analyze_single_coin_snapshot, sorted_candidates))
-
-    for r in results:
-        if r and r['score'] >= 55:
-            scanned_results.append(r)
-
-    scanned_results.sort(key=lambda x: x['score'], reverse=True)
-    top_3 = scanned_results[:3]
-
-    elapsed = time.time() - start_time
-
-    if not top_3:
-        send_telegram_direct_message(f"⚠️ SNAPSHOT REAL-TIME — KHÔNG CÓ CƠ HỘI\n\nThị trường đi ngang tĩnh. (Thời gian xử lý: {elapsed:.1f}s)")
-        return
-
-    msg = f"⚠️ <b>SNAPSHOT REAL-TIME — TOP {len(top_3)} COIN TIỀM NĂNG</b>\n"
-    msg += f"UTC dữ liệu: <code>{utc_now}</code> | Quét: <b>{elapsed:.1f}s</b>\n"
-    msg += f"Đã lọc từ <b>{total_analyzed}</b> hợp đồng USDT.\n\n"
-    msg += f"🟡 <b>ĐANG CHỜ XÁC NHẬN (TOP 3)</b>\n\n"
-
-    for c in top_3:
-        msg += f"🟡 <b>{c['symbol']}</b> — <b>{c['score']}/100</b>\n"
-        msg += f"LONG | CHỜ XÁC NHẬN\n"
-        msg += f"Giá 1H <code>{c['p_change_1h']:+.2f}%</code> | Spot Vol <code>{c['spot_vol_ratio']:.2f}x</code>\n"
-        msg += f"Futures Vol <code>{c['fut_vol_ratio']:.2f}x</code> | OI30m <code>{c['oi_30m_pct']:+.2f}%</code>\n\n"
-
-    msg += "👉 <i>Nhập /scan bất kỳ lúc nào để cập nhật Top 3 snapshot mới nhất!</i>"
-    send_telegram_direct_message(msg)
 
 def process_telegram_commands():
     last_update_id = 0
@@ -390,16 +404,12 @@ def process_telegram_commands():
                     text = message.get("text", "").strip().lower()
                     
                     if text in ["/scan", "scan"]:
-                        Thread(target=execute_fast_snapshot_scan, daemon=True).start()
+                        Thread(target=execute_manual_snapshot_scan, daemon=True).start()
                     elif text in ["/start", "/ping", "ping"]:
-                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot đang chạy 24/7. Nhập <b>/scan</b> để xem Top 3 Snapshot ngay!")
+                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot đang chạy 24/7. Nhập <b>/scan</b> để xem Snapshot!")
         except Exception as e:
             print(f"Lỗi Telegram Listener: {e}", flush=True)
         time.sleep(1)
-
-# ==============================================================================
-# MAIN ENGINE
-# ==============================================================================
 
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()

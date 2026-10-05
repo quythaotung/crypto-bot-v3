@@ -1,7 +1,6 @@
 import time
 import requests
 import os
-import numpy as np
 from threading import Thread
 from flask import Flask
 
@@ -10,17 +9,14 @@ from flask import Flask
 # ==============================================================================
 DEBUG_MODE = True                  
 COOLDOWN_SECONDS = 15              
-MIN_FUTURES_TURNOVER_24H = 15_000_000  # $15M USDT
+MIN_FUTURES_TURNOVER_24H = 10_000_000  # Hạ xuống $10M USD để dễ quét trúng coin hơn
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 signals_history = []
-active_signals = []                
 processed_fingerprints = set()
 symbol_cooldowns = {}              
-daily_call_count = 0
-last_call_reset_time = time.time()
 signal_counter = 0
 
 app = Flask(__name__)
@@ -33,16 +29,6 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
-def get_current_price(symbol):
-    try:
-        url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
-        res = requests.get(url, timeout=5).json()
-        if res.get("retCode") == 0 and res.get("result", {}).get("list"):
-            return float(res["result"]["list"][0]["lastPrice"])
-    except Exception:
-        pass
-    return None
-
 def send_telegram_direct_message(text):
     if not BOT_TOKEN or not CHAT_ID: return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -52,9 +38,6 @@ def send_telegram_direct_message(text):
     except Exception as e:
         print(f"Lỗi gửi Telegram: {e}", flush=True)
 
-# ==============================================================================
-# DATA FETCHING & CVD DIVERGENCE CALCULATOR
-# ==============================================================================
 BASE_URL = "https://api.bybit.com"
 
 def get_all_bybit_usdt_symbols():
@@ -75,14 +58,14 @@ def get_all_bybit_usdt_symbols():
                         'lastPrice': float(t.get('lastPrice', 0))
                     })
             return parsed_list
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Lỗi lấy Tickers từ Bybit: {e}", flush=True)
     return []
 
-def get_closed_klines(symbol, interval, category="linear", limit=100):
+def get_closed_klines(symbol, interval, category="linear", limit=60):
     url = f"{BASE_URL}/v5/market/kline?category={category}&symbol={symbol}&interval={interval}&limit={limit}"
     try:
-        res = requests.get(url, timeout=10).json()
+        res = requests.get(url, timeout=8).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             raw_list = res["result"]["list"]
             closed_candles = raw_list[1:]
@@ -102,10 +85,10 @@ def get_closed_klines(symbol, interval, category="linear", limit=100):
         pass
     return []
 
-def get_taker_ratios(symbol, category="linear", limit=6):
+def get_taker_ratios(symbol, category="linear", limit=5):
     url = f"{BASE_URL}/v5/market/account-ratio?category={category}&symbol={symbol}&period=1h&limit={limit}"
     try:
-        res = requests.get(url, timeout=10).json()
+        res = requests.get(url, timeout=8).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             return [float(x.get("buyRatio", 0.5)) * 100 for x in res["result"]["list"]]
     except Exception:
@@ -125,7 +108,7 @@ def calculate_atr(candles, period=14):
 def get_open_interest_pct(symbol, interval_str="1h"):
     url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval_str}&limit=3"
     try:
-        res = requests.get(url, timeout=10).json()
+        res = requests.get(url, timeout=8).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             oi_list = res["result"]["list"]
             if len(oi_list) >= 2:
@@ -136,72 +119,61 @@ def get_open_interest_pct(symbol, interval_str="1h"):
         pass
     return 0.0
 
-# ==============================================================================
-# CORE EVALUATOR: SPOT ACCUMULATION & SHORT SQUEEZE (MÔ HÌNH QNT / ZRO)
-# ==============================================================================
 def evaluate_spot_squeeze_setup(ticker_data):
     symbol = ticker_data['symbol']
     fut_turnover = ticker_data['turnover24h']
     funding = ticker_data['fundingRate']
 
     if fut_turnover < MIN_FUTURES_TURNOVER_24H: return None
-    if funding > 0.05 or funding < -0.05: return None
+    if funding > 0.06 or funding < -0.06: return None
 
     now = time.time()
     if symbol in symbol_cooldowns and (now - symbol_cooldowns[symbol]) < 21600: return None
 
     h1_candles = get_closed_klines(symbol, "60", category="linear", limit=60)
-    spot_h1_candles = get_closed_klines(symbol, "60", category="spot", limit=60)
-
     if not h1_candles or len(h1_candles) < 30: return None
 
     last_h1 = h1_candles[-1]
     curr_price = last_h1['close']
     h1_atr = calculate_atr(h1_candles, 14)
+    if h1_atr <= 0: return None
 
-    # 1. KIỂM TRA PHÂN KỲ SPOT CVD vs PERP CVD (ZRO STYLE)
     spot_taker = get_taker_ratios(symbol, category="spot", limit=5)
     perp_taker = get_taker_ratios(symbol, category="linear", limit=5)
 
-    spot_accumulating = sum(1 for r in spot_taker[:3] if r >= 53.0) >= 2
+    spot_accumulating = sum(1 for r in spot_taker[:3] if r >= 52.0) >= 2
     oi_h1_pct = get_open_interest_pct(symbol, "1h")
 
-    # 2. XÁC ĐỊNH NỀN TÍCH LŨY BASE H1 (4-15 NẾN)
     recent_lows = [c['low'] for c in h1_candles[-12:-1]]
     recent_highs = [c['high'] for c in h1_candles[-12:-1]]
-    
     base_low = min(recent_lows)
     base_high = max(recent_highs)
     base_range_pct = (base_high - base_low) / base_low * 100
 
-    # Nếu nền đi ngang quá rộng (> 5.5%), không phải tích lũy nén giá
-    if base_range_pct > 5.5: return None
+    if base_range_pct > 6.0: return None
 
-    # 3. ĐIỀU KIỆN KÍCH HOẠT TRIGGER (BREAKOUT HOẶC HOLDING SUPPORT RECLAIM)
     is_breakout = last_h1['close'] > base_high
-    is_holding = (curr_price >= base_low + (base_high - base_low)*0.4) and last_h1['close'] > last_h1['open']
+    is_holding = (curr_price >= base_low + (base_high - base_low)*0.35) and last_h1['close'] > last_h1['open']
 
     if not (is_breakout or is_holding): return None
 
-    # 4. TÍNH STOP LOSS VÀ TAKE PROFIT THEO CẤU TRÚC
-    sl_price = base_low - (0.2 * h1_atr)
+    sl_price = base_low - (0.15 * h1_atr)
     risk_pct = (curr_price - sl_price) / curr_price * 100
 
-    if risk_pct > 3.0: return None # Loại bỏ các lệnh rủi ro SL > 3%
+    if risk_pct > 3.2: return None
 
     tp1_price = curr_price + (h1_atr * 2.5)
     tp2_price = curr_price + (h1_atr * 4.0)
-
     tp1_pct = (tp1_price - curr_price) / curr_price * 100
-    if tp1_pct / risk_pct < 1.5: return None # Tỷ lệ R:R tối thiểu 1.5R
 
-    # Chấm điểm uy tín Setup (0 - 100)
+    if tp1_pct / risk_pct < 1.4: return None
+
     score = 70
     if spot_accumulating: score += 15
-    if oi_h1_pct >= 1.5: score += 10
+    if oi_h1_pct >= 1.0: score += 10
     if is_breakout: score += 5
 
-    if score < 80: return None
+    if score < 78: return None
 
     fingerprint = f"{symbol}_{last_h1['timestamp']}_SPOT_SQUEEZE"
     if fingerprint in processed_fingerprints: return None
@@ -237,7 +209,7 @@ def send_telegram_signal(sig):
 ⭐️ <b>Điểm Uy Tín:</b> <code>{sig['score']}/100</code>
 
 📊 <b>DÒNG TIỀN NÉN GIÁ (ZRO/QNT STYLE):</b>
-• Spot Taker Buy: <code>{sig['spot_taker']:.1f}%</code> (Cá mập mua gom)
+• Spot Taker Buy: <code>{sig['spot_taker']:.1f}%</code> (Cá mập gom)
 • Perp Taker Buy: <code>{sig['perp_taker']:.1f}%</code>
 • OI H1 Expansion: <code>{sig['oi_pct']:+.2f}%</code>
 • Biên độ nền nén H1: <code>{sig['base_range']:.2f}%</code>
@@ -252,19 +224,26 @@ def send_telegram_signal(sig):
 ⚠️ <i>Vào lệnh sát vùng Base. Không Mua Đuổi nếu giá đã vọt cao.</i>"""
 
     send_telegram_direct_message(msg)
+    print(f"✅ [ALERT TELEGRAM] đã bắn tín hiệu #{sig['id']} {sig['symbol']}", flush=True)
 
 def run_radar_loop():
     print("⚡️ Bắt đầu Radar Spot Squeeze Precision Scanner...", flush=True)
     while True:
-        all_tickers = get_all_bybit_usdt_symbols()
-        for ticker in all_tickers:
-            try:
-                sig = evaluate_spot_squeeze_setup(ticker)
-                if sig:
-                    send_telegram_signal(sig)
-            except Exception:
-                pass
-            time.sleep(0.05)
+        try:
+            all_tickers = get_all_bybit_usdt_symbols()
+            print(f"🔍 [SCANNER] Đang rà soát {len(all_tickers)} coins...", flush=True)
+            for ticker in all_tickers:
+                try:
+                    sig = evaluate_spot_squeeze_setup(ticker)
+                    if sig:
+                        send_telegram_signal(sig)
+                except Exception as inner_e:
+                    pass
+                time.sleep(0.05)
+        except Exception as e:
+            print(f"Lỗi luồng Radar Loop: {e}", flush=True)
+        
+        print(f"✅ Hoàn tất 1 lượt quét. Tạm nghỉ {COOLDOWN_SECONDS}s...", flush=True)
         time.sleep(COOLDOWN_SECONDS)
 
 if __name__ == "__main__":

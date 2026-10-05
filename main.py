@@ -5,11 +5,12 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION - STRATEGY: h1-spot-squeeze-precision-v2
+# CONFIGURATION - H1 SQUEEZE EXPLOSION (TELEGRAM ALERT ENGINE)
 # ==============================================================================
 DEBUG_MODE = True                  
 COOLDOWN_SECONDS = 15              
-MIN_FUTURES_TURNOVER_24H = 10_000_000  # Hạ xuống $10M USD để dễ quét trúng coin hơn
+MIN_FUTURES_TURNOVER_24H = 10_000_000  # Lọc coin thanh khoản 24h >= $10M USD
+MIN_ALERT_SCORE = 80               # CHỈ BẮN TELEGRAM TỪ 80 ĐIỂM TRỞ LÊN
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -23,7 +24,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot H1 Spot-Squeeze Precision Active 24/7!"
+    return "Bot H1 Squeeze Explosion (Score >= 80) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -119,7 +120,15 @@ def get_open_interest_pct(symbol, interval_str="1h"):
         pass
     return 0.0
 
-def evaluate_spot_squeeze_setup(ticker_data):
+def calculate_sma_volume(candles, period=20):
+    if len(candles) < period: return 0
+    vols = [c['volume'] for c in candles[-period:]]
+    return sum(vols) / period
+
+# ==============================================================================
+# EVALUATE SQUEEZE SETUP (SCORE 0 - 100)
+# ==============================================================================
+def evaluate_squeeze_explosion_setup(ticker_data):
     symbol = ticker_data['symbol']
     fut_turnover = ticker_data['turnover24h']
     funding = ticker_data['fundingRate']
@@ -138,12 +147,16 @@ def evaluate_spot_squeeze_setup(ticker_data):
     h1_atr = calculate_atr(h1_candles, 14)
     if h1_atr <= 0: return None
 
+    # Order flow data
     spot_taker = get_taker_ratios(symbol, category="spot", limit=5)
     perp_taker = get_taker_ratios(symbol, category="linear", limit=5)
-
-    spot_accumulating = sum(1 for r in spot_taker[:3] if r >= 52.0) >= 2
     oi_h1_pct = get_open_interest_pct(symbol, "1h")
 
+    # Volume ratio
+    avg_vol_20 = calculate_sma_volume(h1_candles[:-1], 20)
+    vvol_ratio = last_h1['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
+
+    # Base high / low
     recent_lows = [c['low'] for c in h1_candles[-12:-1]]
     recent_highs = [c['high'] for c in h1_candles[-12:-1]]
     base_low = min(recent_lows)
@@ -157,25 +170,48 @@ def evaluate_spot_squeeze_setup(ticker_data):
 
     if not (is_breakout or is_holding): return None
 
+    # SL & TP Calculations
     sl_price = base_low - (0.15 * h1_atr)
     risk_pct = (curr_price - sl_price) / curr_price * 100
 
     if risk_pct > 3.2: return None
 
     tp1_price = curr_price + (h1_atr * 2.5)
-    tp2_price = curr_price + (h1_atr * 4.0)
-    tp1_pct = (tp1_price - curr_price) / curr_price * 100
+    tp2_price = curr_price + (h1_atr * 4.2)
 
-    if tp1_pct / risk_pct < 1.4: return None
+    # --------------------------------------------------------------------------
+    # HỆ THỐNG CHẤM ĐIỂM UY TÍN (0 - 100)
+    # --------------------------------------------------------------------------
+    score = 50
 
-    score = 70
-    if spot_accumulating: score += 15
-    if oi_h1_pct >= 1.0: score += 10
-    if is_breakout: score += 5
+    # 1. Volume Expansion (+20đ)
+    if vvol_ratio >= 2.5: score += 20
+    elif vvol_ratio >= 2.0: score += 16
+    elif vvol_ratio >= 1.5: score += 12
 
-    if score < 78: return None
+    # 2. Open Interest (+15đ)
+    if oi_h1_pct >= 5.0: score += 15
+    elif oi_h1_pct >= 2.5: score += 10
+    elif oi_h1_pct >= 1.0: score += 5
 
-    fingerprint = f"{symbol}_{last_h1['timestamp']}_SPOT_SQUEEZE"
+    # 3. CVD Buy Ratio (+15đ)
+    if spot_taker[0] >= 80.0: score += 15
+    elif spot_taker[0] >= 65.0: score += 12
+    elif spot_taker[0] >= 55.0: score += 8
+
+    # 4. Breakout State (+10đ)
+    if is_breakout: score += 10
+
+    # --------------------------------------------------------------------------
+    # CHỈ GIỮ LẠI LỆNH CÓ SCORE >= 80 ĐỂ BẮN TELEGRAM
+    # --------------------------------------------------------------------------
+    if score < MIN_ALERT_SCORE:
+        return None
+
+    entry_zone_low = base_high if is_breakout else base_low
+    entry_zone_high = curr_price
+
+    fingerprint = f"{symbol}_{last_h1['timestamp']}_SQUEEZE_{score}"
     if fingerprint in processed_fingerprints: return None
 
     processed_fingerprints.add(fingerprint)
@@ -183,61 +219,74 @@ def evaluate_spot_squeeze_setup(ticker_data):
 
     return {
         'symbol': symbol,
+        'score': score,
+        'vvol_ratio': vvol_ratio,
+        'oi_pct': oi_h1_pct,
+        'cvd_buy': spot_taker[0],
+        'status_text': "Breakout Nền Tích Lũy" if is_breakout else "Test Nền Tích Lũy Holding",
+        'entry_low': entry_zone_low,
+        'entry_high': entry_zone_high,
         'entry': curr_price,
-        'entry_low': base_high if is_breakout else base_low,
-        'entry_high': curr_price,
         'sl': sl_price,
-        'risk_pct': risk_pct,
         'tp1': tp1_price,
         'tp2': tp2_price,
-        'score': score,
-        'spot_taker': spot_taker[0],
-        'perp_taker': perp_taker[0],
-        'oi_pct': oi_h1_pct,
-        'funding': funding,
-        'base_range': base_range_pct
+        'tp1_pct': (tp1_price - curr_price) / curr_price * 100,
+        'tp2_pct': (tp2_price - curr_price) / curr_price * 100
     }
 
+# ==============================================================================
+# TELEGRAM ALERT FORMATTER (ĐÚNG MẪU BẠN YÊU CẦU 100%)
+# ==============================================================================
 def send_telegram_signal(sig):
     global signal_counter
     signal_counter += 1
     sig['id'] = signal_counter
     signals_history.append(sig)
 
-    msg = f"""🔥 <b>[SPOT ACCUMULATION & SHORT SQUEEZE] #{sig['symbol']}</b>
-━━━━━━━━━━━━━━━━━━━━━━━
-⭐️ <b>Điểm Uy Tín:</b> <code>{sig['score']}/100</code>
+    msg = f"""🚀 <b>[LONG H1 SQUEEZE EXPLOSION] #{sig['symbol']}</b>
+-------------------------------------
+⭐️ <b>Điểm Uy Tín</b>: <code>{sig['score']}/100</code>
 
-📊 <b>DÒNG TIỀN NÉN GIÁ (ZRO/QNT STYLE):</b>
-• Spot Taker Buy: <code>{sig['spot_taker']:.1f}%</code> (Cá mập gom)
-• Perp Taker Buy: <code>{sig['perp_taker']:.1f}%</code>
-• OI H1 Expansion: <code>{sig['oi_pct']:+.2f}%</code>
-• Biên độ nền nén H1: <code>{sig['base_range']:.2f}%</code>
-• Funding Rate: <code>{sig['funding']:+.3f}%</code>
+🔥 <b>DẤU HIỆU CÁ MẬP GOM SPOT & SHORT SQUEEZE</b>:
+• Volume H1: <code>+{sig['vvol_ratio']:.1f}x</code> (Dốc đứng)
+• Open Interest (OI): <code>{sig['oi_pct']:+.1f}%</code> (Tiền bơm cực mạnh)
+• Lực Mua CVD: <code>{sig['cvd_buy']:.0f}%</code> (Taker Buy ép đỉnh)
+• Trạng Thái: <code>{sig['status_text']}</code>
+-------------------------------------
+🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG)</b>:
 
-🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG):</b>
-📍 Entry Zone: <code>{sig['entry_low']:.4f} – {sig['entry_high']:.4f}</code>
-🛑 Stop Loss: <code>{sig['sl']:.4f}</code> (-{sig['risk_pct']:.2f}%)
-🎯 Take Profit 1: <code>{sig['tp1']:.4f}</code> (+{(sig['tp1']-sig['entry'])/sig['entry']*100:.1f}%)
-🚀 Take Profit 2: <code>{sig['tp2']:.4f}</code> (+{(sig['tp2']-sig['entry'])/sig['entry']*100:.1f}%)
+📍 <b>Entry Zone</b>:
+<code>{sig['entry_low']:.4f} – {sig['entry_high']:.4f}</code>
 
-⚠️ <i>Vào lệnh sát vùng Base. Không Mua Đuổi nếu giá đã vọt cao.</i>"""
+🛑 <b>Stop Loss (Cắt lỗ)</b>:
+<code>{sig['sl']:.4f}</code> (Thủng chân nến gom H1)
+
+🎯 <b>Take Profit 1 (Chốt 1)</b>:
+<code>{sig['tp1']:.4f}</code> <code>(+{sig['tp1_pct']:.1f}%)</code> (Đỉnh cũ cản H1)
+
+🚀 <b>Take Profit 2 (Chốt 2)</b>:
+<code>{sig['tp2']:.4f}</code> <code>(+{sig['tp2_pct']:.1f}%)</code> (Vùng nổ đà sóng tăng)
+-------------------------------------
+👉 <b>CHECK CHART H1 & BẮT SÓNG NGAY!</b>"""
 
     send_telegram_direct_message(msg)
-    print(f"✅ [ALERT TELEGRAM] đã bắn tín hiệu #{sig['id']} {sig['symbol']}", flush=True)
+    print(f"✅ [ALERT TELEGRAM] Đã bắn tín hiệu #{sig['id']} {sig['symbol']} (Score: {sig['score']})", flush=True)
 
+# ==============================================================================
+# MAIN RADAR LOOP
+# ==============================================================================
 def run_radar_loop():
-    print("⚡️ Bắt đầu Radar Spot Squeeze Precision Scanner...", flush=True)
+    print(f"⚡️ Bắt đầu Radar Squeeze Explosion (Chỉ báo Score >= {MIN_ALERT_SCORE})...", flush=True)
     while True:
         try:
             all_tickers = get_all_bybit_usdt_symbols()
-            print(f"🔍 [SCANNER] Đang rà soát {len(all_tickers)} coins...", flush=True)
+            print(f"🔍 [SCANNER] Đang rà soát {len(all_tickers)} coins (Lọc Score >= 80)...", flush=True)
             for ticker in all_tickers:
                 try:
-                    sig = evaluate_spot_squeeze_setup(ticker)
+                    sig = evaluate_squeeze_explosion_setup(ticker)
                     if sig:
                         send_telegram_signal(sig)
-                except Exception as inner_e:
+                except Exception:
                     pass
                 time.sleep(0.05)
         except Exception as e:

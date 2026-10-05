@@ -5,14 +5,14 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION - CRYPTO PURE ENGINE WITH REAL-TIME /scan COMMAND
+# CONFIGURATION - 5M MOMENTUM & H1 CRYPTO EXPLOSION ENGINE
 # ==============================================================================
 DEBUG_MODE = True                  
 COOLDOWN_SECONDS = 15              
 MIN_FUTURES_TURNOVER_24H = 10_000_000  # $10M USD 24h Crypto Turnover
-MIN_ALERT_SCORE = 80               # Chỉ bắn Telegram tự động từ 80 điểm trở lên
-MIN_TP1_PERCENT = 3.5              # TP1 tối thiểu từ +3.5% trở lên
-MIN_CVD_PERCENT = 60.0             # Lực mua CVD tối thiểu từ 60%
+MIN_ALERT_SCORE = 80               # Bắn Telegram tự động từ 80 điểm
+MIN_TP1_PERCENT_5M = 2.0           # TP1 tối thiểu cho lướt sóng 5M (>= 2.0%)
+MIN_CVD_PERCENT_5M = 60.0          # Lực mua CVD 5M tối thiểu >= 60%
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -26,7 +26,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot Crypto Pure H1 Squeeze Explosion with /scan Command Active 24/7!"
+    return "Bot Crypto 5M Momentum & H1 Squeeze Scanner Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -45,8 +45,8 @@ BASE_URL = "https://api.bybit.com"
 
 def get_all_bybit_crypto_symbols():
     """
-    Chỉ lấy các cặp Crypto USDT Perp.
-    Loại bỏ tuyệt đối: Cổ phiếu, Vàng (XAU), Chỉ số, Kim loại quý, Hàng hóa.
+    Lọc duy nhất Crypto USDT Perp.
+    Loại bỏ hoàn toàn: Cổ phiếu, Vàng (XAU), Chỉ số, Kim loại quý, Hàng hóa.
     """
     url = f"{BASE_URL}/v5/market/tickers?category=linear"
     try:
@@ -100,8 +100,8 @@ def get_closed_klines(symbol, interval, category="linear", limit=60):
         pass
     return []
 
-def get_taker_ratios(symbol, category="linear", limit=5):
-    url = f"{BASE_URL}/v5/market/account-ratio?category={category}&symbol={symbol}&period=1h&limit={limit}"
+def get_taker_ratios_5m(symbol, category="linear", limit=5):
+    url = f"{BASE_URL}/v5/market/account-ratio?category={category}&symbol={symbol}&period=5m&limit={limit}"
     try:
         res = requests.get(url, timeout=8).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
@@ -120,8 +120,8 @@ def calculate_atr(candles, period=14):
         tr_list.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
     return sum(tr_list[-period:]) / period if tr_list else 0.0
 
-def get_open_interest_pct(symbol, interval_str="1h"):
-    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval_str}&limit=3"
+def get_open_interest_pct_5m(symbol):
+    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime=5m&limit=3"
     try:
         res = requests.get(url, timeout=8).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
@@ -140,9 +140,9 @@ def calculate_sma_volume(candles, period=20):
     return sum(vols) / period
 
 # ==============================================================================
-# EVALUATE HIGH-PROFIT & HIGH-MOMENTUM SQUEEZE SETUP
+# EVALUATE 5M MOMENTUM EXPLOSION (SÓNG ĐỘT BIẾN KHUNG 5 PHÚT)
 # ==============================================================================
-def evaluate_squeeze_explosion_setup(ticker_data, is_manual_scan=False):
+def evaluate_5m_momentum_setup(ticker_data, is_manual_scan=False):
     symbol = ticker_data['symbol']
     fut_turnover = ticker_data['turnover24h']
     funding = ticker_data['fundingRate']
@@ -151,80 +151,62 @@ def evaluate_squeeze_explosion_setup(ticker_data, is_manual_scan=False):
     if funding > 0.06 or funding < -0.06: return None
 
     now = time.time()
-    if not is_manual_scan and symbol in symbol_cooldowns and (now - symbol_cooldowns[symbol]) < 21600:
+    if not is_manual_scan and symbol in symbol_cooldowns and (now - symbol_cooldowns[symbol]) < 7200: # Cooldown 2h cho 5M
         return None
 
-    h1_candles = get_closed_klines(symbol, "60", category="linear", limit=60)
-    if not h1_candles or len(h1_candles) < 30: return None
+    # Lấy Klines 5M
+    m5_candles = get_closed_klines(symbol, "5", category="linear", limit=40)
+    if not m5_candles or len(m5_candles) < 25: return None
 
-    last_h1 = h1_candles[-1]
-    curr_price = last_h1['close']
-    h1_atr = calculate_atr(h1_candles, 14)
-    if h1_atr <= 0: return None
+    last_5m = m5_candles[-1]
+    curr_price = last_5m['close']
+    m5_atr = calculate_atr(m5_candles, 14)
+    if m5_atr <= 0: return None
 
-    spot_taker = get_taker_ratios(symbol, category="spot", limit=5)
-    cvd_buy_pct = spot_taker[0] if spot_taker else 50.0
+    # 1. TÍNH BIẾN ĐỘNG GIÁ 5M
+    change_5m_pct = (last_5m['close'] - last_5m['open']) / last_5m['open'] * 100
+    if change_5m_pct < 0.8 or change_5m_pct > 5.0: return None # Bắt nến 5M tăng từ +0.8% đến +5.0%
 
-    if cvd_buy_pct < MIN_CVD_PERCENT: return None
+    # 2. TÍNH TỈ LỆ VOLUME 5M
+    avg_vol_20 = calculate_sma_volume(m5_candles[:-1], 20)
+    vvol_ratio_5m = last_5m['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
+    if vvol_ratio_5m < 1.8: return None # Volume 5M gấp ít nhất 1.8x SMA20
 
-    oi_h1_pct = get_open_interest_pct(symbol, "1h")
-    if oi_h1_pct < 1.0: return None
+    # 3. LỰC MUA CVD 5M
+    spot_taker_5m = get_taker_ratios_5m(symbol, category="spot", limit=3)
+    cvd_buy_5m = spot_taker_5m[0] if spot_taker_5m else 50.0
+    if cvd_buy_5m < MIN_CVD_PERCENT_5M: return None
 
-    avg_vol_20 = calculate_sma_volume(h1_candles[:-1], 20)
-    vvol_ratio = last_h1['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
+    # 4. OPEN INTEREST 5M
+    oi_5m_pct = get_open_interest_pct_5m(symbol)
 
-    if vvol_ratio < 1.3: return None
+    # ĐIỂM SỐ UY TÍN (0 - 100)
+    score = 45
+    if vvol_ratio_5m >= 3.5: score += 25
+    elif vvol_ratio_5m >= 2.5: score += 20
+    elif vvol_ratio_5m >= 1.8: score += 12
 
-    recent_lows = [c['low'] for c in h1_candles[-12:-1]]
-    recent_highs = [c['high'] for c in h1_candles[-12:-1]]
-    base_low = min(recent_lows)
-    base_high = max(recent_highs)
-    base_range_pct = (base_high - base_low) / base_low * 100
+    if oi_5m_pct >= 2.0: score += 15
+    elif oi_5m_pct >= 0.8: score += 10
 
-    if base_range_pct > 6.0: return None
+    if cvd_buy_5m >= 75.0: score += 15
+    elif cvd_buy_5m >= 60.0: score += 10
 
-    is_breakout = last_h1['close'] > base_high
-    is_holding = (curr_price >= base_low + (base_high - base_low)*0.35) and last_h1['close'] > last_h1['open']
-
-    if not (is_breakout or is_holding): return None
-
-    sl_price = base_low - (0.15 * h1_atr)
+    # Tính SL & TP cho 5M
+    sl_price = min(last_5m['low'], curr_price - (1.2 * m5_atr))
     risk_pct = (curr_price - sl_price) / curr_price * 100
 
-    if risk_pct > 3.5: return None
+    if risk_pct > 2.5: return None # Risk 5M tối đa 2.5%
 
-    tp1_price = max(curr_price + (h1_atr * 3.2), curr_price * (1 + MIN_TP1_PERCENT / 100))
-    tp2_price = tp1_price + (h1_atr * 4.5)
+    tp1_price = curr_price + (m5_atr * 2.2)
+    tp2_price = curr_price + (m5_atr * 4.0)
 
     tp1_pct = (tp1_price - curr_price) / curr_price * 100
     tp2_pct = (tp2_price - curr_price) / curr_price * 100
 
-    if tp1_pct < MIN_TP1_PERCENT: return None
+    if tp1_pct < MIN_TP1_PERCENT_5M: return None
 
-    score = 40
-
-    if vvol_ratio >= 2.5: score += 20
-    elif vvol_ratio >= 2.0: score += 16
-    elif vvol_ratio >= 1.3: score += 12
-
-    if oi_h1_pct >= 5.0: score += 20
-    elif oi_h1_pct >= 2.5: score += 15
-    elif oi_h1_pct >= 1.0: score += 10
-
-    if cvd_buy_pct >= 80.0: score += 20
-    elif cvd_buy_pct >= 70.0: score += 16
-    elif cvd_buy_pct >= 60.0: score += 12
-
-    if is_breakout: score += 10
-
-    # Đối với lệnh tự động, bắt buộc Score >= 80; Đối với /scan thủ công, lấy từ Score >= 75
-    min_threshold = MIN_ALERT_SCORE if not is_manual_scan else 75
-    if score < min_threshold: return None
-
-    entry_zone_low = base_high if is_breakout else base_low
-    entry_zone_high = curr_price
-
-    fingerprint = f"{symbol}_{last_h1['timestamp']}_CRYPTO_SQUEEZE_{score}"
+    fingerprint = f"{symbol}_{last_5m['timestamp']}_M5_{score}"
     if not is_manual_scan:
         if fingerprint in processed_fingerprints: return None
         processed_fingerprints.add(fingerprint)
@@ -233,12 +215,12 @@ def evaluate_squeeze_explosion_setup(ticker_data, is_manual_scan=False):
     return {
         'symbol': symbol,
         'score': score,
-        'vvol_ratio': vvol_ratio,
-        'oi_pct': oi_h1_pct,
-        'cvd_buy': cvd_buy_pct,
-        'status_text': "Breakout Nền Tích Lũy" if is_breakout else "Test Nền Tích Lũy Holding",
-        'entry_low': entry_zone_low,
-        'entry_high': entry_zone_high,
+        'change_5m': change_5m_pct,
+        'vvol_ratio_5m': vvol_ratio_5m,
+        'oi_5m_pct': oi_5m_pct,
+        'cvd_buy_5m': cvd_buy_5m,
+        'entry_low': last_5m['open'],
+        'entry_high': curr_price,
         'entry': curr_price,
         'sl': sl_price,
         'tp1': tp1_price,
@@ -248,43 +230,42 @@ def evaluate_squeeze_explosion_setup(ticker_data, is_manual_scan=False):
     }
 
 # ==============================================================================
-# MANUAL SCANNER PROCESSOR (/scan COMMAND)
+# MANUAL SCANNER PROCESSOR (/scan COMMAND 5M + H1)
 # ==============================================================================
 def execute_manual_scan():
-    send_telegram_direct_message("🔍 <b>ĐANG SCAN REAL-TIME TOÀN BỘ THỊ TRƯỜNG CRYPTO...</b>\n⏳ Vui lòng chờ trong 15-30 giây để lọc ra các mã bùng nổ tốt nhất!")
+    send_telegram_direct_message("⚡️ <b>ĐANG SCAN BIẾN ĐỘNG 5 PHÚT & DÒNG TIỀN NỔ ĐÀ...</b>\n⏳ Vui lòng chờ 10-15 giây để lọc ra các mã Crypto xung lực mạnh nhất!")
     
     all_crypto_tickers = get_all_bybit_crypto_symbols()
     matched_coins = []
 
     for ticker in all_crypto_tickers:
         try:
-            sig = evaluate_squeeze_explosion_setup(ticker, is_manual_scan=True)
+            sig = evaluate_5m_momentum_setup(ticker, is_manual_scan=True)
             if sig:
                 matched_coins.append(sig)
         except Exception:
             pass
-        time.sleep(0.03)
+        time.sleep(0.02)
 
     if not matched_coins:
-        send_telegram_direct_message("📊 <b>KẾT QUẢ /SCAN REAL-TIME:</b>\n\nChưa có coin Crypto nào đáp ứng đủ tiêu chí bùng nổ (Score ≥ 75, TP1 ≥ +3.5%, Volume/CVD mạnh) tại thời điểm này.")
+        send_telegram_direct_message("📊 <b>KẾT QUẢ /SCAN REAL-TIME 5M:</b>\n\nThị trường đang nén tĩnh. Chưa có coin Crypto nào bùng nổ Vol/CVD đột biến trong 5 phút qua.")
         return
 
-    # Sắp xếp theo điểm Uy Tín giảm dần
     matched_coins.sort(key=lambda x: x['score'], reverse=True)
     top_candidates = matched_coins[:5]
 
-    msg = f"🚀 <b>KẾT QUẢ SCAN REAL-TIME — TOP {len(top_candidates)} COIN BÙNG NỔ</b>\n"
+    msg = f"🔥 <b>KẾT QUẢ SCAN REAL-TIME — TOP {len(top_candidates)} COIN KHỎE 5M</b>\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
     for sig in top_candidates:
-        msg += f"🔥 <b>#{sig['symbol']}</b> (Điểm: <code>{sig['score']}/100</code>)\n"
-        msg += f"• Volume H1: <code>+{sig['vvol_ratio']:.1f}x</code> | OI: <code>{sig['oi_pct']:+.1f}%</code> | CVD Buy: <code>{sig['cvd_buy']:.0f}%</code>\n"
+        msg += f"⚡️ <b>#{sig['symbol']}</b> (Biến động 5M: <b>+{sig['change_5m']:.2f}%</b> | Điểm: <code>{sig['score']}/100</code>)\n"
+        msg += f"• Vol 5M: <code>+{sig['vvol_ratio_5m']:.1f}x</code> | OI 5M: <code>{sig['oi_5m_pct']:+.1f}%</code> | CVD Buy: <code>{sig['cvd_buy_5m']:.0f}%</code>\n"
         msg += f"📍 Entry Zone: <code>{sig['entry_low']:.4f} – {sig['entry_high']:.4f}</code>\n"
         msg += f"🛑 Stop Loss: <code>{sig['sl']:.4f}</code>\n"
         msg += f"🎯 TP1: <code>{sig['tp1']:.4f}</code> (<b>+{sig['tp1_pct']:.1f}%</b>) | TP2: <code>{sig['tp2']:.4f}</code> (<b>+{sig['tp2_pct']:.1f}%</b>)\n"
         msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
 
-    msg += "👉 <i>Gửi tín hiệu chi tiết tự động khi có biến động nổ đà sóng tăng!</i>"
+    msg += "👉 <i>Nhấn /scan bất kỳ lúc nào để cập nhật sóng 5M mới nhất!</i>"
     send_telegram_direct_message(msg)
 
 def process_telegram_commands():
@@ -303,13 +284,13 @@ def process_telegram_commands():
                     if text in ["/scan", "scan"]:
                         Thread(target=execute_manual_scan, daemon=True).start()
                     elif text in ["/start", "/ping", "ping"]:
-                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot Crypto Squeeze Scanner đang chạy 24/7. Nhập <b>/scan</b> để tìm coin ngay!")
+                        send_telegram_direct_message("🏓 <b>Pong!</b> Bot Crypto 5M Scanner đang chạy 24/7. Nhập <b>/scan</b> để tìm sóng ngay!")
         except Exception as e:
             print(f"Lỗi Telegram Listener: {e}", flush=True)
         time.sleep(2)
 
 # ==============================================================================
-# TELEGRAM ALERT FORMATTER (TỰ ĐỘNG BẮN SIGNAL)
+# TELEGRAM ALERT FORMATTER (TỰ ĐỘNG BẮN SIGNAL 5M)
 # ==============================================================================
 def send_telegram_signal(sig):
     global signal_counter
@@ -317,56 +298,56 @@ def send_telegram_signal(sig):
     sig['id'] = signal_counter
     signals_history.append(sig)
 
-    msg = f"""🚀 <b>[LONG H1 SQUEEZE EXPLOSION] #{sig['symbol']}</b>
+    msg = f"""⚡️ <b>[LONG 5M MOMENTUM EXPLOSION] #{sig['symbol']}</b>
 -------------------------------------
-⭐️ <b>Điểm Uy Tín</b>: <code>{sig['score']}/100</code>
+⭐️️ <b>Điểm Xung Lực 5M</b>: <code>{sig['score']}/100</code>
 
-🔥 <b>DẤU HIỆU CÁ MẬP GOM SPOT & SHORT SQUEEZE</b>:
-• Volume H1: <code>+{sig['vvol_ratio']:.1f}x</code> (Dốc đứng)
-• Open Interest (OI): <code>{sig['oi_pct']:+.1f}%</code> (Tiền bơm cực mạnh)
-• Lực Mua CVD: <code>{sig['cvd_buy']:.0f}%</code> (Taker Buy ép đỉnh)
-• Trạng Thái: <code>{sig['status_text']}</code>
+🔥 <b>DẤU HIỆU DÒNG TIỀN ĐỘT BIẾN 5 PHÚT</b>:
+• Nến 5M Tăng: <code>+{sig['change_5m']:.2f}%</code> (Nổ đà)
+• Volume 5M: <code>+{sig['vvol_ratio_5m']:.1f}x</code> (Bùng nổ)
+• OI 5M: <code>{sig['oi_5m_pct']:+.1f}%</code> (Bơm tiền khẩn cấp)
+• Lực Mua CVD 5M: <code>{sig['cvd_buy_5m']:.0f}%</code> (Gom áp đảo)
 -------------------------------------
-🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG)</b>:
+🎯 <b>KẾ HOẠCH LƯỚT SÓNG NGÀY (5M)</b>:
 
 📍 <b>Entry Zone</b>:
 <code>{sig['entry_low']:.4f} – {sig['entry_high']:.4f}</code>
 
 🛑 <b>Stop Loss (Cắt lỗ)</b>:
-<code>{sig['sl']:.4f}</code> (Thủng chân nến gom H1)
+<code>{sig['sl']:.4f}</code> (Dưới chân nến 5M)
 
 🎯 <b>Take Profit 1 (Chốt 1)</b>:
-<code>{sig['tp1']:.4f}</code> <code>(+{sig['tp1_pct']:.1f}%)</code> (Đỉnh cũ cản H1)
+<code>{sig['tp1']:.4f}</code> <code>(+{sig['tp1_pct']:.1f}%)</code>
 
 🚀 <b>Take Profit 2 (Chốt 2)</b>:
-<code>{sig['tp2']:.4f}</code> <code>(+{sig['tp2_pct']:.1f}%)</code> (Vùng nổ đà sóng tăng)
+<code>{sig['tp2']:.4f}</code> <code>(+{sig['tp2_pct']:.1f}%)</code>
 -------------------------------------
-👉 <b>CHECK CHART H1 & BẮT SÓNG NGAY!</b>"""
+👉 <b>CHECK CHART 5M & BẮT XUNG LỰC NGAY!</b>"""
 
     send_telegram_direct_message(msg)
-    print(f"✅ [ALERT TELEGRAM CRYPTO] Đã bắn tín hiệu #{sig['id']} {sig['symbol']} (Score: {sig['score']})", flush=True)
+    print(f"✅ [ALERT 5M CRYPTO] Đã bắn tín hiệu #{sig['id']} {sig['symbol']} (Score: {sig['score']})", flush=True)
 
 # ==============================================================================
 # MAIN RADAR LOOP
 # ==============================================================================
 def run_radar_loop():
-    print(f"⚡️ Bắt đầu Radar Crypto Squeeze Explosion (TP1 >= {MIN_TP1_PERCENT}% & CVD >= {MIN_CVD_PERCENT}%)...", flush=True)
+    print("⚡️ Bắt đầu Radar Crypto 5M Momentum Scanner...", flush=True)
     while True:
         try:
             all_crypto_tickers = get_all_bybit_crypto_symbols()
-            print(f"🔍 [CRYPTO SCANNER] Đang rà soát {len(all_crypto_tickers)} coin Crypto...", flush=True)
+            print(f"🔍 [5M SCANNER] Đang rà soát {len(all_crypto_tickers)} coin Crypto...", flush=True)
             for ticker in all_crypto_tickers:
                 try:
-                    sig = evaluate_squeeze_explosion_setup(ticker, is_manual_scan=False)
-                    if sig:
+                    sig = evaluate_5m_momentum_setup(ticker, is_manual_scan=False)
+                    if sig and sig['score'] >= MIN_ALERT_SCORE:
                         send_telegram_signal(sig)
                 except Exception:
                     pass
-                time.sleep(0.05)
+                time.sleep(0.04)
         except Exception as e:
             print(f"Lỗi luồng Radar Loop: {e}", flush=True)
         
-        print(f"✅ Hoàn tất 1 lượt quét. Tạm nghỉ {COOLDOWN_SECONDS}s...", flush=True)
+        print(f"✅ Hoàn tất 1 lượt quét 5M. Tạm nghỉ {COOLDOWN_SECONDS}s...", flush=True)
         time.sleep(COOLDOWN_SECONDS)
 
 if __name__ == "__main__":

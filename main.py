@@ -227,14 +227,14 @@ def evaluate_setup_with_momentum(ticker_data, btc_regime):
 
     if not h1_fut or len(h1_fut) < 22: return None
 
-    # Lấy và khai báo đầy đủ các biến Kline H1 trước khi xử lý logic
+    # THỨ TỰ KHAI BÁO BIẾN CHUẨN XÁC NAY ĐƯỢC ĐẶT LÊN ĐẦU
     last_h1 = h1_fut[-1]
     open_1h = last_h1['open']
     high_1h = last_h1['high']
     low_1h = last_h1['low']
     close_1h = last_h1['close']
     
-    p_change_1h = (close_1h - open_1h) / open_1h * 100
+    p_change_1h = (close_1h - open_1h) / open_1h * 100 if open_1h > 0 else 0.0
 
     # Volume Ratio Calculation
     fut_vols_20 = [c['volume'] for c in h1_fut[-21:-1]]
@@ -256,7 +256,7 @@ def evaluate_setup_with_momentum(ticker_data, btc_regime):
     prev_swing_high = max([c['high'] for c in h1_fut[-7:-1]])
 
     is_sweep_low = (low_1h < prev_swing_low) and (close_1h >= prev_swing_low * 0.998)
-    is_sweep_high = (high_1h > prev_swing_high) and (close_1h <= prev_swing_high * 1.002)
+    is_sweep_high = (high_1h > prev_swing_high) and (close_h1 <= prev_swing_high * 1.002)
 
     is_choch_bos_long = (close_1h > prev_swing_high)
     is_choch_bos_short = (close_h1 < prev_swing_low)
@@ -269,8 +269,8 @@ def evaluate_setup_with_momentum(ticker_data, btc_regime):
     if not ema34_h1 or not rsi_h1_list or h1_atr <= 0: return None
     rsi_h1 = rsi_h1_list[-1]
 
-    is_h1_reclaim_long = close_1h >= ema34_h1[-1] * 0.998 and 45.0 <= rsi_h1 <= 65.0
-    is_h1_reclaim_short = close_1h <= ema34_h1[-1] * 1.002 and 35.0 <= rsi_h1 <= 55.0
+    is_h1_reclaim_long = close_h1 >= ema34_h1[-1] * 0.998 and 45.0 <= rsi_h1 <= 65.0
+    is_h1_reclaim_short = close_h1 <= ema34_h1[-1] * 1.002 and 35.0 <= rsi_h1 <= 55.0
 
     # Determine Direction
     direction = None

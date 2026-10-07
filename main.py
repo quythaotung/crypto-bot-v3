@@ -227,8 +227,13 @@ def evaluate_setup_with_momentum(ticker_data, btc_regime):
 
     if not h1_fut or len(h1_fut) < 22: return None
 
+    # Lấy và khai báo đầy đủ các biến Kline H1 trước khi xử lý logic
     last_h1 = h1_fut[-1]
-    open_1h, high_1h, low_1h, close_1h = last_h1['open'], last_h1['high'], last_h1['low'], last_h1['close']
+    open_1h = last_h1['open']
+    high_1h = last_h1['high']
+    low_1h = last_h1['low']
+    close_1h = last_h1['close']
+    
     p_change_1h = (close_1h - open_1h) / open_1h * 100
 
     # Volume Ratio Calculation
@@ -250,10 +255,10 @@ def evaluate_setup_with_momentum(ticker_data, btc_regime):
     prev_swing_low = min([c['low'] for c in h1_fut[-7:-1]])
     prev_swing_high = max([c['high'] for c in h1_fut[-7:-1]])
 
-    is_sweep_low = (low_1h < prev_swing_low) and (close_h1 >= prev_swing_low * 0.998)
-    is_sweep_high = (high_1h > prev_swing_high) and (close_h1 <= prev_swing_high * 1.002)
+    is_sweep_low = (low_1h < prev_swing_low) and (close_1h >= prev_swing_low * 0.998)
+    is_sweep_high = (high_1h > prev_swing_high) and (close_1h <= prev_swing_high * 1.002)
 
-    is_choch_bos_long = (close_h1 > prev_swing_high)
+    is_choch_bos_long = (close_1h > prev_swing_high)
     is_choch_bos_short = (close_h1 < prev_swing_low)
 
     # Indicators & Confirmation
@@ -264,8 +269,8 @@ def evaluate_setup_with_momentum(ticker_data, btc_regime):
     if not ema34_h1 or not rsi_h1_list or h1_atr <= 0: return None
     rsi_h1 = rsi_h1_list[-1]
 
-    is_h1_reclaim_long = close_h1 >= ema34_h1[-1] * 0.998 and 45.0 <= rsi_h1 <= 65.0
-    is_h1_reclaim_short = close_h1 <= ema34_h1[-1] * 1.002 and 35.0 <= rsi_h1 <= 55.0
+    is_h1_reclaim_long = close_1h >= ema34_h1[-1] * 0.998 and 45.0 <= rsi_h1 <= 65.0
+    is_h1_reclaim_short = close_1h <= ema34_h1[-1] * 1.002 and 35.0 <= rsi_h1 <= 55.0
 
     # Determine Direction
     direction = None
@@ -278,15 +283,15 @@ def evaluate_setup_with_momentum(ticker_data, btc_regime):
 
     # Calculate Risk / Reward (RR)
     if direction == "LONG":
-        sl_price = max(low_1h - (0.2 * h1_atr), close_h1 * 0.96)
-        tp_price = close_h1 + (h1_atr * 3.2)
-        risk = close_h1 - sl_price
-        reward = tp_price - close_h1
+        sl_price = max(low_1h - (0.2 * h1_atr), close_1h * 0.96)
+        tp_price = close_1h + (h1_atr * 3.2)
+        risk = close_1h - sl_price
+        reward = tp_price - close_1h
     else:
-        sl_price = min(high_1h + (0.2 * h1_atr), close_h1 * 1.04)
-        tp_price = close_h1 - (h1_atr * 3.2)
-        risk = sl_price - close_h1
-        reward = close_h1 - tp_price
+        sl_price = min(high_1h + (0.2 * h1_atr), close_1h * 1.04)
+        tp_price = close_1h - (h1_atr * 3.2)
+        risk = sl_price - close_1h
+        reward = close_1h - tp_price
 
     rr_ratio = (reward / risk) if risk > 0 else 0.0
 
@@ -302,9 +307,7 @@ def evaluate_setup_with_momentum(ticker_data, btc_regime):
     elif direction == "SHORT" and spot_vol_ratio >= 2.0 and fut_vol_ratio >= 2.0 and oi_30m_pct >= 0.5:
         momentum_confirmed = True
 
-    # --------------------------------------------------------------------------
     # HỆ THỐNG 100 ĐIỂM CHUẨN
-    # --------------------------------------------------------------------------
     s_sweep = 15 if (is_sweep_low if direction == "LONG" else is_sweep_high) else 5
     s_structure = 20 if (is_choch_bos_long if direction == "LONG" else is_choch_bos_short) else 10
     s_vol = 10 if spot_vol_ratio >= 2.0 else (5 if spot_vol_ratio >= 1.5 else 2)
@@ -316,9 +319,7 @@ def evaluate_setup_with_momentum(ticker_data, btc_regime):
 
     total_score = s_sweep + s_structure + s_vol + s_cvd + s_oi + s_h1 + s_btc + s_rr + momentum_score
 
-    # --------------------------------------------------------------------------
-    # CHECK HARD FILTER CHO KÈO PREMIUM (TẮT TẤT CẢ TÍN HIỆU RÁC)
-    # --------------------------------------------------------------------------
+    # CHECK HARD FILTER CHO KÈO PREMIUM
     is_premium_hard_filter = False
     if direction == "LONG":
         is_premium_hard_filter = (

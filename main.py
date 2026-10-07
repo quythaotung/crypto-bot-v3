@@ -8,25 +8,22 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# CONFIGURATION - AUTOMATIC 2-TIER REVERSAL SCANNER ENGINE
+# CONFIGURATION - MOMENTUM & VOLUME & OI ENGINE (100-POINT SCORING)
 # ==============================================================================
 SCAN_INTERVAL_SECONDS = 300            # Tự động scan mỗi 5 phút (300 giây)
 MIN_FUTURES_TURNOVER_24H = 8_000_000   # Lọc Altcoin thanh khoản >= $8M USD
-TOP_TIER1_LIMIT = 25                   # Tầng 1 lọc chọn Top 25 coin biến động nhất
-TOP_TELEGRAM_REPORT_LIMIT = 5          # Tầng 2 chọn Top 5 coin đẹp nhất gửi Telegram
+TOP_TIER1_LIMIT = 30                   # Lọc Top 30 coin biến động nhất ở Tầng 1
 COOLDOWN_ALERT_SECONDS = 1800          # Cooldown 30 phút chống spam cùng 1 coin
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-processed_alerts = {}                  # Lưu trạng thái cooldown & score gần nhất
-confirmed_h1_set = set()               # Đánh dấu các nến H1 đã gửi CONFIRMED
-
+processed_alerts = {}                  # Lưu cooldown & score gần nhất
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot Automatic 2-Tier Reversal Scanner Active 24/7!"
+    return "Bot Premium Momentum + Volume + OI Engine Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -44,11 +41,10 @@ def send_telegram_direct_message(text):
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# API HELPERS (PURE CRYPTO ONLY)
+# 1. API DATA HELPERS
 # ==============================================================================
 
 def get_all_bybit_crypto_symbols():
-    """Lấy danh sách Altcoin USDT Perp thuần Crypto"""
     url = f"{BASE_URL}/v5/market/tickers?category=linear"
     try:
         res = requests.get(url, timeout=5).json()
@@ -64,7 +60,7 @@ def get_all_bybit_crypto_symbols():
             for t in tickers:
                 sym = t['symbol']
                 turnover = float(t.get('turnover24h', 0))
-                price_change = abs(float(t.get('price24hPcnt', 0)) * 100)
+                price_change = float(t.get('price24hPcnt', 0)) * 100
                 if sym.endswith('USDT') and not sym.startswith(('USDC', 'BUSD', 'DAI')) and turnover >= MIN_FUTURES_TURNOVER_24H:
                     if not any(k in sym for k in non_crypto_keywords):
                         parsed_list.append({
@@ -79,9 +75,8 @@ def get_all_bybit_crypto_symbols():
         print(f"Lỗi lấy Tickers: {e}", flush=True)
     return []
 
-def get_klines_with_current(symbol, interval, limit=35):
-    """Lấy Klines bao gồm cả nến đang chạy real-time"""
-    url = f"{BASE_URL}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit}"
+def get_klines(symbol, interval, category="linear", limit=35):
+    url = f"{BASE_URL}/v5/market/kline?category={category}&symbol={symbol}&interval={interval}&limit={limit}"
     try:
         res = requests.get(url, timeout=4).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
@@ -101,8 +96,8 @@ def get_klines_with_current(symbol, interval, limit=35):
         pass
     return []
 
-def get_open_interest_pct(symbol, interval_str="5m"):
-    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval_str}&limit=3"
+def get_open_interest_pct_30m(symbol):
+    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime=30m&limit=3"
     try:
         res = requests.get(url, timeout=3).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
@@ -115,8 +110,8 @@ def get_open_interest_pct(symbol, interval_str="5m"):
         pass
     return 0.0
 
-def get_taker_buy_sell_ratio(symbol, interval_str="5m"):
-    url = f"{BASE_URL}/v5/market/account-ratio?category=spot&symbol={symbol}&period={interval_str}&limit=2"
+def get_taker_buy_pct_5m(symbol):
+    url = f"{BASE_URL}/v5/market/account-ratio?category=spot&symbol={symbol}&period=5m&limit=2"
     try:
         res = requests.get(url, timeout=3).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
@@ -124,6 +119,14 @@ def get_taker_buy_sell_ratio(symbol, interval_str="5m"):
     except Exception:
         pass
     return 50.0
+
+def get_btc_regime_status():
+    btc_klines = get_klines("BTCUSDT", "60", limit=10)
+    if not btc_klines or len(btc_klines) < 3: return "NEUTRAL"
+    p_change = (btc_klines[-1]['close'] - btc_klines[-2]['open']) / btc_klines[-2]['open'] * 100
+    if p_change <= -1.0: return "BEARISH"
+    elif p_change >= 1.0: return "BULLISH"
+    return "NEUTRAL"
 
 def calculate_ema(candles, period):
     if len(candles) < period: return []
@@ -155,322 +158,295 @@ def calculate_rsi(candles, period=14):
         rsi_values.append(100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
     return rsi_values
 
-# ==============================================================================
-# CANDLESTICK PATTERN RECOGNITION ENGINE (CÁC MÔ HÌNH NẾN H1)
-# ==============================================================================
-
-def detect_h1_candle_pattern(h1_candles):
-    if len(h1_candles) < 3:
-        return "Unknown", "NONE"
-
-    c1 = h1_candles[-1] # Nến hiện tại (in-progress hoặc vừa đóng)
-    c2 = h1_candles[-2] # Nến trước
-    c3 = h1_candles[-3]
-
-    o1, h1, l1, cl1 = c1['open'], c1['high'], c1['low'], c1['close']
-    o2, h2, l2, cl2 = c2['open'], c2['high'], c2['low'], c2['close']
-    o3, h3, l3, cl3 = c3['open'], c3['high'], c3['low'], c3['close']
-
-    body1 = abs(cl1 - o1)
-    range1 = h1 - l1 if (h1 - l1) > 0 else 1.0
-    lower_wick1 = min(o1, cl1) - l1
-    upper_wick1 = h1 - max(o1, cl1)
-
-    body2 = abs(cl2 - o2)
-
-    # 1. Bullish Pin Bar / Hammer
-    if lower_wick1 >= 2.0 * body1 and cl1 >= l1 + (0.6 * range1):
-        return "Bullish Pin Bar", "LONG"
-
-    # 2. Bearish Shooting Star / Pin Bar
-    if upper_wick1 >= 2.0 * body1 and cl1 <= l1 + (0.4 * range1):
-        return "Shooting Star", "SHORT"
-
-    # 3. Bullish Engulfing
-    if cl2 < o2 and cl1 > o1 and cl1 >= o2 and o1 <= cl2:
-        return "Bullish Engulfing", "LONG"
-
-    # 4. Bearish Engulfing
-    if cl2 > o2 and cl1 < o1 and cl1 <= o2 and o1 >= cl2:
-        return "Bearish Engulfing", "SHORT"
-
-    # 5. Morning Star
-    if cl3 < o3 and body2 < (abs(cl3 - o3) * 0.4) and cl1 > o1 and cl1 >= (o3 + cl3) / 2:
-        return "Morning Star", "LONG"
-
-    # 6. Evening Star
-    if cl3 > o3 and body2 < (abs(cl3 - o3) * 0.4) and cl1 < o1 and cl1 <= (o3 + cl3) / 2:
-        return "Evening Star", "SHORT"
-
-    # 7. Tweezer Bottom
-    if abs(l1 - l2) / cl1 <= 0.0015 and cl1 > o1:
-        return "Tweezer Bottom", "LONG"
-
-    # 8. Tweezer Top
-    if abs(h1 - h2) / cl1 <= 0.0015 and cl1 < o1:
-        return "Tweezer Top", "SHORT"
-
-    # 9. Doji Rejection
-    if body1 <= range1 * 0.15:
-        if lower_wick1 > upper_wick1:
-            return "Doji Bullish Rejection", "LONG"
-        elif upper_wick1 > lower_wick1:
-            return "Doji Bearish Rejection", "SHORT"
-
-    return "Standard Reversal", "NEUTRAL"
+def calculate_atr(candles, period=14):
+    if len(candles) < period + 1: return 0.0
+    tr_list = []
+    for i in range(1, len(candles)):
+        high = candles[i]['high']
+        low = candles[i]['low']
+        prev_close = candles[i-1]['close']
+        tr_list.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return sum(tr_list[-period:]) / period if tr_list else 0.0
 
 # ==============================================================================
-# TẦNG 1 — FAST SCANNER (LỌC NHANH TOÀN BỘ THỊ TRƯỜNG CHỌN TOP 25 COIN)
+# 2. MODULE MOMENTUM SCORE (TỐI ĐA 15 ĐIỂM)
 # ==============================================================================
 
-def execute_tier1_fast_scan(all_tickers):
-    candidates = []
-    for t in all_tickers:
-        sym = t['symbol']
-        try:
-            m5_candles = get_klines_with_current(sym, "5", limit=15)
-            if not m5_candles or len(m5_candles) < 10: continue
+def calculate_momentum_module_score(p_change_1h, spot_vol_ratio, fut_vol_ratio, oi_30m_pct, cvd_bullish, direction):
+    score = 0
 
-            last_5m = m5_candles[-1]
-            p_change_5m = abs((last_5m['close'] - last_5m['open']) / last_5m['open'] * 100)
+    # A. Price 1H (Max 3 pts)
+    if direction == "LONG":
+        if p_change_1h >= 1.00: score += 3
+        elif p_change_1h >= 0.50: score += 2
+        elif p_change_1h >= 0.30: score += 1
+    else: # SHORT
+        if p_change_1h <= -1.00: score += 3
+        elif p_change_1h <= -0.50: score += 2
+        elif p_change_1h <= -0.30: score += 1
 
-            vols_5m = [c['volume'] for c in m5_candles[-11:-1]]
-            avg_vol_5m = np.mean(vols_5m) if vols_5m else 1.0
-            vol_expansion_5m = last_5m['volume'] / avg_vol_5m if avg_vol_5m > 0 else 1.0
+    # B. Spot Volume (Max 4 pts)
+    if spot_vol_ratio >= 3.0: score += 4
+    elif spot_vol_ratio >= 2.0: score += 3
+    elif spot_vol_ratio >= 1.5: score += 1
 
-            # Điểm hấp dẫn Tầng 1 (Volume Expansion 5M + Biến động giá + Turnover)
-            tier1_score = (vol_expansion_5m * 30) + (p_change_5m * 25) + (t['price24hPcnt'] * 20)
-            
-            if vol_expansion_5m >= 1.3 or p_change_5m >= 0.5:
-                candidates.append({
-                    'ticker': t,
-                    'tier1_score': tier1_score,
-                    'vol_expansion_5m': vol_expansion_5m,
-                    'p_change_5m': p_change_5m
-                })
-        except Exception:
-            pass
+    # C. Futures Volume (Max 3 pts)
+    if fut_vol_ratio >= 3.0: score += 3
+    elif fut_vol_ratio >= 2.0: score += 2
+    elif fut_vol_ratio >= 1.5: score += 1
 
-    candidates.sort(key=lambda x: x['tier1_score'], reverse=True)
-    return [c['ticker'] for c in candidates[:TOP_TIER1_LIMIT]]
+    # D. OI 30m (Max 3 pts)
+    if oi_30m_pct >= 1.00: score += 3
+    elif oi_30m_pct >= 0.50: score += 2
+    elif oi_30m_pct >= 0.20: score += 1
+
+    # E. Price + Spot Vol + OI Alignment (Max 2 pts)
+    align_count = 0
+    if (direction == "LONG" and p_change_1h > 0) or (direction == "SHORT" and p_change_1h < 0):
+        align_count += 1
+    if spot_vol_ratio >= 1.5:
+        align_count += 1
+    if oi_30m_pct >= 0.20 and cvd_bullish == (direction == "LONG"):
+        align_count += 1
+
+    if align_count == 3: score += 2
+    elif align_count == 2: score += 1
+
+    return min(15, score)
 
 # ==============================================================================
-# TẦNG 2 — DEEP REVERSAL ENGINE (CHẤM ĐIỂM 100 & NHẬN DIỆN MÔ HÌNH NẾN H1)
+# 3. CORE EVALUATOR & HARD FILTER PREMIUM ENGINE
 # ==============================================================================
 
-def analyze_tier2_deep_reversal(ticker_data):
+def evaluate_setup_with_momentum(ticker_data, btc_regime):
     sym = ticker_data['symbol']
     funding = ticker_data['fundingRate']
 
-    m5_candles = get_klines_with_current(sym, "5", limit=30)
-    h1_candles = get_klines_with_current(sym, "60", limit=35)
+    h1_fut = get_klines(sym, "60", category="linear", limit=35)
+    h1_spot = get_klines(sym, "60", category="spot", limit=35)
 
-    if not m5_candles or len(m5_candles) < 22 or not h1_candles or len(h1_candles) < 22:
-        return None
+    if not h1_fut or len(h1_fut) < 22: return None
 
-    last_5m = m5_candles[-1]
-    curr_price = last_5m['close']
+    last_h1 = h1_fut[-1]
+    open_1h, high_1h, low_1h, close_1h = last_h1['open'], last_h1['high'], last_h1['low'], last_h1['close']
+    p_change_1h = (close_1h - open_1h) / open_1h * 100
 
-    # Volume 5M
-    vols_5m_20 = [c['volume'] for c in m5_candles[-21:-1]]
-    avg_vol_5m = np.mean(vols_5m_20) if vols_5m_20 else 1.0
-    vol_5m_ratio = last_5m['volume'] / avg_vol_5m if avg_vol_5m > 0 else 1.0
+    # Volume Ratio Calculation
+    fut_vols_20 = [c['volume'] for c in h1_fut[-21:-1]]
+    avg_fut_vol = np.mean(fut_vols_20) if fut_vols_20 else 1.0
+    fut_vol_ratio = last_h1['volume'] / avg_fut_vol if avg_fut_vol > 0 else 1.0
 
-    # Kline H1
-    curr_h1 = h1_candles[-1]
-    prev_h1_swing_low = min([c['low'] for c in h1_candles[-7:-1]])
-    prev_h1_swing_high = max([c['high'] for c in h1_candles[-7:-1]])
+    spot_vol_ratio = 1.0
+    if h1_spot and len(h1_spot) >= 20:
+        spot_vols_20 = [c['volume'] for c in h1_spot[-21:-1]]
+        avg_spot_vol = np.mean(spot_vols_20) if spot_vols_20 else 1.0
+        spot_vol_ratio = h1_spot[-1]['volume'] / avg_spot_vol if avg_spot_vol > 0 else 1.0
 
-    open_h1, high_h1, low_h1, close_h1 = curr_h1['open'], curr_h1['high'], curr_h1['low'], curr_h1['close']
-    body_h1 = abs(close_h1 - open_h1)
-    lower_wick_h1 = min(open_h1, close_h1) - low_h1
-    upper_wick_h1 = high_h1 - max(open_h1, close_h1)
+    oi_30m_pct = get_open_interest_pct_30m(sym)
+    taker_buy_pct = get_taker_buy_pct_5m(sym)
+    cvd_bullish = taker_buy_pct >= 55.0
 
-    # Technical Indicators
-    ema34_h1 = calculate_ema(h1_candles, 34)
-    ema89_h1 = calculate_ema(h1_candles, 89)
-    rsi_h1_list = calculate_rsi(h1_candles, 14)
+    # Structural Signals (Sweep / BOS / CHoCH)
+    prev_swing_low = min([c['low'] for c in h1_fut[-7:-1]])
+    prev_swing_high = max([c['high'] for c in h1_fut[-7:-1]])
 
-    if not ema34_h1 or not rsi_h1_list: return None
+    is_sweep_low = (low_1h < prev_swing_low) and (close_h1 >= prev_swing_low * 0.998)
+    is_sweep_high = (high_1h > prev_swing_high) and (close_h1 <= prev_swing_high * 1.002)
+
+    is_choch_bos_long = (close_h1 > prev_swing_high)
+    is_choch_bos_short = (close_h1 < prev_swing_low)
+
+    # Indicators & Confirmation
+    ema34_h1 = calculate_ema(h1_fut, 34)
+    rsi_h1_list = calculate_rsi(h1_fut, 14)
+    h1_atr = calculate_atr(h1_fut, 14)
+
+    if not ema34_h1 or not rsi_h1_list or h1_atr <= 0: return None
     rsi_h1 = rsi_h1_list[-1]
 
-    # Orderflow Data
-    oi_pct_5m = get_open_interest_pct(sym, "5m")
-    taker_buy_pct = get_taker_buy_sell_ratio(sym, "5m")
+    is_h1_reclaim_long = close_h1 >= ema34_h1[-1] * 0.998 and 45.0 <= rsi_h1 <= 65.0
+    is_h1_reclaim_short = close_h1 <= ema34_h1[-1] * 1.002 and 35.0 <= rsi_h1 <= 55.0
 
-    # Anti-Overextended Filter (Loại bỏ coin đã pump/dump quá xa > 8%)
-    p_change_3h = (close_h1 - h1_candles[-4]['open']) / h1_candles[-4]['open'] * 100 if len(h1_candles) >= 4 else 0
-    if p_change_3h > 8.5 or p_change_3h < -8.5:
-        return None
+    # Determine Direction
+    direction = None
+    if (is_sweep_low or is_choch_bos_long or is_h1_reclaim_long) and cvd_bullish:
+        direction = "LONG"
+    elif (is_sweep_high or is_choch_bos_short or is_h1_reclaim_short) and not cvd_bullish:
+        direction = "SHORT"
 
-    # Nhận diện mô hình nến H1
-    pattern_name, pattern_dir = detect_h1_candle_pattern(h1_candles)
+    if not direction: return None
 
-    # --------------------------------------------------------------------------
-    # CHECK LONG REVERSAL
-    # --------------------------------------------------------------------------
-    is_long_sweep = (low_h1 < prev_h1_swing_low) and (close_h1 >= prev_h1_swing_low * 0.998)
-    wick_ratio_long = (lower_wick_h1 / body_h1) if body_h1 > 0 else 0.0
-    is_support_reclaim = close_h1 >= prev_h1_swing_low
+    # Calculate Risk / Reward (RR)
+    if direction == "LONG":
+        sl_price = max(low_1h - (0.2 * h1_atr), close_h1 * 0.96)
+        tp_price = close_h1 + (h1_atr * 3.2)
+        risk = close_h1 - sl_price
+        reward = tp_price - close_h1
+    else:
+        sl_price = min(high_1h + (0.2 * h1_atr), close_h1 * 1.04)
+        tp_price = close_h1 - (h1_atr * 3.2)
+        risk = sl_price - close_h1
+        reward = close_h1 - tp_price
 
-    if is_long_sweep or (wick_ratio_long >= 1.4 and close_h1 >= open_h1) or pattern_dir == "LONG":
-        s_sweep = 25 if is_long_sweep else 10
-        s_wick = 15 if wick_ratio_long >= 2.0 else (10 if wick_ratio_long >= 1.2 else 5)
-        s_reclaim = 15 if is_support_reclaim else 8
-        s_vol = 10 if vol_5m_ratio >= 2.0 else (6 if vol_5m_ratio >= 1.4 else 2)
-        s_oi = 10 if oi_pct_5m >= 1.0 else 5
-        s_cvd = 10 if taker_buy_pct >= 60.0 else 4
-        s_ema = 5 if (abs(close_h1 - ema34_h1[-1])/close_h1 < 0.012 or (ema89_h1 and abs(close_h1 - ema89_h1[-1])/close_h1 < 0.012)) else 2
-        s_rsi = 5 if 36.0 <= rsi_h1 <= 58.0 else 2
-        s_btc = 5 if funding >= 0 else 3
+    rr_ratio = (reward / risk) if risk > 0 else 0.0
 
-        score_long = s_sweep + s_wick + s_reclaim + s_vol + s_oi + s_cvd + s_ema + s_rsi + s_btc
+    # Tính Momentum Score (Max 15)
+    momentum_score = calculate_momentum_module_score(
+        p_change_1h, spot_vol_ratio, fut_vol_ratio, oi_30m_pct, cvd_bullish, direction
+    )
 
-        if score_long >= 65:
-            return {
-                'symbol': sym,
-                'direction': 'LONG',
-                'score': score_long,
-                'entry': curr_price,
-                'pattern': pattern_name if pattern_dir == "LONG" else "Bullish Reclaim",
-                'is_sweep': is_long_sweep,
-                'is_reclaim': is_support_reclaim,
-                'wick_ratio': wick_ratio_long,
-                'vol_5m_ratio': vol_5m_ratio,
-                'oi_pct': oi_pct_5m,
-                'taker_buy': taker_buy_pct,
-                'rsi_h1': rsi_h1,
-                'funding': funding,
-                'h1_timestamp': curr_h1['timestamp']
-            }
+    # Phân loại Momentum
+    momentum_confirmed = False
+    if direction == "LONG" and spot_vol_ratio >= 2.0 and fut_vol_ratio >= 2.0 and oi_30m_pct >= 0.5:
+        momentum_confirmed = True
+    elif direction == "SHORT" and spot_vol_ratio >= 2.0 and fut_vol_ratio >= 2.0 and oi_30m_pct >= 0.5:
+        momentum_confirmed = True
 
     # --------------------------------------------------------------------------
-    # CHECK SHORT REVERSAL
+    # HỆ THỐNG 100 ĐIỂM CHUẨN
     # --------------------------------------------------------------------------
-    is_short_sweep = (high_h1 > prev_h1_swing_high) and (close_h1 <= prev_h1_swing_high * 1.002)
-    wick_ratio_short = (upper_wick_h1 / body_h1) if body_h1 > 0 else 0.0
-    is_resistance_reject = close_h1 <= prev_h1_swing_high
+    s_sweep = 15 if (is_sweep_low if direction == "LONG" else is_sweep_high) else 5
+    s_structure = 20 if (is_choch_bos_long if direction == "LONG" else is_choch_bos_short) else 10
+    s_vol = 10 if spot_vol_ratio >= 2.0 else (5 if spot_vol_ratio >= 1.5 else 2)
+    s_cvd = 15 if (taker_buy_pct >= 62.0 if direction == "LONG" else taker_buy_pct <= 38.0) else 5
+    s_oi = 10 if oi_30m_pct >= 0.50 else 3
+    s_h1 = 10 if (is_h1_reclaim_long if direction == "LONG" else is_h1_reclaim_short) else 4
+    s_btc = 5 if (btc_regime != "BEARISH" if direction == "LONG" else btc_regime != "BULLISH") else 0
+    s_rr = 10 if rr_ratio >= 2.5 else (5 if rr_ratio >= 1.8 else 0)
 
-    if is_short_sweep or (wick_ratio_short >= 1.4 and close_h1 <= open_h1) or pattern_dir == "SHORT":
-        s_sweep = 25 if is_short_sweep else 10
-        s_wick = 15 if wick_ratio_short >= 2.0 else (10 if wick_ratio_short >= 1.2 else 5)
-        s_reclaim = 15 if is_resistance_reject else 8
-        s_vol = 10 if vol_5m_ratio >= 2.0 else (6 if vol_5m_ratio >= 1.4 else 2)
-        s_oi = 10 if oi_pct_5m >= 1.0 else 5
-        s_cvd = 10 if taker_buy_pct <= 40.0 else 4
-        s_ema = 5 if (abs(close_h1 - ema34_h1[-1])/close_h1 < 0.012 or (ema89_h1 and abs(close_h1 - ema89_h1[-1])/close_h1 < 0.012)) else 2
-        s_rsi = 5 if 42.0 <= rsi_h1 <= 64.0 else 2
-        s_btc = 5 if funding < 0 else 3
+    total_score = s_sweep + s_structure + s_vol + s_cvd + s_oi + s_h1 + s_btc + s_rr + momentum_score
 
-        score_short = s_sweep + s_wick + s_reclaim + s_vol + s_oi + s_cvd + s_ema + s_rsi + s_btc
+    # --------------------------------------------------------------------------
+    # CHECK HARD FILTER CHO KÈO PREMIUM (TẮT TẤT CẢ TÍN HIỆU RÁC)
+    # --------------------------------------------------------------------------
+    is_premium_hard_filter = False
+    if direction == "LONG":
+        is_premium_hard_filter = (
+            is_sweep_low and 
+            is_choch_bos_long and 
+            is_h1_reclaim_long and 
+            cvd_bullish and 
+            spot_vol_ratio >= 2.0 and 
+            oi_30m_pct >= 0.50 and 
+            btc_regime != "BEARISH" and 
+            rr_ratio >= 2.5
+        )
+    else: # SHORT
+        is_premium_hard_filter = (
+            is_sweep_high and 
+            is_choch_bos_short and 
+            is_h1_reclaim_short and 
+            not cvd_bullish and 
+            spot_vol_ratio >= 2.0 and 
+            oi_30m_pct >= 0.50 and 
+            btc_regime != "BULLISH" and 
+            rr_ratio >= 2.5
+        )
 
-        if score_short >= 65:
-            return {
-                'symbol': sym,
-                'direction': 'SHORT',
-                'score': score_short,
-                'entry': curr_price,
-                'pattern': pattern_name if pattern_dir == "SHORT" else "Bearish Rejection",
-                'is_sweep': is_short_sweep,
-                'is_reclaim': is_resistance_reject,
-                'wick_ratio': wick_ratio_short,
-                'vol_5m_ratio': vol_5m_ratio,
-                'oi_pct': oi_pct_5m,
-                'taker_buy': taker_buy_pct,
-                'rsi_h1': rsi_h1,
-                'funding': funding,
-                'h1_timestamp': curr_h1['timestamp']
-            }
-
-    return None
+    return {
+        'symbol': sym,
+        'direction': direction,
+        'score': total_score,
+        'momentum_score': momentum_score,
+        'momentum_confirmed': momentum_confirmed,
+        'is_premium': is_premium_hard_filter,
+        'p_change_1h': p_change_1h,
+        'spot_vol_ratio': spot_vol_ratio,
+        'fut_vol_ratio': fut_vol_ratio,
+        'oi_30m_pct': oi_30m_pct,
+        'taker_buy_pct': taker_buy_pct,
+        'entry': close_h1,
+        'sl': sl_price,
+        'tp': tp_price,
+        'rr_ratio': rr_ratio,
+        'h1_timestamp': last_h1['timestamp']
+    }
 
 # ==============================================================================
-# TELEGRAM AUTOMATIC ALERT FORMATTER
+# 4. TELEGRAM ALERT FORMATTER
 # ==============================================================================
 
-def send_telegram_reversal_alert(sig, is_confirmed=False):
+def send_telegram_momentum_alert(sig):
     now_time = time.time()
     sym = sig['symbol']
     
     # Anti-spam Cooldown Logic
-    if not is_confirmed:
-        if sym in processed_alerts:
-            last_time, last_score = processed_alerts[sym]
-            if (now_time - last_time < COOLDOWN_ALERT_SECONDS) and (sig['score'] <= last_score + 8):
-                return
-        processed_alerts[sym] = (now_time, sig['score'])
+    if sym in processed_alerts:
+        last_time, last_score = processed_alerts[sym]
+        if (now_time - last_time < COOLDOWN_ALERT_SECONDS) and (sig['score'] <= last_score + 6):
+            return
+    processed_alerts[sym] = (now_time, sig['score'])
 
-    sweep_icon = "✅" if sig['is_sweep'] else "❌"
-    reclaim_icon = "✅" if sig['is_reclaim'] else "❌"
-    cvd_text = "BUY PRESSURE" if sig['taker_buy'] >= 58 else ("SELL PRESSURE" if sig['taker_buy'] <= 42 else "NEUTRAL")
+    mom_tag = "🚀 VERY HIGH MOMENTUM" if sig['momentum_score'] >= 12 else ("🔥 HIGH MOMENTUM" if sig['momentum_score'] >= 9 else "🟢 MODERATE MOMENTUM")
+    cvd_text = "BULLISH" if sig['taker_buy_pct'] >= 55.0 else "BEARISH"
+    confirmed_tag = " [MOMENTUM CONFIRMED]" if sig['momentum_confirmed'] else ""
 
-    header_title = f"✅ H1 CONFIRMED REVERSAL — {sig['direction']}" if is_confirmed else f"🔥 EARLY H1 REVERSAL"
+    header_title = f"🔥🔥 PREMIUM SETUP {confirmed_tag}" if sig['score'] >= 90 else f"🔥 HIGH CONFIDENCE SETUP"
 
     msg = f"""<b>{header_title}</b>
 
 🪙 <b>#{sig['symbol']}</b>
-⭐ <b>Score:</b> <code>{sig['score']}/100</code>
+⭐ <b>Total Score:</b> <code>{sig['score']}/100</code>
+⚡️ <b>Momentum Score:</b> <code>{sig['momentum_score']}/15</code> (<b>{mom_tag}</b>)
 🟢 <b>Direction:</b> <code>{sig['direction']}</code>
 
-🕯 <b>Pattern:</b> <code>{sig['pattern']}</code>
-🧲 <b>Liquidity Sweep:</b> {sweep_icon}
-📍 <b>Support/Resistance Reclaim:</b> {reclaim_icon}
-📊 <b>Volume 5M:</b> <code>{sig['vol_5m_ratio']:.1f}x</code>
-📈 <b>OI:</b> <code>{sig['oi_pct']:+.1f}%</code>
-💰 <b>CVD:</b> <code>{cvd_text}</code>
-📐 <b>EMA34:</b> NEAR / RECLAIM
-📊 <b>RSI H1:</b> <code>{sig['rsi_h1']:.1f} (Recovery)</code>
+📍 <b>Entry:</b> <code>{sig['entry']:.4f}</code>
+🛑 <b>Stop Loss:</b> <code>{sig['sl']:.4f}</code>
+🎯 <b>Take Profit:</b> <code>{sig['tp']:.4f}</code> (<b>RR 1:{sig['rr_ratio']:.1f}</b>)
 
-⚡️️ <b>EARLY — Check H1 ngay</b>"""
+📊 <b>FLOW & MOMENTUM METRICS:</b>
+• Price 1H: <code>{sig['p_change_1h']:+.2f}%</code>
+• Spot Volume: <code>{sig['spot_vol_ratio']:.2f}x</code>
+• Futures Volume: <code>{sig['fut_vol_ratio']:.2f}x</code>
+• OI 30m Change: <code>{sig['oi_30m_pct']:+.2f}%</code>
+• CVD Direction: <code>{cvd_text} ({sig['taker_buy_pct']:.0f}%)</code>
+
+⚠️ <i>Strict Risk Management Required. Check H1 Chart!</i>"""
 
     send_telegram_direct_message(msg)
-    print(f"✅ [AUTOMATIC ALERT SENT] {header_title} #{sig['symbol']} Score: {sig['score']}", flush=True)
+    print(f"✅ [ALERT SENT] {header_title} #{sig['symbol']} Score: {sig['score']} MomScore: {sig['momentum_score']}", flush=True)
 
 # ==============================================================================
-# MAIN AUTOMATIC SCAN ENGINE (2 TẦNG CHẠY LIÊN TỤC MỖI 5 PHÚT)
+# 5. AUTOMATIC RUNNER (QUÉT TỰ ĐỘNG MỖI 5 PHÚT)
 # ==============================================================================
 
-def run_automatic_2tier_scanner():
-    print("⚡️ Bắt đầu Luồng Auto Scanner 2 Tầng Chạy Liên Tục Mỗi 5 Phút...", flush=True)
+def run_automatic_momentum_scanner():
+    print("⚡️ Bắt đầu Luồng Momentum Engine Auto Scanner...", flush=True)
     while True:
         try:
-            start_time = time.time()
             all_tickers = get_all_bybit_crypto_symbols()
-            print(f"\n🔍 [AUTOMATIC SCANNER] Bắt đầu quét {len(all_tickers)} altcoins...", flush=True)
+            btc_regime = get_btc_regime_status()
+            print(f"\n🔍 [AUTOMATIC SCANNER] Đang rà soát {len(all_tickers)} altcoins...", flush=True)
 
-            # BƯỚC 1: Tầng 1 — Fast Scanner (Lọc Top 25 coin biến động nhất)
-            top25_candidates = execute_tier1_fast_scan(all_tickers)
-            print(f"🎯 [TẦNG 1] Lọc thành công Top {len(top25_candidates)} coin biến động nhất.", flush=True)
+            # Tầng 1: Lọc nhanh Top 30 coin biến động nhất
+            top30_candidates = sorted(all_tickers, key=lambda x: (x['price24hPcnt'] * 0.5 + (x['turnover24h']/1e7) * 0.5), reverse=True)[:TOP_TIER1_LIMIT]
 
-            # BƯỚC 2: Tầng 2 — Deep Reversal Engine (Chạy đa luồng phân tích sâu Top 25)
-            tier2_results = []
+            scanned_results = []
             with ThreadPoolExecutor(max_workers=12) as executor:
-                futures = [executor.submit(analyze_tier2_deep_reversal, t) for t in top25_candidates]
+                futures = [executor.submit(evaluate_setup_with_momentum, t, btc_regime) for t in top30_candidates]
                 for f in futures:
                     res = f.result()
                     if res:
-                        tier2_results.append(res)
+                        scanned_results.append(res)
 
-            # BƯỚC 3: Tự Động Xếp Hạng & Chọn Top 5 Tốt Nhất
-            tier2_results.sort(key=lambda x: x['score'], reverse=True)
-            top5_final = tier2_results[:TOP_TELEGRAM_REPORT_LIMIT]
+            # Lọc phân loại theo điểm Score & Quy tắc Telegram
+            for sig in scanned_results:
+                score = sig['score']
+                mom_score = sig['momentum_score']
 
-            elapsed = time.time() - start_time
-            print(f"✅ [TẦNG 2] Hoàn tất phân tích sâu trong {elapsed:.1f}s. Tìm thấy {len(top5_final)} setup đạt yêu cầu.", flush=True)
-
-            # BƯỚC 4: Tự Động Bắn Telegram (Không cần thao tác thủ công)
-            if top5_final:
-                for sig in top5_final:
-                    send_telegram_reversal_alert(sig, is_confirmed=False)
-            else:
-                print("🔎 Không có setup reversal đáng chú ý trong chu kỳ này.", flush=True)
+                if score >= 90 and sig['is_premium']:
+                    send_telegram_momentum_alert(sig) # PREMIUM
+                elif 85 <= score <= 89 and sig['rr_ratio'] >= 2.5:
+                    send_telegram_momentum_alert(sig) # HIGH CONFIDENCE
+                elif 80 <= score <= 84 and mom_score >= 9 and btc_regime != ("BEARISH" if sig['direction'] == "LONG" else "BULLISH"):
+                    send_telegram_momentum_alert(sig) # GOOD SETUP
 
         except Exception as e:
-            print(f"Lỗi Radar Loop: {e}", flush=True)
+            print(f"Lỗi Momentum Scanner Loop: {e}", flush=True)
 
-        print(f"⏳ Hoàn tất 1 chu kỳ 5M. Tạm nghỉ {SCAN_INTERVAL_SECONDS}s...", flush=True)
+        print(f"⏳ Hoàn tất 1 chu kỳ. Tạm nghỉ {SCAN_INTERVAL_SECONDS}s (5 phút)...", flush=True)
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
-    run_automatic_2tier_scanner()
+    run_automatic_momentum_scanner()

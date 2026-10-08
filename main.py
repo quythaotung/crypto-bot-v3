@@ -129,7 +129,7 @@ def calculate_ema(candles, period):
     return ema_values
 
 # ==============================================================================
-# 3. REVERSAL PATTERN DETECTOR
+# 3. ADVANCED REVERSAL & ACCUMULATION CANDLE DETECTOR
 # ==============================================================================
 
 def detect_h1_reversal_candle(h1_candles):
@@ -150,28 +150,34 @@ def detect_h1_reversal_candle(h1_candles):
 
     wick_ratio = (lower_wick1 / body1) if body1 > 0 else (lower_wick1 / range1 * 3)
 
-    if lower_wick1 >= 1.6 * body1 and cl1 >= l1 + (0.50 * range1):
-        return "Bullish Pin Bar", "LONG", wick_ratio
+    # 1. Bullish Pin Bar / Hammer (Chuẩn mẫu METUSDT)
+    if lower_wick1 >= 1.5 * body1 and cl1 >= l1 + (0.48 * range1):
+        return "Bullish Pin Bar / Hammer", "LONG", wick_ratio
 
-    if upper_wick1 >= 1.6 * body1 and cl1 <= l1 + (0.45 * range1):
+    # 2. Bearish Shooting Star / Pin Bar
+    if upper_wick1 >= 1.5 * body1 and cl1 <= l1 + (0.52 * range1):
         return "Bearish Pin Bar", "SHORT", (upper_wick1 / body1 if body1 > 0 else 2.0)
 
+    # 3. Bullish Engulfing
     if cl2 < o2 and cl1 > o1 and cl1 >= o2 and o1 <= cl2:
         return "Bullish Engulfing", "LONG", 1.5
 
+    # 4. Bearish Engulfing
     if cl2 > o2 and cl1 < o1 and cl1 <= o2 and o1 >= cl2:
         return "Bearish Engulfing", "SHORT", 1.5
 
+    # 5. Morning Star
     if cl3 < o3 and abs(cl2 - o2) < (abs(cl3 - o3) * 0.45) and cl1 > o1 and cl1 >= (o3 + cl3) / 2:
         return "Morning Star", "LONG", 1.8
 
+    # 6. Evening Star
     if cl3 > o3 and abs(cl2 - o2) < (abs(cl3 - o3) * 0.45) and cl1 < o1 and cl1 <= (o3 + cl3) / 2:
         return "Evening Star", "SHORT", 1.8
 
     return "None", None, 0.0
 
 # ==============================================================================
-# 4. DYNAMIC MULTI-SETUP EVALUATOR (NHẬN DIỆN 5 MÔ HÌNH BAY MẠNH)
+# 4. DYNAMIC MULTI-SETUP EVALUATOR (NHẬN DIỆN KÈO METUSDT & ĐA MÔ HÌNH)
 # ==============================================================================
 
 def evaluate_multi_setup_candidate(ticker_data):
@@ -206,7 +212,7 @@ def evaluate_multi_setup_candidate(ticker_data):
 
         pattern_name, pattern_dir, wick_ratio = detect_h1_reversal_candle(h1_candles)
 
-        # Volume Multipliers
+        # Volume Expansion
         vols_5m = [c['volume'] for c in m5_candles[-21:-1]]
         avg_vol_5m = np.mean(vols_5m) if vols_5m else 1.0
         vol_5m_ratio = float(last_5m['volume']) / avg_vol_5m if avg_vol_5m > 0 else 1.0
@@ -225,56 +231,51 @@ def evaluate_multi_setup_candidate(ticker_data):
         ema34 = calculate_ema(h1_candles, 34)
 
         # ----------------------------------------------------------------------
-        # KIỂM TRA 5 MÔ HÌNH BỨT PHÁ (DYNAMIC MULTI-SETUP DETECTOR)
+        # DYNAMIC SETUP DETECTOR
         # ----------------------------------------------------------------------
         setup_type = None
         direction = "LONG"
         score = 0
 
-        # MÔ HÌNH 1: SHORT SQUEEZE PUMP (Funding âm nặng + Vol + OI)
-        if funding <= -0.35 and vol_max_ratio >= 1.8 and taker_buy_pct >= 58.0 and oi_30m_pct >= 1.5:
+        # MÔ HÌNH 1: ACCUMULATION → EXPANSION (Kiểu METUSDT: Nén dẹp + Volume Surge)
+        if vol_max_ratio >= 2.5 and (is_break_res or pattern_dir == "LONG") and taker_buy_pct >= 55.0:
+            setup_type = "🔥 ACCUMULATION → EXPANSION (Kiểu MET)"
+            direction = "LONG"
+            score = 88
+
+        # MÔ HÌNH 2: SHORT SQUEEZE PUMP
+        elif funding <= -0.35 and vol_max_ratio >= 1.8 and taker_buy_pct >= 58.0 and oi_30m_pct >= 1.5:
             setup_type = "🚀 SHORT SQUEEZE PUMP"
             direction = "LONG"
             score = 90
 
-        # MÔ HÌNH 2: LIQUIDITY SWEEP REVERSAL (Quét đáy/đỉnh + Reclaim)
+        # MÔ HÌNH 3: LIQUIDITY SWEEP REVERSAL
         elif (is_sweep_low or is_rejection_low) and pattern_dir == "LONG":
             setup_type = "🧲 LIQUIDITY SWEEP REVERSAL"
             direction = "LONG"
-            score = 80 + (10 if vol_max_ratio >= 2.0 else 0)
+            score = 82 + (8 if vol_max_ratio >= 2.0 else 0)
         elif (is_sweep_high or is_rejection_high) and pattern_dir == "SHORT":
             setup_type = "🧲 LIQUIDITY SWEEP REVERSAL"
             direction = "SHORT"
-            score = 80 + (10 if vol_max_ratio >= 2.0 else 0)
+            score = 82 + (8 if vol_max_ratio >= 2.0 else 0)
 
-        # MÔ HÌNH 3: MOMENTUM BREAKOUT (Phá kháng cự + Volume bùng nổ)
-        elif is_break_res and vol_max_ratio >= 2.2 and taker_buy_pct >= 60.0:
+        # MÔ HÌNH 4: MOMENTUM BREAKOUT
+        elif is_break_res and vol_max_ratio >= 2.0 and taker_buy_pct >= 60.0:
             setup_type = "⚡️ MOMENTUM BREAKOUT"
             direction = "LONG"
-            score = 82
-        elif is_break_supp and vol_max_ratio >= 2.2 and taker_buy_pct <= 40.0:
-            setup_type = "⚡️ MOMENTUM BREAKOUT"
-            direction = "SHORT"
-            score = 82
+            score = 83
 
-        # MÔ HÌNH 4: ACCUMULATION → EXPANSION (Nén giá + OI bùng nổ)
-        elif oi_30m_pct >= 3.0 and vol_max_ratio >= 1.8 and taker_buy_pct >= 58.0:
-            setup_type = "🔥 ACCUMULATION → EXPANSION"
-            direction = "LONG"
-            score = 84
-
-        # MÔ HÌNH 5: PULLBACK CONTINUATION (Chạm EMA34 + Volume mua trở lại)
+        # MÔ HÌNH 5: PULLBACK CONTINUATION
         elif ema34 and abs(close_now - ema34[-1]) / close_now <= 0.008 and pattern_dir == "LONG" and vol_max_ratio >= 1.5:
             setup_type = "📈 PULLBACK CONTINUATION"
             direction = "LONG"
             score = 78
 
-        # LOẠI BỎ NẾU KHÔNG THỎA MÔ HÌNH NÀO
         if not setup_type:
             return {
                 'symbol': sym,
                 'score': 0,
-                'rejected_reason': "Không thuộc 5 mô hình bứt phá",
+                'rejected_reason': "Không thuộc mô hình bứt phá",
                 'is_sweep': False,
                 'has_candle': False,
                 'has_reclaim': False,
@@ -284,11 +285,11 @@ def evaluate_multi_setup_candidate(ticker_data):
 
         # Bổ sung điểm gia tăng
         if is_sweep_low or is_sweep_high: score += 5
-        if oi_30m_pct >= 2.0: score += 5
+        if oi_30m_pct >= 1.5: score += 5
 
         # CHẶN KÈO ĐÃ PUMP QUÁ XA (> 4.5%)
         p_change_from_low = abs(close_now - low_h1) / low_h1 * 100
-        if p_change_from_low >= 4.5 and "SQUEEZE" not in setup_type:
+        if p_change_from_low >= 4.5 and "EXPANSION" not in setup_type and "SQUEEZE" not in setup_type:
             return {
                 'symbol': sym,
                 'score': score,
@@ -306,7 +307,7 @@ def evaluate_multi_setup_candidate(ticker_data):
             'score': min(100, score),
             'is_eligible': True,
             'tier_title': setup_type,
-            'pattern': pattern_name if pattern_name != "None" else "Bứt phá dòng tiền",
+            'pattern': pattern_name if pattern_name != "None" else "Bứt phá dòng tiền H1",
             'is_sweep': is_sweep_low or is_sweep_high,
             'has_reclaim': close_h1 >= prev_swing_low if direction == "LONG" else close_h1 <= prev_swing_high,
             'vol_max_ratio': vol_max_ratio,
@@ -359,7 +360,7 @@ def run_automatic_adaptive_scanner():
     while True:
         try:
             all_tickers = get_all_bybit_crypto_symbols()
-            print(f"\n🔍 [SCANNER] Đang rà soát 5 mô hình bứt phá cho {len(all_tickers)} Altcoins...", flush=True)
+            print(f"\n🔍 [SCANNER] Đang rà soát mô hình bứt phá cho {len(all_tickers)} Altcoins...", flush=True)
 
             top_candidates = sorted(all_tickers, key=lambda x: (x['price24hPcnt'] * 0.5 + (x['turnover24h']/1e7) * 0.5), reverse=True)[:TOP_TIER1_LIMIT]
 
@@ -383,7 +384,7 @@ def run_automatic_adaptive_scanner():
                     if c['score'] == 0: continue
                     print(f"{idx}. {c['symbol']} | Score: {c['score']} | Setup: {c.get('tier_title')}", flush=True)
             else:
-                print("🔎 Chưa có coin nào đạt chuẩn trong 5 mô hình bứt phá.", flush=True)
+                print("🔎 Chưa có coin nào đạt chuẩn trong các mô hình bứt phá.", flush=True)
             
             print("==================================================\n", flush=True)
 

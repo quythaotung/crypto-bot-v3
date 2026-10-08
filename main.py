@@ -10,9 +10,9 @@ from flask import Flask
 # 1. CẤU HÌNH HỆ THỐNG DYNAMIC MULTI-SETUP SCANNER
 # ==============================================================================
 SCAN_INTERVAL_SECONDS = 300            # Quét tự động mỗi 5 phút (300 giây)
-MIN_FUTURES_TURNOVER_24H = 8_000_000   # Thanh khoản 24h >= $8M USD
-TOP_TIER1_LIMIT = 50                   # Lọc Top 50 coin biến động nhất ở Tầng 1
-TOP_TELEGRAM_REPORT_LIMIT = 3          # Tối đa gửi Top 1-3 tín hiệu mạnh nhất
+MIN_FUTURES_TURNOVER_24H = 5_000_000   # Quét các Altcoin có Turnover 24h >= $5M USD
+TOP_TIER1_LIMIT = 60                   # Lọc Top 60 coin biến động nhất ở Tầng 1
+TOP_TELEGRAM_REPORT_LIMIT = 3          # Tối đa gửi Top 1-3 tín hiệu mạnh nhất mỗi chu kỳ
 COOLDOWN_ALERT_SECONDS = 1800          # Cooldown 30 phút chống spam cùng 1 coin
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -40,7 +40,7 @@ def send_telegram_direct_message(text):
 
 BASE_URL = "https://api.bybit.com"
 
-# Safe float helper tránh sập do chuỗi rỗng ''
+# Safe float helper tránh sập luồng do Bybit trả về chuỗi rỗng ''
 def safe_float(val, default=0.0):
     try:
         if val is None or val == '':
@@ -161,28 +161,34 @@ def detect_h1_reversal_candle(h1_candles):
 
     wick_ratio = (lower_wick1 / body1) if body1 > 0 else (lower_wick1 / range1 * 3)
 
+    # 1. Bullish Pin Bar / Hammer (Chuẩn mẫu MET/ALGO)
     if lower_wick1 >= 1.5 * body1 and cl1 >= l1 + (0.48 * range1):
         return "Bullish Pin Bar / Hammer", "LONG", wick_ratio
 
+    # 2. Bearish Shooting Star / Pin Bar
     if upper_wick1 >= 1.5 * body1 and cl1 <= l1 + (0.52 * range1):
         return "Bearish Pin Bar", "SHORT", (upper_wick1 / body1 if body1 > 0 else 2.0)
 
+    # 3. Bullish Engulfing
     if cl2 < o2 and cl1 > o1 and cl1 >= o2 and o1 <= cl2:
         return "Bullish Engulfing", "LONG", 1.5
 
+    # 4. Bearish Engulfing
     if cl2 > o2 and cl1 < o1 and cl1 <= o2 and o1 >= cl2:
         return "Bearish Engulfing", "SHORT", 1.5
 
+    # 5. Morning Star
     if cl3 < o3 and abs(cl2 - o2) < (abs(cl3 - o3) * 0.45) and cl1 > o1 and cl1 >= (o3 + cl3) / 2:
         return "Morning Star", "LONG", 1.8
 
+    # 6. Evening Star
     if cl3 > o3 and abs(cl2 - o2) < (abs(cl3 - o3) * 0.45) and cl1 < o1 and cl1 <= (o3 + cl3) / 2:
         return "Evening Star", "SHORT", 1.8
 
     return "None", None, 0.0
 
 # ==============================================================================
-# 4. DYNAMIC MULTI-SETUP EVALUATOR (NHẬN DIỆN KÈO METUSDT & ĐA MÔ HÌNH)
+# 4. DYNAMIC MULTI-SETUP EVALUATOR (KÈO CHẤT LƯỢNG + HARD GATE LỰC BUY)
 # ==============================================================================
 
 def evaluate_multi_setup_candidate(ticker_data):
@@ -216,6 +222,7 @@ def evaluate_multi_setup_candidate(ticker_data):
 
         pattern_name, pattern_dir, wick_ratio = detect_h1_reversal_candle(h1_candles)
 
+        # Volume Multipliers
         vols_5m = [c['volume'] for c in m5_candles[-21:-1]]
         avg_vol_5m = np.mean(vols_5m) if vols_5m else 1.0
         vol_5m_ratio = float(last_5m['volume']) / avg_vol_5m if avg_vol_5m > 0 else 1.0
@@ -231,23 +238,26 @@ def evaluate_multi_setup_candidate(ticker_data):
 
         ema34 = calculate_ema(h1_candles, 34)
 
+        # ----------------------------------------------------------------------
+        # DYNAMIC SETUP DETECTOR (5 MÔ HÌNH BỨT PHÁ)
+        # ----------------------------------------------------------------------
         setup_type = None
         direction = "LONG"
         score = 0
 
         # MÔ HÌNH 1: ACCUMULATION → EXPANSION (Kiểu METUSDT)
-        if vol_max_ratio >= 2.5 and (is_break_res or pattern_dir == "LONG") and taker_buy_pct >= 55.0:
+        if vol_max_ratio >= 2.2 and (is_break_res or pattern_dir == "LONG") and taker_buy_pct >= 55.0:
             setup_type = "🔥 ACCUMULATION → EXPANSION"
             direction = "LONG"
             score = 88
 
-        # MÔ HÌNH 2: SHORT SQUEEZE PUMP
+        # MÔ HÌNH 2: SHORT SQUEEZE PUMP (Kiểu OGNUSDT)
         elif funding <= -0.35 and vol_max_ratio >= 1.8 and taker_buy_pct >= 58.0 and oi_30m_pct >= 1.5:
             setup_type = "🚀 SHORT SQUEEZE PUMP"
             direction = "LONG"
             score = 90
 
-        # MÔ HÌNH 3: LIQUIDITY SWEEP REVERSAL
+        # MÔ HÌNH 3: LIQUIDITY SWEEP REVERSAL (Kiểu ALGO/WUSDT)
         elif (is_sweep_low or is_rejection_low) and pattern_dir == "LONG":
             setup_type = "🧲 LIQUIDITY SWEEP REVERSAL"
             direction = "LONG"
@@ -281,9 +291,42 @@ def evaluate_multi_setup_candidate(ticker_data):
                 'has_cvd': False
             }
 
+        # ----------------------------------------------------------------------
+        # HARD GATE: LỌC TRIỆT ĐỂ CÁC KÈO YẾU LỰC (NHƯ SUI)
+        # ----------------------------------------------------------------------
+        is_green_candle = close_h1 > open_h1
+        is_strong_wick = (min(open_h1, close_h1) - low_h1) >= 0.35 * (high_h1 - low_h1)
+
+        if direction == "LONG" and "SQUEEZE" not in setup_type:
+            # 1. Bắt buộc Volume phải có sự bùng nổ (Loại nến kiệt Volume)
+            if vol_max_ratio < 1.6:
+                return {
+                    'symbol': sym,
+                    'score': 0,
+                    'rejected_reason': "Volume quá yếu (< 1.6x)",
+                    'is_sweep': is_sweep_low,
+                    'has_candle': False,
+                    'has_reclaim': False,
+                    'has_vol': False,
+                    'has_cvd': False
+                }
+            # 2. Bắt buộc H1 phải đóng xanh HOẶC có rút chân rõ (Loại nến đỏ gập xả dốc)
+            if not (is_green_candle or is_strong_wick or pattern_dir == "LONG"):
+                return {
+                    'symbol': sym,
+                    'score': 0,
+                    'rejected_reason': "Nến H1 đỏ gập, chưa có lực rút chân",
+                    'is_sweep': is_sweep_low,
+                    'has_candle': False,
+                    'has_reclaim': False,
+                    'has_vol': False,
+                    'has_cvd': False
+                }
+
         if is_sweep_low or is_sweep_high: score += 5
         if oi_30m_pct >= 1.5: score += 5
 
+        # CHẶN KÈO ĐÃ PUMP QUÁ XA (> 4.5%)
         p_change_from_low = abs(close_now - low_h1) / low_h1 * 100
         if p_change_from_low >= 4.5 and "EXPANSION" not in setup_type and "SQUEEZE" not in setup_type:
             return {

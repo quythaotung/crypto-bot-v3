@@ -40,6 +40,15 @@ def send_telegram_direct_message(text):
 
 BASE_URL = "https://api.bybit.com"
 
+# Safe float helper tránh sập do chuỗi rỗng ''
+def safe_float(val, default=0.0):
+    try:
+        if val is None or val == '':
+            return default
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 # ==============================================================================
 # 2. API DATA HELPERS (BYBIT API V5)
 # ==============================================================================
@@ -55,10 +64,12 @@ def get_all_bybit_crypto_symbols():
                           'NVDA', 'TSLA', 'AAPL', 'AMZN', 'META', 'MSFT', 'GOOGL', 'NFLX', '3L', '3S']
             parsed_list = []
             for t in tickers:
-                sym = t['symbol']
-                turnover = float(t.get('turnover24h', 0))
-                price_change = float(t.get('price24hPcnt', 0)) * 100
-                funding_rate = float(t.get('fundingRate', 0)) * 100
+                sym = t.get('symbol', '')
+                turnover = safe_float(t.get('turnover24h', 0))
+                price_change = safe_float(t.get('price24hPcnt', 0)) * 100
+                funding_rate = safe_float(t.get('fundingRate', 0)) * 100
+                last_price = safe_float(t.get('lastPrice', 0))
+
                 if sym.endswith('USDT') and not sym.startswith(('USDC', 'BUSD', 'DAI')) and turnover >= MIN_FUTURES_TURNOVER_24H:
                     if not any(k in sym for k in non_crypto):
                         parsed_list.append({
@@ -66,7 +77,7 @@ def get_all_bybit_crypto_symbols():
                             'turnover24h': turnover,
                             'price24hPcnt': price_change,
                             'fundingRate': funding_rate,
-                            'lastPrice': float(t.get('lastPrice', 0))
+                            'lastPrice': last_price
                         })
             return parsed_list
     except Exception as e:
@@ -83,11 +94,11 @@ def get_klines(symbol, interval, category="linear", limit=35):
             for c in reversed(raw_list):
                 parsed.append({
                     'timestamp': int(c[0]),
-                    'open': float(c[1]),
-                    'high': float(c[2]),
-                    'low': float(c[3]),
-                    'close': float(c[4]),
-                    'volume': float(c[5])
+                    'open': safe_float(c[1]),
+                    'high': safe_float(c[2]),
+                    'low': safe_float(c[3]),
+                    'close': safe_float(c[4]),
+                    'volume': safe_float(c[5])
                 })
             return parsed
     except Exception:
@@ -101,8 +112,8 @@ def get_open_interest_pct_30m(symbol):
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             oi_list = res["result"]["list"]
             if len(oi_list) >= 2:
-                curr_oi = float(oi_list[0]["openInterest"])
-                prev_oi = float(oi_list[1]["openInterest"])
+                curr_oi = safe_float(oi_list[0].get("openInterest", 0))
+                prev_oi = safe_float(oi_list[1].get("openInterest", 0))
                 return ((curr_oi - prev_oi) / prev_oi) * 100 if prev_oi > 0 else 0.0
     except Exception:
         pass
@@ -113,7 +124,7 @@ def get_taker_buy_pct_5m(symbol):
     try:
         res = requests.get(url, timeout=4).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
-            return float(res["result"]["list"][0].get("buyRatio", 0.5)) * 100
+            return safe_float(res["result"]["list"][0].get("buyRatio", 0.5)) * 100
     except Exception:
         pass
     return 50.0
@@ -150,27 +161,21 @@ def detect_h1_reversal_candle(h1_candles):
 
     wick_ratio = (lower_wick1 / body1) if body1 > 0 else (lower_wick1 / range1 * 3)
 
-    # 1. Bullish Pin Bar / Hammer (Chuẩn mẫu METUSDT)
     if lower_wick1 >= 1.5 * body1 and cl1 >= l1 + (0.48 * range1):
         return "Bullish Pin Bar / Hammer", "LONG", wick_ratio
 
-    # 2. Bearish Shooting Star / Pin Bar
     if upper_wick1 >= 1.5 * body1 and cl1 <= l1 + (0.52 * range1):
         return "Bearish Pin Bar", "SHORT", (upper_wick1 / body1 if body1 > 0 else 2.0)
 
-    # 3. Bullish Engulfing
     if cl2 < o2 and cl1 > o1 and cl1 >= o2 and o1 <= cl2:
         return "Bullish Engulfing", "LONG", 1.5
 
-    # 4. Bearish Engulfing
     if cl2 > o2 and cl1 < o1 and cl1 <= o2 and o1 >= cl2:
         return "Bearish Engulfing", "SHORT", 1.5
 
-    # 5. Morning Star
     if cl3 < o3 and abs(cl2 - o2) < (abs(cl3 - o3) * 0.45) and cl1 > o1 and cl1 >= (o3 + cl3) / 2:
         return "Morning Star", "LONG", 1.8
 
-    # 6. Evening Star
     if cl3 > o3 and abs(cl2 - o2) < (abs(cl3 - o3) * 0.45) and cl1 < o1 and cl1 <= (o3 + cl3) / 2:
         return "Evening Star", "SHORT", 1.8
 
@@ -200,7 +205,6 @@ def evaluate_multi_setup_candidate(ticker_data):
         prev_swing_low = min([c['low'] for c in h1_candles[-8:-1]])
         prev_swing_high = max([c['high'] for c in h1_candles[-8:-1]])
 
-        # Structural Signals
         is_sweep_low = (low_h1 < prev_swing_low) and (close_h1 >= prev_swing_low * 0.998)
         is_sweep_high = (high_h1 > prev_swing_high) and (close_h1 <= prev_swing_high * 1.002)
         
@@ -212,7 +216,6 @@ def evaluate_multi_setup_candidate(ticker_data):
 
         pattern_name, pattern_dir, wick_ratio = detect_h1_reversal_candle(h1_candles)
 
-        # Volume Expansion
         vols_5m = [c['volume'] for c in m5_candles[-21:-1]]
         avg_vol_5m = np.mean(vols_5m) if vols_5m else 1.0
         vol_5m_ratio = float(last_5m['volume']) / avg_vol_5m if avg_vol_5m > 0 else 1.0
@@ -223,23 +226,18 @@ def evaluate_multi_setup_candidate(ticker_data):
 
         vol_max_ratio = max(vol_5m_ratio, vol_h1_ratio)
 
-        # Orderflow
         taker_buy_pct = get_taker_buy_pct_5m(sym)
         oi_30m_pct = get_open_interest_pct_30m(sym)
 
-        # Indicators
         ema34 = calculate_ema(h1_candles, 34)
 
-        # ----------------------------------------------------------------------
-        # DYNAMIC SETUP DETECTOR
-        # ----------------------------------------------------------------------
         setup_type = None
         direction = "LONG"
         score = 0
 
-        # MÔ HÌNH 1: ACCUMULATION → EXPANSION (Kiểu METUSDT: Nén dẹp + Volume Surge)
+        # MÔ HÌNH 1: ACCUMULATION → EXPANSION (Kiểu METUSDT)
         if vol_max_ratio >= 2.5 and (is_break_res or pattern_dir == "LONG") and taker_buy_pct >= 55.0:
-            setup_type = "🔥 ACCUMULATION → EXPANSION (Kiểu MET)"
+            setup_type = "🔥 ACCUMULATION → EXPANSION"
             direction = "LONG"
             score = 88
 
@@ -283,11 +281,9 @@ def evaluate_multi_setup_candidate(ticker_data):
                 'has_cvd': False
             }
 
-        # Bổ sung điểm gia tăng
         if is_sweep_low or is_sweep_high: score += 5
         if oi_30m_pct >= 1.5: score += 5
 
-        # CHẶN KÈO ĐÃ PUMP QUÁ XA (> 4.5%)
         p_change_from_low = abs(close_now - low_h1) / low_h1 * 100
         if p_change_from_low >= 4.5 and "EXPANSION" not in setup_type and "SQUEEZE" not in setup_type:
             return {

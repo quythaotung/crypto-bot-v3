@@ -11,7 +11,7 @@ from flask import Flask
 # CONFIGURATION - ADAPTIVE PRICE ACTION REVERSAL ENGINE & DEBUG SCANNER
 # ==============================================================================
 SCAN_INTERVAL_SECONDS = 300            # Quét tự động mỗi 5 phút (300 giây)
-MIN_FUTURES_TURNOVER_24H = 8_000_000   # Thanh khoản 24h tối thiểu >= $8M USD
+MIN_FUTURES_TURNOVER_24H = 5_000_000   # Thanh khoản 24h tối thiểu >= $5M USD
 TOP_TIER1_LIMIT = 40                   # Tầng 1 lọc Top 40 coin biến động nhất
 TOP_TELEGRAM_REPORT_LIMIT = 3          # Chỉ gửi tối đa Top 1-3 tín hiệu mạnh nhất
 COOLDOWN_ALERT_SECONDS = 1800          # Cooldown 30 phút chống spam cùng 1 coin
@@ -214,8 +214,6 @@ def detect_h1_reversal_candle(h1_candles):
 def evaluate_adaptive_reversal_candidate(ticker_data):
     try:
         sym = ticker_data['symbol']
-        funding = ticker_data['fundingRate']
-
         h1_candles = get_klines(sym, "60", category="linear", limit=35)
         m5_candles = get_klines(sym, "5", category="linear", limit=25)
 
@@ -242,7 +240,7 @@ def evaluate_adaptive_reversal_candidate(ticker_data):
         # 2. REVERSAL CANDLE
         pattern_name, pattern_dir, wick_ratio = detect_h1_reversal_candle(h1_candles)
 
-        # BẮT BUỘC (CORE REQUIREMENT 1): Phải có Price Action Reversal (Sweep/Rejection + Candle)
+        # BẮT BUỘC (CORE REQUIREMENT): Phải có Price Action Reversal (Sweep/Rejection + Candle)
         has_long_pa = (is_sweep_low or is_rejection_low) and (pattern_dir == "LONG")
         has_short_pa = (is_sweep_high or is_rejection_high) and (pattern_dir == "SHORT")
 
@@ -330,8 +328,6 @@ def evaluate_adaptive_reversal_candidate(ticker_data):
             }
 
         # ĐIỀU KIỆN PHÂN LOẠI & DUYỆT TÍN HIỆU (GỬI TELEGRAM)
-        # Score 75-79: Chỉ gửi nếu có CẢ Sweep VÀ Candle
-        # Score >= 80: ĐỦ ĐIỀU KIỆN STRONG REVERSAL
         is_eligible = False
         rejected_reason = ""
 
@@ -345,7 +341,7 @@ def evaluate_adaptive_reversal_candidate(ticker_data):
         else:
             rejected_reason = f"Score < 75 (Score = {score})"
 
-        tier_title = "🚀 EXTREME REVERSAL" if score >= 90 else ("🔥 STRONG REVERSAL" if score >= 85 else "🚨 STRONG H1 REVERSAL")
+        tier_title = "🚀 EXTREME REVERSAL" if score >= 90 else ("🔥 VERY STRONG REVERSAL" if score >= 85 else "🚨 STRONG REVERSAL")
 
         return {
             'symbol': sym,
@@ -430,7 +426,7 @@ def run_automatic_adaptive_scanner():
             scanned_results.sort(key=lambda x: x['score'], reverse=True)
 
             # ------------------------------------------------------------------
-            # PRINT DEBUG LOGS TOP 10 CANDIDATES TRÊN RENDER (THEO YÊU CẦU QUAN TRỌNG)
+            # PRINT DEBUG LOGS TOP 10 CANDIDATES TRÊN RENDER
             # ------------------------------------------------------------------
             print("\n==================================================", flush=True)
             print("📋 TOP REVERSAL CANDIDATES (DEBUG LOG)", flush=True)
@@ -446,7 +442,7 @@ def run_automatic_adaptive_scanner():
                     vol_str = "YES" if c['has_vol'] else "NO"
                     cvd_str = "YES" if c['has_cvd'] else "NO"
                     
-                    print(f"{idx}. {c['symbol']} Score: {c['score']}", flush=True)
+                    print(f"{idx}. {c['symbol']} {c['score']}", flush=True)
                     print(f"   Sweep: {sweep_str} | Candle: {candle_str} | Reclaim: {reclaim_str} | Volume: {vol_str} | CVD: {cvd_str}", flush=True)
                     if not c.get('is_eligible'):
                         print(f"   ❌ Rejected reason: {c.get('rejected_reason')}", flush=True)

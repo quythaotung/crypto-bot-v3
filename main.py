@@ -1,42 +1,36 @@
 import os
 import time
-import json
 import requests
 import numpy as np
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask
 
 # ==============================================================================
-# 1. CẤU HÌNH HỆ THỐNG & ĐIỀU KIỆN LỌC (CONFIGURATIONS)
+# 1. CẤU HÌNH HỆ THỐNG DYNAMIC MULTI-SETUP SCANNER
 # ==============================================================================
 SCAN_INTERVAL_SECONDS = 300            # Quét tự động mỗi 5 phút (300 giây)
-MIN_FUTURES_TURNOVER_24H = 8_000_000   # Lọc Altcoin thanh khoản 24h >= $8M USD
+MIN_FUTURES_TURNOVER_24H = 8_000_000   # Thanh khoản 24h >= $8M USD
 TOP_TIER1_LIMIT = 50                   # Lọc Top 50 coin biến động nhất ở Tầng 1
-TOP_TELEGRAM_REPORT_LIMIT = 3          # Tối đa gửi Top 1-3 tín hiệu mạnh nhất mỗi chu kỳ
+TOP_TELEGRAM_REPORT_LIMIT = 3          # Tối đa gửi Top 1-3 tín hiệu mạnh nhất
 COOLDOWN_ALERT_SECONDS = 1800          # Cooldown 30 phút chống spam cùng 1 coin
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
-MIN_ALERT_SCORE = 75                   # Ngưỡng Score tối thiểu để duyệt gửi Alert
-
-processed_alerts = {}                  # Lưu cooldown & score gần nhất
+processed_alerts = {}
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Futures High-Probability & Short Squeeze Scanner Active 24/7!"
+    return "Bybit Dynamic Multi-Setup Engine Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 def send_telegram_direct_message(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("[WARN] Chưa cấu hình BOT_TOKEN hoặc CHAT_ID!", flush=True)
-        return
+    if not BOT_TOKEN or not CHAT_ID: return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
@@ -56,12 +50,9 @@ def get_all_bybit_crypto_symbols():
         res = requests.get(url, timeout=6).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             tickers = res["result"]["list"]
-            non_crypto_keywords = [
-                'XAU', 'XAG', 'WTI', 'USOIL', 'BRENT', 'COPPER', 'SILVER', 'GOLD',
-                'QQQ', 'SPCX', 'SPY', 'DIA', 'IWM', 'TLT', 'NDX', 'SPX',
-                'NVDA', 'TSLA', 'AAPL', 'AMZN', 'META', 'MSFT', 'GOOGL', 'NFLX', 'AMD', 'INTC',
-                '3L', '3S', '2L', '2S'
-            ]
+            non_crypto = ['XAU', 'XAG', 'WTI', 'USOIL', 'BRENT', 'COPPER', 'SILVER', 'GOLD',
+                          'QQQ', 'SPCX', 'SPY', 'DIA', 'IWM', 'TLT', 'NDX', 'SPX',
+                          'NVDA', 'TSLA', 'AAPL', 'AMZN', 'META', 'MSFT', 'GOOGL', 'NFLX', '3L', '3S']
             parsed_list = []
             for t in tickers:
                 sym = t['symbol']
@@ -69,7 +60,7 @@ def get_all_bybit_crypto_symbols():
                 price_change = float(t.get('price24hPcnt', 0)) * 100
                 funding_rate = float(t.get('fundingRate', 0)) * 100
                 if sym.endswith('USDT') and not sym.startswith(('USDC', 'BUSD', 'DAI')) and turnover >= MIN_FUTURES_TURNOVER_24H:
-                    if not any(k in sym for k in non_crypto_keywords):
+                    if not any(k in sym for k in non_crypto):
                         parsed_list.append({
                             'symbol': sym,
                             'turnover24h': turnover,
@@ -137,28 +128,8 @@ def calculate_ema(candles, period):
         ema_values.append(new_ema)
     return ema_values
 
-def calculate_rsi(candles, period=14):
-    if len(candles) < period + 1: return []
-    closes = [c['close'] for c in candles]
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i-1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-    
-    rsi_values = []
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    rsi_values.append(100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
-        
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rsi_values.append(100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
-    return rsi_values
-
 # ==============================================================================
-# 3. PATTERN DETECTOR
+# 3. REVERSAL PATTERN DETECTOR
 # ==============================================================================
 
 def detect_h1_reversal_candle(h1_candles):
@@ -182,7 +153,7 @@ def detect_h1_reversal_candle(h1_candles):
     if lower_wick1 >= 1.6 * body1 and cl1 >= l1 + (0.50 * range1):
         return "Bullish Pin Bar", "LONG", wick_ratio
 
-    if upper_wick1 >= 1.6 * body1 and cl1 <= l1 + (0.50 * range1):
+    if upper_wick1 >= 1.6 * body1 and cl1 <= l1 + (0.45 * range1):
         return "Bearish Pin Bar", "SHORT", (upper_wick1 / body1 if body1 > 0 else 2.0)
 
     if cl2 < o2 and cl1 > o1 and cl1 >= o2 and o1 <= cl2:
@@ -200,10 +171,10 @@ def detect_h1_reversal_candle(h1_candles):
     return "None", None, 0.0
 
 # ==============================================================================
-# 4. MULTI-SETUP EVALUATOR (REVERSAL & SHORT SQUEEZE PUMP ENGINE)
+# 4. DYNAMIC MULTI-SETUP EVALUATOR (NHẬN DIỆN 5 MÔ HÌNH BAY MẠNH)
 # ==============================================================================
 
-def evaluate_adaptive_reversal_candidate(ticker_data):
+def evaluate_multi_setup_candidate(ticker_data):
     try:
         sym = ticker_data['symbol']
         funding = ticker_data['fundingRate']
@@ -223,15 +194,19 @@ def evaluate_adaptive_reversal_candidate(ticker_data):
         prev_swing_low = min([c['low'] for c in h1_candles[-8:-1]])
         prev_swing_high = max([c['high'] for c in h1_candles[-8:-1]])
 
+        # Structural Signals
         is_sweep_low = (low_h1 < prev_swing_low) and (close_h1 >= prev_swing_low * 0.998)
         is_sweep_high = (high_h1 > prev_swing_high) and (close_h1 <= prev_swing_high * 1.002)
         
         is_rejection_low = (low_h1 <= prev_swing_low * 1.003) and (close_h1 > low_h1 + (high_h1 - low_h1) * 0.4)
         is_rejection_high = (high_h1 >= prev_swing_high * 0.997) and (close_h1 < high_h1 - (high_h1 - low_h1) * 0.4)
 
+        is_break_res = close_now > prev_swing_high
+        is_break_supp = close_now < prev_swing_low
+
         pattern_name, pattern_dir, wick_ratio = detect_h1_reversal_candle(h1_candles)
 
-        # Volume Expansion
+        # Volume Multipliers
         vols_5m = [c['volume'] for c in m5_candles[-21:-1]]
         avg_vol_5m = np.mean(vols_5m) if vols_5m else 1.0
         vol_5m_ratio = float(last_5m['volume']) / avg_vol_5m if avg_vol_5m > 0 else 1.0
@@ -241,29 +216,65 @@ def evaluate_adaptive_reversal_candidate(ticker_data):
         vol_h1_ratio = float(last_h1['volume']) / avg_vol_h1 if avg_vol_h1 > 0 else 1.0
 
         vol_max_ratio = max(vol_5m_ratio, vol_h1_ratio)
-        has_vol = vol_max_ratio >= 1.5
 
-        # Orderflow (CVD & OI)
+        # Orderflow
         taker_buy_pct = get_taker_buy_pct_5m(sym)
         oi_30m_pct = get_open_interest_pct_30m(sym)
 
-        # ----------------------------------------------------------------------
-        # MODULE A: SPECIAL SHORT SQUEEZE / ACCUMULATION PUMP DETECTOR
-        # (Chuyên bắt sớm những con như OGN / WUSDT trước khi dựng cột)
-        # ----------------------------------------------------------------------
-        is_short_squeeze_setup = False
-        if funding <= -0.35 and vol_max_ratio >= 2.0 and taker_buy_pct >= 58.0 and oi_30m_pct >= 2.0:
-            is_short_squeeze_setup = True
+        # Indicators
+        ema34 = calculate_ema(h1_candles, 34)
 
-        # PA Alignment Check
-        has_long_pa = (is_sweep_low or is_rejection_low) and (pattern_dir == "LONG")
-        has_short_pa = (is_sweep_high or is_rejection_high) and (pattern_dir == "SHORT")
+        # ----------------------------------------------------------------------
+        # KIỂM TRA 5 MÔ HÌNH BỨT PHÁ (DYNAMIC MULTI-SETUP DETECTOR)
+        # ----------------------------------------------------------------------
+        setup_type = None
+        direction = "LONG"
+        score = 0
 
-        if not (has_long_pa or has_short_pa or is_short_squeeze_setup):
+        # MÔ HÌNH 1: SHORT SQUEEZE PUMP (Funding âm nặng + Vol + OI)
+        if funding <= -0.35 and vol_max_ratio >= 1.8 and taker_buy_pct >= 58.0 and oi_30m_pct >= 1.5:
+            setup_type = "🚀 SHORT SQUEEZE PUMP"
+            direction = "LONG"
+            score = 90
+
+        # MÔ HÌNH 2: LIQUIDITY SWEEP REVERSAL (Quét đáy/đỉnh + Reclaim)
+        elif (is_sweep_low or is_rejection_low) and pattern_dir == "LONG":
+            setup_type = "🧲 LIQUIDITY SWEEP REVERSAL"
+            direction = "LONG"
+            score = 80 + (10 if vol_max_ratio >= 2.0 else 0)
+        elif (is_sweep_high or is_rejection_high) and pattern_dir == "SHORT":
+            setup_type = "🧲 LIQUIDITY SWEEP REVERSAL"
+            direction = "SHORT"
+            score = 80 + (10 if vol_max_ratio >= 2.0 else 0)
+
+        # MÔ HÌNH 3: MOMENTUM BREAKOUT (Phá kháng cự + Volume bùng nổ)
+        elif is_break_res and vol_max_ratio >= 2.2 and taker_buy_pct >= 60.0:
+            setup_type = "⚡️ MOMENTUM BREAKOUT"
+            direction = "LONG"
+            score = 82
+        elif is_break_supp and vol_max_ratio >= 2.2 and taker_buy_pct <= 40.0:
+            setup_type = "⚡️ MOMENTUM BREAKOUT"
+            direction = "SHORT"
+            score = 82
+
+        # MÔ HÌNH 4: ACCUMULATION → EXPANSION (Nén giá + OI bùng nổ)
+        elif oi_30m_pct >= 3.0 and vol_max_ratio >= 1.8 and taker_buy_pct >= 58.0:
+            setup_type = "🔥 ACCUMULATION → EXPANSION"
+            direction = "LONG"
+            score = 84
+
+        # MÔ HÌNH 5: PULLBACK CONTINUATION (Chạm EMA34 + Volume mua trở lại)
+        elif ema34 and abs(close_now - ema34[-1]) / close_now <= 0.008 and pattern_dir == "LONG" and vol_max_ratio >= 1.5:
+            setup_type = "📈 PULLBACK CONTINUATION"
+            direction = "LONG"
+            score = 78
+
+        # LOẠI BỎ NẾU KHÔNG THỎA MÔ HÌNH NÀO
+        if not setup_type:
             return {
                 'symbol': sym,
                 'score': 0,
-                'rejected_reason': "No Price Action or Squeeze Setup",
+                'rejected_reason': "Không thuộc 5 mô hình bứt phá",
                 'is_sweep': False,
                 'has_candle': False,
                 'has_reclaim': False,
@@ -271,81 +282,33 @@ def evaluate_adaptive_reversal_candidate(ticker_data):
                 'has_cvd': False
             }
 
-        direction = "LONG" if (has_long_pa or is_short_squeeze_setup) else "SHORT"
-        is_reclaim = (close_h1 >= prev_swing_low) if direction == "LONG" else (close_h1 <= prev_swing_high)
-        has_cvd = (taker_buy_pct >= 54.0) if direction == "LONG" else (taker_buy_pct <= 46.0)
+        # Bổ sung điểm gia tăng
+        if is_sweep_low or is_sweep_high: score += 5
+        if oi_30m_pct >= 2.0: score += 5
 
-        # ----------------------------------------------------------------------
-        # ADAPTIVE SCORING (MAX 100 PTS)
-        # ----------------------------------------------------------------------
-        score = 0
-        is_sweep = is_sweep_low if direction == "LONG" else is_sweep_high
-
-        if is_sweep: score += 25
-        elif (is_rejection_low if direction == "LONG" else is_rejection_high): score += 18
-
-        if pattern_dir: score += 20
-        if is_reclaim: score += 15
-
-        if wick_ratio >= 2.0: score += 10
-        elif wick_ratio >= 1.3: score += 5
-
-        if vol_max_ratio >= 2.5: score += 10
-        elif vol_max_ratio >= 1.5: score += 6
-
-        if (direction == "LONG" and taker_buy_pct >= 60.0) or (direction == "SHORT" and taker_buy_pct <= 40.0): score += 10
-        elif has_cvd: score += 5
-
-        if oi_30m_pct >= 3.0: score += 10
-        elif oi_30m_pct >= 1.0: score += 5
-
-        # Thưởng điểm cho Short Squeeze
-        if is_short_squeeze_setup:
-            score = max(score, 88)
-            pattern_name = f"SHORT SQUEEZE PUMP (Funding: {funding:.2f}%)"
-
-        # OVEREXTENDED CHECK (> 4.5% từ điểm Reversal)
-        p_change_from_sweep = abs(close_now - (low_h1 if direction == "LONG" else high_h1)) / (low_h1 if direction == "LONG" else high_h1) * 100
-        if p_change_from_sweep >= 4.5 and not is_short_squeeze_setup:
+        # CHẶN KÈO ĐÃ PUMP QUÁ XA (> 4.5%)
+        p_change_from_low = abs(close_now - low_h1) / low_h1 * 100
+        if p_change_from_low >= 4.5 and "SQUEEZE" not in setup_type:
             return {
                 'symbol': sym,
                 'score': score,
-                'rejected_reason': "Pumped/Dumped too far (>4.5% from reversal)",
-                'is_sweep': is_sweep,
+                'rejected_reason': "Giá đã bay quá xa (>4.5%)",
+                'is_sweep': is_sweep_low or is_sweep_high,
                 'has_candle': True,
-                'has_reclaim': is_reclaim,
-                'has_vol': has_vol,
-                'has_cvd': has_cvd
+                'has_reclaim': True,
+                'has_vol': True,
+                'has_cvd': True
             }
-
-        is_eligible = False
-        rejected_reason = ""
-
-        if score >= 80 or is_short_squeeze_setup:
-            is_eligible = True
-        elif 75 <= score <= 79:
-            if is_sweep and pattern_dir:
-                is_eligible = True
-            else:
-                rejected_reason = "Score 75-79 missing Liquidity Sweep"
-        else:
-            rejected_reason = f"Score < 75 (Score = {score})"
-
-        tier_title = "🚀 EXTREME SHORT SQUEEZE" if is_short_squeeze_setup else ("🔥 VERY STRONG REVERSAL" if score >= 85 else "🚨 STRONG REVERSAL")
 
         return {
             'symbol': sym,
             'direction': direction,
-            'score': score,
-            'is_eligible': is_eligible,
-            'rejected_reason': rejected_reason,
-            'tier_title': tier_title,
-            'pattern': pattern_name if pattern_name else "Price Action Alignment",
-            'is_sweep': is_sweep,
-            'has_candle': True if pattern_dir else False,
-            'has_reclaim': is_reclaim,
-            'has_vol': has_vol,
-            'has_cvd': has_cvd,
+            'score': min(100, score),
+            'is_eligible': True,
+            'tier_title': setup_type,
+            'pattern': pattern_name if pattern_name != "None" else "Bứt phá dòng tiền",
+            'is_sweep': is_sweep_low or is_sweep_high,
+            'has_reclaim': close_h1 >= prev_swing_low if direction == "LONG" else close_h1 <= prev_swing_high,
             'vol_max_ratio': vol_max_ratio,
             'oi_30m_pct': oi_30m_pct,
             'taker_buy_pct': taker_buy_pct,
@@ -356,7 +319,7 @@ def evaluate_adaptive_reversal_candidate(ticker_data):
         return None
 
 # ==============================================================================
-# 5. TELEGRAM ALERT FORMATTER
+# 5. TELEGRAM ALERT FORMATTER & AUTOMATIC LOOP
 # ==============================================================================
 
 def send_telegram_reversal_alert(sig):
@@ -371,43 +334,38 @@ def send_telegram_reversal_alert(sig):
 
     sweep_icon = "✅" if sig['is_sweep'] else "❌"
     reclaim_icon = "✅" if sig['has_reclaim'] else "❌"
-    cvd_icon = "Buy ✅" if sig['direction'] == "LONG" and sig['has_cvd'] else ("Sell ✅" if sig['has_cvd'] else "Neutral")
 
-    msg = f"""🚨 <b>{sig['tier_title']}</b>
+    msg = f"""<b>{sig['tier_title']}</b>
 
 #<b>{sig['symbol']}</b>
-Score: <b>{sig['score']}/100</b>
-Direction: <b>{sig['direction']}</b>
+⭐ Score: <b>{sig['score']}/100</b>
+🟢 Direction: <b>{sig['direction']}</b>
 
-🕯 <b>{sig['pattern']}</b>
-🧲 <b>Liquidity Sweep:</b> {sweep_icon}
-📍 <b>Support Reclaim:</b> {reclaim_icon}
-📊 <b>Volume:</b> <code>{sig['vol_max_ratio']:.1f}x</code>
-💰 <b>CVD:</b> <code>{cvd_icon} ({sig['taker_buy_pct']:.0f}%)</code>
-📈 <b>OI 30m:</b> <code>{sig['oi_30m_pct']:+.1f}%</code>
-💸 <b>Funding Rate:</b> <code>{sig['funding']:.3f}%</code>
+🕯 Pattern: <b>{sig['pattern']}</b>
+🧲 Liquidity Sweep: {sweep_icon}
+📍 Support Reclaim: {reclaim_icon}
+📊 Volume Expansion: <code>{sig['vol_max_ratio']:.1f}x</code>
+💰 CVD Buy Pressure: <code>{sig['taker_buy_pct']:.0f}%</code>
+📈 OI 30m Change: <code>{sig['oi_30m_pct']:+.1f}%</code>
+💸 Funding Rate: <code>{sig['funding']:.3f}%</code>
 
 ⚡ <b>EARLY ENTRY — CHECK CHART NGAY!</b>"""
 
     send_telegram_direct_message(msg)
     print(f"✅ [ALERT SENT] {sig['tier_title']} #{sig['symbol']} Score: {sig['score']}", flush=True)
 
-# ==============================================================================
-# 6. AUTOMATIC SCANNER LOOP WITH DEBUG LOGGING
-# ==============================================================================
-
 def run_automatic_adaptive_scanner():
-    print("⚡️ Bắt đầu Bybit Futures Scanner Engine Active...", flush=True)
+    print("⚡️ Bắt đầu Bybit Dynamic Multi-Setup Engine Active...", flush=True)
     while True:
         try:
             all_tickers = get_all_bybit_crypto_symbols()
-            print(f"\n🔍 [SCANNER] Đang rà soát {len(all_tickers)} Altcoins đạt chuẩn Turnover >= 8M USD...", flush=True)
+            print(f"\n🔍 [SCANNER] Đang rà soát 5 mô hình bứt phá cho {len(all_tickers)} Altcoins...", flush=True)
 
             top_candidates = sorted(all_tickers, key=lambda x: (x['price24hPcnt'] * 0.5 + (x['turnover24h']/1e7) * 0.5), reverse=True)[:TOP_TIER1_LIMIT]
 
             scanned_results = []
             with ThreadPoolExecutor(max_workers=12) as executor:
-                futures = [executor.submit(evaluate_adaptive_reversal_candidate, t) for t in top_candidates]
+                futures = [executor.submit(evaluate_multi_setup_candidate, t) for t in top_candidates]
                 for f in futures:
                     res = f.result()
                     if res:
@@ -415,39 +373,27 @@ def run_automatic_adaptive_scanner():
 
             scanned_results.sort(key=lambda x: x['score'], reverse=True)
 
-            # PRINT DEBUG LOGS TOP 10 CANDIDATES TRÊN RENDER
             print("\n==================================================", flush=True)
-            print("📋 TOP CANDIDATES (DEBUG LOG)", flush=True)
+            print("📋 TOP MULTI-SETUP CANDIDATES (DEBUG LOG)", flush=True)
             print("==================================================", flush=True)
             
-            top10_candidates = scanned_results[:10]
-            if top10_candidates and top10_candidates[0]['score'] > 0:
-                for idx, c in enumerate(top10_candidates, 1):
+            top10 = scanned_results[:10]
+            if top10 and top10[0]['score'] > 0:
+                for idx, c in enumerate(top10, 1):
                     if c['score'] == 0: continue
-                    sweep_str = "YES" if c['is_sweep'] else "NO"
-                    candle_str = "YES" if c['has_candle'] else "NO"
-                    reclaim_str = "YES" if c['has_reclaim'] else "NO"
-                    vol_str = "YES" if c['has_vol'] else "NO"
-                    cvd_str = "YES" if c['has_cvd'] else "NO"
-                    
-                    print(f"{idx}. {c['symbol']} Score: {c['score']}", flush=True)
-                    print(f"   Sweep: {sweep_str} | Candle: {candle_str} | Reclaim: {reclaim_str} | Volume: {vol_str} | CVD: {cvd_str}", flush=True)
-                    if not c.get('is_eligible'):
-                        print(f"   ❌ Rejected reason: {c.get('rejected_reason')}", flush=True)
+                    print(f"{idx}. {c['symbol']} | Score: {c['score']} | Setup: {c.get('tier_title')}", flush=True)
             else:
-                print("🔎 Không có coin nào đạt cấu trúc Reversal hoặc Short Squeeze.", flush=True)
+                print("🔎 Chưa có coin nào đạt chuẩn trong 5 mô hình bứt phá.", flush=True)
             
             print("==================================================\n", flush=True)
 
-            # GỬI TELEGRAM TOP 1-3 TÍN HIỆU ĐỦ ĐIỀU KIỆN
             eligible_signals = [c for c in scanned_results if c.get('is_eligible', False)]
 
             if eligible_signals:
                 for sig in eligible_signals[:TOP_TELEGRAM_REPORT_LIMIT]:
                     send_telegram_reversal_alert(sig)
             else:
-                highest_score = scanned_results[0]['score'] if scanned_results else 0
-                print(f"🔎 Không có tín hiệu reversal đủ mạnh để gửi Telegram. (Highest score = {highest_score})", flush=True)
+                print("🔎 Không có tín hiệu mô hình đủ mạnh trong chu kỳ này.", flush=True)
 
         except Exception as e:
             print(f"Lỗi Adaptive Scanner Loop: {e}", flush=True)

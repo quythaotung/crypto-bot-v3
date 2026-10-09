@@ -14,14 +14,14 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit H1 LONG Sniper Bot is Active 24/7!"
+    return "Bybit H1 LONG Sniper Bot (RLC Pullback Engine) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 # ==============================================================================
-# 2. ĐỌC CẤU HÌNH TỪ BIẾN MÔI TRƯỜNG (ENVIRONMENT VARIABLES)
+# 2. ĐỌC CẤU HÌNH TỪ BIẾN MÔI TRƯỜNG
 # ==============================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
@@ -75,7 +75,7 @@ def record_signal(symbol: str, h1_timestamp: int, setup_name: str, score: int):
         conn.commit()
 
 # ==============================================================================
-# 4. BYBIT API V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT (CLOSED CANDLES ONLY)
+# 4. BYBIT API V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -119,7 +119,6 @@ def get_closed_klines(symbol: str, interval: str, limit: int = 40):
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             raw_list = res["result"]["list"]
             if len(raw_list) < 2: return []
-            # Loại bỏ index 0 (nến đang chạy) và đảo ngược mảng
             closed_raw = raw_list[1:]
             parsed = []
             for c in reversed(closed_raw):
@@ -198,8 +197,8 @@ def calculate_atr(candles: list, period: int = 14) -> float:
         tr_list.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
     return float(np.mean(tr_list[-period:])) if tr_list else 0.0
 
-def detect_h1_patterns(h1_candles: list) -> list:
-    if len(h1_candles) < 3: return []
+def detect_h1_patterns(h1_candles: list, ema20_h1: list, ema50_h1: list) -> list:
+    if len(h1_candles) < 5: return []
     patterns = []
     c1, c2, c3 = h1_candles[-1], h1_candles[-2], h1_candles[-3]
     o1, h1, l1, cl1 = c1['open'], c1['high'], c1['low'], c1['close']
@@ -209,8 +208,8 @@ def detect_h1_patterns(h1_candles: list) -> list:
     body1 = abs(cl1 - o1)
     range1 = (h1 - l1) if (h1 - l1) > 0 else 1e-8
     lower_wick1 = min(o1, cl1) - l1
-    upper_wick1 = h1 - max(o1, cl1)
 
+    # 1. Price Action Reversals
     if lower_wick1 >= 1.5 * body1 and cl1 >= (l1 + 0.45 * range1):
         patterns.append("Hammer / Bullish Pin Bar")
     if cl2 < o2 and cl1 > o1 and cl1 >= o2 and o1 <= cl2:
@@ -218,11 +217,29 @@ def detect_h1_patterns(h1_candles: list) -> list:
     if cl3 < o3 and abs(cl2 - o2) <= 0.4 * abs(cl3 - o3) and cl1 > o1 and cl1 >= (o3 + cl3) / 2:
         patterns.append("Morning Star")
     
+    # 2. Resistance Breakout
     prev_high = max([c['high'] for c in h1_candles[-10:-1]])
-    if cl1 > prev_high: patterns.append("Resistance Breakout")
+    if cl1 > prev_high: 
+        patterns.append("Resistance Breakout")
     
+    # 3. Liquidity Sweep
     prev_low = min([c['low'] for c in h1_candles[-10:-1]])
-    if l1 < prev_low and cl1 >= prev_low: patterns.append("Liquidity Sweep Reclaim")
+    if l1 < prev_low and cl1 >= prev_low: 
+        patterns.append("Liquidity Sweep Reclaim")
+
+    # 4. MÔ HÌNH RLC: EMA Pullback & Compression Breakout
+    if ema20_h1 and ema50_h1:
+        # Kiểm tra 5 nến trước đó có nén biên độ hẹp và chạm/sát EMA20/50
+        recent_lows = [c['low'] for c in h1_candles[-6:-1]]
+        recent_closes = [c['close'] for c in h1_candles[-6:-1]]
+        min_recent_low = min(recent_lows)
+        max_recent_close = max(recent_closes)
+        
+        range_compression_pct = (max_recent_close - min_recent_low) / min_recent_low * 100
+        near_ema = any(abs(l - ema20_h1[-1]) / ema20_h1[-1] * 100 <= 1.2 for l in recent_lows)
+
+        if range_compression_pct <= 3.0 and near_ema and cl1 > max_recent_close:
+            patterns.append("EMA Pullback & Range Compression (Kiểu RLC)")
 
     return patterns
 
@@ -266,34 +283,34 @@ def evaluate_long_candidate(ticker_info, config_turnover):
         # Hard Gate OI & Taker Buy
         if oi_change < 1.0 or taker_buy_pct < 55.0: return None
 
-        patterns = detect_h1_patterns(h1_candles)
+        patterns = detect_h1_patterns(h1_candles, ema20_h1, ema50_h1)
         if not patterns: return None
 
-        # CHẤM ĐIỂM
+        # CHẤM ĐIỂM SỨC MẠNH (MAX 100 PTS)
         score = 0
         reasons = []
 
-        # Trend (20đ)
+        # 1. Trend (20đ)
         if ema20_h1[-1] > ema50_h1[-1] and cl1 > ema20_h1[-1]: score += 10
         if ema20_h4[-1] > ema50_h4[-1]: score += 10
         reasons.append("Cấu trúc xu hướng H1/H4 đồng thuận")
 
-        # Pattern (30đ)
+        # 2. Pattern (30đ)
         p_score = min(30, len(patterns) * 15)
         score += p_score
         reasons.append(f"Mô hình: {', '.join(patterns)}")
 
-        # Vol (15đ)
+        # 3. Vol (15đ)
         v_score = 15 if vol_ratio >= 2.2 else 10
         score += v_score
         reasons.append(f"Volume H1 bùng nổ {vol_ratio:.1f}x")
 
-        # OI (15đ)
+        # 4. OI (15đ)
         if oi_change >= 2.0: score += 15
         else: score += 8
         reasons.append(f"OI 1h tăng {oi_change:+}%")
 
-        # RSI (5đ) & Strength (10đ) & Quality (5đ)
+        # 5. RSI (5đ) & Strength (10đ) & Quality (5đ)
         if 40 <= rsi_h1[-1] <= 70: score += 5
         score += 15
 
@@ -301,7 +318,7 @@ def evaluate_long_candidate(ticker_info, config_turnover):
 
         # Tính toán Entry, SL, TP
         entry = cl1
-        if abs(curr_price - entry) / entry * 100 > 1.0: return None # Chống đuổi giá
+        if abs(curr_price - entry) / entry * 100 > 1.0: return None  # Anti-chase
 
         swing_low = min([c['low'] for c in h1_candles[-10:]])
         sl = swing_low - (0.3 * atr_h1)
@@ -401,7 +418,6 @@ def run_scanner_loop():
                 for f in futures:
                     res = f.result()
                     if res:
-                        # Kiểm tra chống gửi trùng bằng timestamp nến
                         if not is_signal_sent(res['symbol'], res['h1_timestamp']):
                             scanned_signals.append(res)
 

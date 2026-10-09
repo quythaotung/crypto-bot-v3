@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit H1 LONG Sniper Bot (RLC Pullback Engine) Active 24/7!"
+    return "Bybit H1/H4 LONG Sniper Bot (APT/JCT/OGN/RLC Engine) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -75,7 +75,7 @@ def record_signal(symbol: str, h1_timestamp: int, setup_name: str, score: int):
         conn.commit()
 
 # ==============================================================================
-# 4. BYBIT API V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT
+# 4. BYBIT API V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT (CLOSED CANDLES ONLY)
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -197,39 +197,37 @@ def calculate_atr(candles: list, period: int = 14) -> float:
         tr_list.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
     return float(np.mean(tr_list[-period:])) if tr_list else 0.0
 
-def detect_h1_patterns(h1_candles: list, ema20_h1: list, ema50_h1: list) -> list:
+# ==============================================================================
+# 5. MÔ HÌNH NẾN ĐA DẠNG (APT, JCT, OGN, RLC PATTERNS)
+# ==============================================================================
+def detect_h1_patterns(h1_candles: list, ema20_h1: list, ema50_h1: list, funding: float, vol_ratio: float, oi_change: float) -> list:
     if len(h1_candles) < 5: return []
     patterns = []
     c1, c2, c3 = h1_candles[-1], h1_candles[-2], h1_candles[-3]
     o1, h1, l1, cl1 = c1['open'], c1['high'], c1['low'], c1['close']
     o2, h2, l2, cl2 = c2['open'], c2['high'], c2['low'], c2['close']
-    o3, h3, l3, cl3 = c3['open'], c3['high'], c3['low'], c3['close']
 
     body1 = abs(cl1 - o1)
     range1 = (h1 - l1) if (h1 - l1) > 0 else 1e-8
     lower_wick1 = min(o1, cl1) - l1
 
-    # 1. Price Action Reversals
+    # 1. Price Action
     if lower_wick1 >= 1.5 * body1 and cl1 >= (l1 + 0.45 * range1):
         patterns.append("Hammer / Bullish Pin Bar")
     if cl2 < o2 and cl1 > o1 and cl1 >= o2 and o1 <= cl2:
         patterns.append("Bullish Engulfing")
-    if cl3 < o3 and abs(cl2 - o2) <= 0.4 * abs(cl3 - o3) and cl1 > o1 and cl1 >= (o3 + cl3) / 2:
-        patterns.append("Morning Star")
-    
-    # 2. Resistance Breakout
-    prev_high = max([c['high'] for c in h1_candles[-10:-1]])
-    if cl1 > prev_high: 
-        patterns.append("Resistance Breakout")
-    
-    # 3. Liquidity Sweep
+
+    # 2. Liquidity Sweep & Reclaim (Kiểu JCT & APT)
     prev_low = min([c['low'] for c in h1_candles[-10:-1]])
     if l1 < prev_low and cl1 >= prev_low: 
-        patterns.append("Liquidity Sweep Reclaim")
+        patterns.append("Liquidity Sweep & Reclaim (Kiểu JCT/APT)")
 
-    # 4. MÔ HÌNH RLC: EMA Pullback & Compression Breakout
+    # 3. Short Squeeze Pump (Kiểu OGN)
+    if funding <= -0.25 and vol_ratio >= 2.0 and oi_change >= 1.5:
+        patterns.append("Short Squeeze Pump (Kiểu OGN)")
+
+    # 4. EMA Pullback & Range Compression (Kiểu RLC)
     if ema20_h1 and ema50_h1:
-        # Kiểm tra 5 nến trước đó có nén biên độ hẹp và chạm/sát EMA20/50
         recent_lows = [c['low'] for c in h1_candles[-6:-1]]
         recent_closes = [c['close'] for c in h1_candles[-6:-1]]
         min_recent_low = min(recent_lows)
@@ -239,12 +237,12 @@ def detect_h1_patterns(h1_candles: list, ema20_h1: list, ema50_h1: list) -> list
         near_ema = any(abs(l - ema20_h1[-1]) / ema20_h1[-1] * 100 <= 1.2 for l in recent_lows)
 
         if range_compression_pct <= 3.0 and near_ema and cl1 > max_recent_close:
-            patterns.append("EMA Pullback & Range Compression (Kiểu RLC)")
+            patterns.append("EMA Pullback & Compression (Kiểu RLC)")
 
     return patterns
 
 # ==============================================================================
-# 5. BỘ EVALUATOR LỌC TÍN HIỆU LONG VÀ TÍNH ENTRY/SL/TP
+# 6. BỘ EVALUATOR LỌC TÍN HIỆU LONG VÀ TÍNH ENTRY/SL/TP
 # ==============================================================================
 def evaluate_long_candidate(ticker_info, config_turnover):
     try:
@@ -275,42 +273,36 @@ def evaluate_long_candidate(ticker_info, config_turnover):
         avg_vol = np.mean(vols[-20:]) if vols else 1.0
         vol_ratio = float(last_h1['volume'] / avg_vol) if avg_vol > 0 else 1.0
 
-        if vol_ratio < MIN_H1_VOLUME_RATIO: return None  # Hard Gate Volume
+        if vol_ratio < MIN_H1_VOLUME_RATIO: return None
 
         oi_change, oi_interval, oi_status = get_open_interest_change(sym)
         taker_buy_pct = get_taker_buy_ratio_5m(sym)
 
-        # Hard Gate OI & Taker Buy
         if oi_change < 1.0 or taker_buy_pct < 55.0: return None
 
-        patterns = detect_h1_patterns(h1_candles, ema20_h1, ema50_h1)
+        patterns = detect_h1_patterns(h1_candles, ema20_h1, ema50_h1, funding, vol_ratio, oi_change)
         if not patterns: return None
 
-        # CHẤM ĐIỂM SỨC MẠNH (MAX 100 PTS)
+        # CHẤM ĐIỂM (MAX 100 PTS)
         score = 0
         reasons = []
 
-        # 1. Trend (20đ)
         if ema20_h1[-1] > ema50_h1[-1] and cl1 > ema20_h1[-1]: score += 10
         if ema20_h4[-1] > ema50_h4[-1]: score += 10
-        reasons.append("Cấu trúc xu hướng H1/H4 đồng thuận")
+        reasons.append("Cấu trúc xu hướng H1/H4 hợp nhất")
 
-        # 2. Pattern (30đ)
         p_score = min(30, len(patterns) * 15)
         score += p_score
         reasons.append(f"Mô hình: {', '.join(patterns)}")
 
-        # 3. Vol (15đ)
         v_score = 15 if vol_ratio >= 2.2 else 10
         score += v_score
         reasons.append(f"Volume H1 bùng nổ {vol_ratio:.1f}x")
 
-        # 4. OI (15đ)
         if oi_change >= 2.0: score += 15
         else: score += 8
         reasons.append(f"OI 1h tăng {oi_change:+}%")
 
-        # 5. RSI (5đ) & Strength (10đ) & Quality (5đ)
         if 40 <= rsi_h1[-1] <= 70: score += 5
         score += 15
 
@@ -318,7 +310,7 @@ def evaluate_long_candidate(ticker_info, config_turnover):
 
         # Tính toán Entry, SL, TP
         entry = cl1
-        if abs(curr_price - entry) / entry * 100 > 1.0: return None  # Anti-chase
+        if abs(curr_price - entry) / entry * 100 > 1.0: return None
 
         swing_low = min([c['low'] for c in h1_candles[-10:]])
         sl = swing_low - (0.3 * atr_h1)
@@ -361,7 +353,7 @@ def evaluate_long_candidate(ticker_info, config_turnover):
         return None
 
 # ==============================================================================
-# 6. GỬI TIN NHẮN TELEGRAM
+# 7. GỬI TIN NHẮN TELEGRAM
 # ==============================================================================
 def send_telegram_alert(sig):
     if not BOT_TOKEN or not CHAT_ID:
@@ -401,7 +393,7 @@ def send_telegram_alert(sig):
         return False
 
 # ==============================================================================
-# 7. AUTOMATIC SCANNER LOOP
+# 8. AUTOMATIC SCANNER LOOP
 # ==============================================================================
 def run_scanner_loop():
     init_db()

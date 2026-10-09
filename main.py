@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 import sqlite3
 from threading import Thread
-from concurrent.futures import ThreadPoolExecutor
 from flask import Flask
 
 # ==============================================================================
@@ -22,22 +21,23 @@ def run_flask():
     app.run(host='0.0.0.0', port=port)
 
 # ==============================================================================
-# 2. ĐỌC CẤU HÌNH TỪ BIẾN MÔI TRƯỜNG (ENVIRONMENT VARIABLES)
+# 2. ĐỌC CẤU HÌNH TỪ BIẾN MÔI TRƯỜNG
 # ==============================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
 MIN_SCORE = int(os.environ.get("MIN_SCORE", "80"))
-MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))  # $2M USD
-MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.20"))         # Max 0.20%
+MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))
+MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.20"))
 MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "80"))
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "1800")) # Cooldown 30 phút chống spam
 DB_PATH = "signals_history.db"
 
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 3. QUẢN LÝ CƠ SỞ DỮ LIỆU SQLITE (CHỐNG GỬI TRÙNG TÍN HIỆU)
+# 3. QUẢN LÝ CƠ SỞ DỮ LIỆU SQLITE (CHỐNG LẶP & ĐẾM SỐ LẦN CALL)
 # ==============================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -47,34 +47,55 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL,
                 status TEXT NOT NULL,
-                h1_timestamp INTEGER NOT NULL,
                 score INTEGER,
-                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(symbol, status, h1_timestamp)
+                call_count INTEGER DEFAULT 1,
+                last_sent_at INTEGER NOT NULL,
+                UNIQUE(symbol, status)
             )
         """)
         conn.commit()
 
-def is_signal_sent(symbol: str, status: str, h1_timestamp: int) -> bool:
+def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
+    """
+    Xử lý chống spam và đếm số lần call.
+    Trả về: (should_send: bool, call_count: int)
+    """
+    now_ts = int(time.time())
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT 1 FROM sent_signals WHERE symbol = ? AND status = ? AND h1_timestamp = ?",
-            (symbol, status, h1_timestamp)
+            "SELECT call_count, last_sent_at, score FROM sent_signals WHERE symbol = ? AND status = ?",
+            (symbol, status)
         )
-        return cursor.fetchone() is not None
+        row = cursor.fetchone()
 
-def record_signal(symbol: str, status: str, score: int, h1_timestamp: int):
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR IGNORE INTO sent_signals (symbol, status, score, h1_timestamp) VALUES (?, ?, ?, ?)",
-            (symbol, status, score, h1_timestamp)
-        )
-        conn.commit()
+        if row is None:
+            # Chưa từng call -> Thêm mới (Call lần 1)
+            cursor.execute(
+                "INSERT INTO sent_signals (symbol, status, score, call_count, last_sent_at) VALUES (?, ?, ?, 1, ?)",
+                (symbol, status, score, now_ts)
+            )
+            conn.commit()
+            return True, 1
+        else:
+            prev_call_count, last_sent_at, prev_score = row
+            time_passed = now_ts - last_sent_at
+
+            # Bỏ qua nếu chưa hết thời gian Cooldown (trừ khi điểm tăng >= 5 điểm)
+            if time_passed < COOLDOWN_SECONDS and (score - prev_score) < 5:
+                return False, prev_call_count
+
+            # Hợp lệ để re-call -> Tăng số lần call
+            new_call_count = prev_call_count + 1
+            cursor.execute(
+                "UPDATE sent_signals SET call_count = ?, last_sent_at = ?, score = ? WHERE symbol = ? AND status = ?",
+                (new_call_count, now_ts, score, symbol, status)
+            )
+            conn.commit()
+            return True, new_call_count
 
 # ==============================================================================
-# 4. BYBIT API V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT (STRICT CLOSED CANDLES)
+# 4. BYBIT API V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -123,7 +144,6 @@ def get_closed_klines_df(symbol: str, interval: str, limit: int = 60) -> pd.Data
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             raw_list = res["result"]["list"]
             if len(raw_list) < 2: return pd.DataFrame()
-            # Loại bỏ index 0 (nến đang chạy) -> CHỈ LẤY NẾN ĐÃ ĐÓNG HOÀN TOÀN
             closed_raw = raw_list[1:]
             df = pd.DataFrame(closed_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
             df = df.iloc[::-1].reset_index(drop=True)
@@ -158,39 +178,35 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['ema89'] = closes.ewm(span=89, adjust=False).mean()
     df['ema200'] = closes.ewm(span=200, adjust=False).mean()
 
-    # ATR 14
     tr1 = highs - lows
     tr2 = (highs - closes.shift(1)).abs()
     tr3 = (lows - closes.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df['atr14'] = tr.rolling(14).mean()
 
-    # RSI 14
     delta = closes.diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss.replace(0, np.nan)
     df['rsi14'] = 100 - (100 / (1 + rs))
 
-    # Bollinger Bands Width
     bb_mid = closes.rolling(20).mean()
     bb_std = closes.rolling(20).std()
     df['bb_width'] = ((bb_mid + (bb_std * 2)) - (bb_mid - (bb_std * 2))) / bb_mid
 
-    # Volume Ratio vs MA20
     df['vol_ma20'] = vols.rolling(20).mean()
     df['vol_ratio'] = vols / df['vol_ma20'].replace(0, np.nan)
 
     return df
 
 # ==============================================================================
-# 5. ENGINE PHÁT HIỆN 3 TRẠNG THÁI & CHẤM ĐIỂM
+# 5. ENGINE PHÁT HIỆN TRẠNG THÁI & CHẤM ĐIỂM
 # ==============================================================================
 def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: float) -> dict:
     if df_m15.empty or len(df_m15) < 35: return None
 
     last_candle = df_m15.iloc[-1]
-    prev_candles = df_m15.iloc[-25:-1]  # 24 nến M15 tích lũy trước đó
+    prev_candles = df_m15.iloc[-25:-1]
 
     close_now = last_candle['close']
     vol_ratio_now = last_candle['vol_ratio']
@@ -208,26 +224,22 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     status = None
     reasons = []
 
-    # 1. BREAKOUT CONFIRMED
     if close_now > base_high and vol_ratio_now >= 1.5:
         status = "BREAKOUT CONFIRMED"
         reasons.append(f"Đóng nến M15 ({close_now:.4f}) vượt đỉnh nền ({base_high:.4f})")
         reasons.append(f"Volume bùng nổ {vol_ratio_now:.1f}x so với MA20")
 
-    # 2. PRE-BREAKOUT
     elif is_tight_base and is_bb_squeezed and (close_now >= base_high * 0.985):
         status = "PRE-BREAKOUT"
         reasons.append(f"Nền tích lũy nén chặt {base_range_pct:.1f}% trong 24 nến M15")
         reasons.append("Bollinger Bands siết chặt, áp sát vùng kháng cự")
 
-    # 3. RETEST WATCH
     elif close_now <= base_high * 1.01 and close_now >= base_high * 0.99 and vol_ratio_now < 1.3:
         status = "RETEST WATCH"
         reasons.append(f"Giá test lại vùng phá nền ({base_high:.4f}) với Volume cạn")
 
     if not status: return None
 
-    # Cảnh báo KHÔNG ĐUỔI GIÁ nếu đã tăng > 12% từ đáy nền
     pump_from_base = ((close_now - base_low) / base_low) * 100
     no_chase = pump_from_base > 12.0
 
@@ -238,7 +250,6 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     tp1 = close_now + (risk * 2.0)
     tp2 = close_now + (risk * 3.0)
 
-    # CHẤM ĐIỂM (0 - 100)
     score = 0
     if base_range_pct <= 5.0: score += 20
     elif base_range_pct <= 8.0: score += 15
@@ -263,7 +274,7 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     if coin_perf > btc_perf + 2.0: score += 10
     else: score += 5
 
-    score += 5 # Tier liquidity
+    score += 5
 
     return {
         "status": status,
@@ -285,7 +296,7 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     }
 
 # ==============================================================================
-# 6. GỬI ALERT TELEGRAM
+# 6. GỬI ALERT TELEGRAM (BỔ SUNG THÔNG BÁO SỐ LẦN CALL)
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
@@ -296,6 +307,7 @@ def send_telegram_alert(sig: dict) -> bool:
 
 <b>Coin:</b> #{sig['symbol']}
 <b>Trạng thái:</b> <code>{sig['status']}</code>
+🔔 <b>Lần thông báo:</b> <b>Call lần {sig['call_count']}</b>
 ⭐ <b>Điểm xếp hạng:</b> <b>{sig['score']}/100</b>
 <b>Khung thời gian:</b> M15 + H1
 
@@ -332,7 +344,7 @@ def send_telegram_alert(sig: dict) -> bool:
 # ==============================================================================
 def run_scanner_loop():
     init_db()
-    print("⚡️ Bắt đầu Bybit Early Pump & Breakout Engine...", flush=True)
+    print("⚡️ Bắt đầu Bybit Early Pump & Breakout Engine (V3 Anti-Spam)...", flush=True)
     while True:
         try:
             tickers = get_usdt_perpetual_tickers()
@@ -356,13 +368,15 @@ def run_scanner_loop():
 
                 analysis = analyze_early_pump(df_m15, df_h1, btc_perf)
                 if analysis and analysis['score'] >= MIN_SCORE:
-                    oi_change = get_open_interest_change(sym)
-                    analysis['symbol'] = sym
-                    analysis['turnover24h'] = t['turnover24h']
-                    analysis['funding'] = t['fundingRate']
-                    analysis['oi_info'] = f"{oi_change:+}%/1h"
-
-                    if not is_signal_sent(sym, analysis['status'], analysis['timestamp']):
+                    # Kiểm tra trùng & đếm số lần call
+                    should_send, call_count = process_signal_dedup(sym, analysis['status'], analysis['score'])
+                    if should_send:
+                        oi_change = get_open_interest_change(sym)
+                        analysis['symbol'] = sym
+                        analysis['turnover24h'] = t['turnover24h']
+                        analysis['funding'] = t['fundingRate']
+                        analysis['oi_info'] = f"{oi_change:+}%/1h"
+                        analysis['call_count'] = call_count
                         scanned_signals.append(analysis)
 
             scanned_signals.sort(key=lambda x: x['score'], reverse=True)
@@ -370,10 +384,9 @@ def run_scanner_loop():
             if scanned_signals:
                 for sig in scanned_signals:
                     if send_telegram_alert(sig):
-                        record_signal(sig['symbol'], sig['status'], sig['score'], sig['timestamp'])
-                        print(f"✅ [ALERT SENT] #{sig['symbol']} Status: {sig['status']} | Score: {sig['score']}", flush=True)
+                        print(f"✅ [ALERT SENT] #{sig['symbol']} State: {sig['status']} | Call: lần {sig['call_count']} | Score: {sig['score']}", flush=True)
             else:
-                print("🔎 Không có tín hiệu Early Pump nào đạt chuẩn trong chu kỳ này.", flush=True)
+                print("🔎 Không có tín hiệu mới hoặc các tín hiệu đang trong thời gian Cooldown.", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)

@@ -8,20 +8,20 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# 1. KHỞI TẠO FLASK KEEP-ALIVE SERVER (DÙNG CHO RENDER/RAILWAY 24/7)
+# 1. KHỞI TẠO FLASK KEEP-ALIVE SERVER (DÙNG CHO RENDER 24/7)
 # ==============================================================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Early Pump Engine (Top 3 Quality Signals Only) Active 24/7!"
+    return "Bybit Early Pump Engine (Dynamic TP/SL Tracking) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 # ==============================================================================
-# 2. ĐỌC CẤU HÌNH TỪ BIẾN MÔI TRƯỜNG & GIỚI HẠN TOP 3
+# 2. CẤU HÌNH BIẾN MÔI TRƯỜNG & NGƯỠNG LỌC
 # ==============================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
@@ -33,17 +33,18 @@ MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "80"))
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "1800")) 
 
-MAX_ALERTS_PER_CYCLE = 3  # 🔴 GIỚI HẠN CỨNG: CHỈ GỬI TỐI ĐA TOP 3 KÈO CHẤT LƯỢNG NHẤT MỖI CHU KỲ
+MAX_ALERTS_PER_CYCLE = 3  # Tối đa Top 3 kèo chất lượng nhất mỗi chu kỳ
 
 DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 3. QUẢN LÝ CƠ SỞ DỮ LIỆU SQLITE (CHỐNG LẶP & ĐẾM SỐ LẦN CALL)
+# 3. SQLITE DATABASE (CHỐNG SPAM & TỰ ĐỘNG QUẢN LÝ QUÁ TRÌNH TP/SL)
 # ==============================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
+        # Bảng chống lặp
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sent_signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,6 +54,22 @@ def init_db():
                 call_count INTEGER DEFAULT 1,
                 last_sent_at INTEGER NOT NULL,
                 UNIQUE(symbol, status)
+            )
+        """)
+        # Bảng theo dõi giá TP/SL thời gian thực
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS active_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT UNIQUE NOT NULL,
+                entry REAL NOT NULL,
+                sl REAL NOT NULL,
+                tp1 REAL NOT NULL,
+                tp2 REAL NOT NULL,
+                tp3 REAL NOT NULL,
+                tp1_hit INTEGER DEFAULT 0,
+                tp2_hit INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'OPEN',
+                created_at INTEGER NOT NULL
             )
         """)
         conn.commit()
@@ -89,8 +106,18 @@ def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
             conn.commit()
             return True, new_call_count
 
+def save_active_trade(sig: dict):
+    now_ts = int(time.time())
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO active_trades (symbol, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?)
+        """, (sig['symbol'], sig['close_price'], sig['invalidation_sl'], sig['tp1'], sig['tp2'], sig['tp3'], now_ts))
+        conn.commit()
+
 # ==============================================================================
-# 4. BYBIT API V5 HELPERS & CHỈ BÁO KỸ THUẬT
+# 4. API BYBIT V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -242,8 +269,10 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     risk = close_now - invalidation_sl
     if risk <= 0: return None
 
-    tp1 = close_now + (risk * 2.0)
-    tp2 = close_now + (risk * 3.0)
+    # Tính toán TP1 (tối thiểu +5.0%), TP2 (+10%), TP3 (+15%)
+    tp1 = max(close_now + (risk * 2.0), close_now * 1.05)
+    tp2 = close_now + (risk * 3.5)
+    tp3 = close_now + (risk * 5.0)
 
     score = 0
     if base_range_pct <= 5.0: score += 20
@@ -284,14 +313,15 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
         "invalidation_sl": round(invalidation_sl, 4),
         "tp1": round(tp1, 4),
         "tp2": round(tp2, 4),
-        "rr_ratio": "1:2 / 1:3",
+        "tp3": round(tp3, 4),
+        "rr_ratio": "1:2 / 1:3.5",
         "no_chase": no_chase,
         "reasons": reasons,
         "timestamp": last_candle['timestamp']
     }
 
 # ==============================================================================
-# 6. GỬI ALERT TELEGRAM
+# 6. HỆ THỐNG GỬI TELEGRAM & THEO DÕI CỦA THÁI DÒNG TP/SL
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
@@ -310,8 +340,8 @@ def send_telegram_alert(sig: dict) -> bool:
 📦 <b>Vùng tích lũy:</b> {sig['base_low']:.4f} - {sig['base_high']:.4f} ({sig['base_range_pct']}%)
 🎯 <b>Kháng cự Breakout:</b> {sig['base_high']:.4f}
 🔄 <b>Vùng Retest tham khảo:</b> {sig['retest_zone']}
-🛡 <b>Hỗ trợ / Điểm vô hiệu:</b> {sig['invalidation_sl']:.4f}
-⛳️ <b>TP1 / TP2 tham khảo:</b> {sig['tp1']:.4f} / {sig['tp2']:.4f} ({sig['rr_ratio']})
+🛡 <b>Hỗ trợ / Stop Loss:</b> {sig['invalidation_sl']:.4f}
+⛳️ <b>TP1 (+5%):</b> {sig['tp1']:.4f} | <b>TP2:</b> {sig['tp2']:.4f}
 
 📊 <b>Turnover 24h:</b> ${sig['turnover24h']/1e6:.2f}M USD
 🔥 <b>Volume / MA20:</b> {sig['vol_ratio']}x
@@ -334,15 +364,80 @@ def send_telegram_alert(sig: dict) -> bool:
         print(f"[ERROR] Lỗi gửi Telegram: {e}", flush=True)
         return False
 
+def send_direct_message(text: str):
+    if not BOT_TOKEN or not CHAT_ID: return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    try:
+        requests.post(url, json=payload, timeout=8)
+    except Exception:
+        pass
+
+def track_and_update_active_trades(tickers_map: dict):
+    """
+    Tự động quét giá hiện tại, kiểm tra dính TP/SL.
+    KHI DÍNH TP1 -> DỜI SL VỀ ENTRY (HÒA VỐN) VÀ KHÔNG CÒN BỊ CẮT LỖ BẰNG SL CŨ NỮA!
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, symbol, entry, sl, tp1, tp2, tp3, tp1_hit FROM active_trades WHERE status = 'OPEN'")
+        trades = cursor.fetchall()
+
+        for t in trades:
+            trade_id, sym, entry, sl, tp1, tp2, tp3, tp1_hit = t
+            if sym not in tickers_map: continue
+
+            curr_price = tickers_map[sym]
+
+            # 1. KIỂM TRA CHẠM TP1
+            if tp1_hit == 0 and curr_price >= tp1:
+                cursor.execute("UPDATE active_trades SET tp1_hit = 1, sl = ? WHERE id = ?", (entry, trade_id))
+                conn.commit()
+                msg = f"""🎉 <b>TAKE PROFIT ALERT — TP1 HIT!</b>
+
+#<b>{sym}</b>
+✅ Giá đã chạm <b>TP1: {tp1:.4f}</b> (+5.0%+)
+🛡 <b>CẬP NHẬT RỦI RO:</b> Đã dời SL về Breakeven (Hòa vốn) tại <b>{entry:.4f}</b>.
+👉 <b>Mức Stop Loss ban đầu ({sl:.4f}) KHÔNG CÒN HIỆU LỰC!</b> Vị thế hoàn toàn an toàn."""
+                send_direct_message(msg)
+                print(f"🎯 [TP1 HIT] #{sym} -> SL updated to Entry", flush=True)
+
+            # 2. KIỂM TRA CHẠM TP2 HOẶC TP3
+            elif tp1_hit == 1 and curr_price >= tp2:
+                cursor.execute("UPDATE active_trades SET status = 'CLOSED_TP2' WHERE id = ?", (trade_id,))
+                conn.commit()
+                msg = f"""🚀 <b>TAKE PROFIT ALERT — TP2 HIT!</b>
+
+#<b>{sym}</b>
+✅ Giá đã chốt lời thành công chặng 2 tại <b>TP2: {tp2:.4f}</b>!
+🎉 Chúc mừng bạn đã gặt hái lợi nhuận tối đa!"""
+                send_direct_message(msg)
+
+            # 3. KIỂM TRA DÍNH SL (Chỉ xảy ra nếu CHƯA chạm TP1)
+            elif tp1_hit == 0 and curr_price <= sl:
+                cursor.execute("UPDATE active_trades SET status = 'CLOSED_SL' WHERE id = ?", (trade_id,))
+                conn.commit()
+                msg = f"""🛑 <b>STOP LOSS ALERT</b>
+
+#<b>{sym}</b>
+❌ Giá đã chạm Stop Loss ban đầu tại <b>{sl:.4f}</b>.
+Kịch bản bị vô hiệu hóa."""
+                send_direct_message(msg)
+
 # ==============================================================================
-# 7. AUTOMATIC SCANNER LOOP (LỌC TOP 3 DUY NHẤT)
+# 7. AUTOMATIC SCANNER LOOP
 # ==============================================================================
 def run_scanner_loop():
     init_db()
-    print("⚡️ Bắt đầu Bybit Early Pump & Breakout Engine (Top 3 Sniper Mode)...", flush=True)
+    print("⚡️ Bắt đầu Bybit Early Pump & Dynamic TP/SL Engine...", flush=True)
     while True:
         try:
             tickers = get_usdt_perpetual_tickers()
+            tickers_map = {t['symbol']: t['lastPrice'] for t in tickers}
+
+            # Cập nhật và kiểm tra TP/SL vị thế đang mở
+            track_and_update_active_trades(tickers_map)
+
             target_tickers = tickers[:MAX_SYMBOLS_SCAN]
             print(f"\n🔍 [SCANNER] Đang rà soát {len(target_tickers)} Altcoins thanh khoản cao...", flush=True)
 
@@ -370,10 +465,7 @@ def run_scanner_loop():
                     analysis['oi_info'] = f"{oi_change:+}%/1h"
                     scanned_signals.append(analysis)
 
-            # Sắp xếp danh sách theo điểm từ cao xuống thấp
             scanned_signals.sort(key=lambda x: x['score'], reverse=True)
-
-            # 🔴 CHỈ LẤY ĐÚNG TOP 3 KÈO CÓ ĐIỂM SỐ CAO NHẤT THỊ TRƯỜNG
             top_3_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
 
             sent_count = 0
@@ -383,13 +475,9 @@ def run_scanner_loop():
                     if should_send:
                         sig['call_count'] = call_count
                         if send_telegram_alert(sig):
+                            save_active_trade(sig) # Lưu vị thế vào bảng theo dõi TP/SL
                             sent_count += 1
                             print(f"✅ [SNIPER TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Score: {sig['score']}", flush=True)
-                
-                if sent_count == 0:
-                    print("🔎 Top 3 kèo hôm nay đang nằm trong thời gian Cooldown, không gửi trùng.", flush=True)
-            else:
-                print("🔎 Không có tín hiệu nào đạt ngưỡng điểm tối thiểu.", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)

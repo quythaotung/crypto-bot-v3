@@ -1,5 +1,5 @@
-requests
-websockets
-ccxt
-pandas
-flask
+requests>=2.31.0
+pandas>=2.0.0
+numpy>=1.24.0
+flask>=3.0.0
+gunicorn>=21.2.0

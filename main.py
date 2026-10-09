@@ -14,14 +14,14 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Early Pump & Breakout Bot Engine Active 24/7!"
+    return "Bybit Early Pump Engine (Top 3 Quality Signals Only) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 # ==============================================================================
-# 2. ĐỌC CẤU HÌNH TỪ BIẾN MÔI TRƯỜNG
+# 2. ĐỌC CẤU HÌNH TỪ BIẾN MÔI TRƯỜNG & GIỚI HẠN TOP 3
 # ==============================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
@@ -31,9 +31,11 @@ MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))
 MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.20"))
 MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "80"))
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "1800")) # Cooldown 30 phút chống spam
-DB_PATH = "signals_history.db"
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "1800")) 
 
+MAX_ALERTS_PER_CYCLE = 3  # 🔴 GIỚI HẠN CỨNG: CHỈ GỬI TỐI ĐA TOP 3 KÈO CHẤT LƯỢNG NHẤT MỖI CHU KỲ
+
+DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
@@ -56,10 +58,6 @@ def init_db():
         conn.commit()
 
 def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
-    """
-    Xử lý chống spam và đếm số lần call.
-    Trả về: (should_send: bool, call_count: int)
-    """
     now_ts = int(time.time())
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
@@ -70,7 +68,6 @@ def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
         row = cursor.fetchone()
 
         if row is None:
-            # Chưa từng call -> Thêm mới (Call lần 1)
             cursor.execute(
                 "INSERT INTO sent_signals (symbol, status, score, call_count, last_sent_at) VALUES (?, ?, ?, 1, ?)",
                 (symbol, status, score, now_ts)
@@ -81,11 +78,9 @@ def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
             prev_call_count, last_sent_at, prev_score = row
             time_passed = now_ts - last_sent_at
 
-            # Bỏ qua nếu chưa hết thời gian Cooldown (trừ khi điểm tăng >= 5 điểm)
             if time_passed < COOLDOWN_SECONDS and (score - prev_score) < 5:
                 return False, prev_call_count
 
-            # Hợp lệ để re-call -> Tăng số lần call
             new_call_count = prev_call_count + 1
             cursor.execute(
                 "UPDATE sent_signals SET call_count = ?, last_sent_at = ?, score = ? WHERE symbol = ? AND status = ?",
@@ -95,7 +90,7 @@ def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
             return True, new_call_count
 
 # ==============================================================================
-# 4. BYBIT API V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT
+# 4. BYBIT API V5 HELPERS & CHỈ BÁO KỸ THUẬT
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -296,7 +291,7 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     }
 
 # ==============================================================================
-# 6. GỬI ALERT TELEGRAM (BỔ SUNG THÔNG BÁO SỐ LẦN CALL)
+# 6. GỬI ALERT TELEGRAM
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
@@ -340,11 +335,11 @@ def send_telegram_alert(sig: dict) -> bool:
         return False
 
 # ==============================================================================
-# 7. AUTOMATIC SCANNER LOOP
+# 7. AUTOMATIC SCANNER LOOP (LỌC TOP 3 DUY NHẤT)
 # ==============================================================================
 def run_scanner_loop():
     init_db()
-    print("⚡️ Bắt đầu Bybit Early Pump & Breakout Engine (V3 Anti-Spam)...", flush=True)
+    print("⚡️ Bắt đầu Bybit Early Pump & Breakout Engine (Top 3 Sniper Mode)...", flush=True)
     while True:
         try:
             tickers = get_usdt_perpetual_tickers()
@@ -368,25 +363,33 @@ def run_scanner_loop():
 
                 analysis = analyze_early_pump(df_m15, df_h1, btc_perf)
                 if analysis and analysis['score'] >= MIN_SCORE:
-                    # Kiểm tra trùng & đếm số lần call
-                    should_send, call_count = process_signal_dedup(sym, analysis['status'], analysis['score'])
-                    if should_send:
-                        oi_change = get_open_interest_change(sym)
-                        analysis['symbol'] = sym
-                        analysis['turnover24h'] = t['turnover24h']
-                        analysis['funding'] = t['fundingRate']
-                        analysis['oi_info'] = f"{oi_change:+}%/1h"
-                        analysis['call_count'] = call_count
-                        scanned_signals.append(analysis)
+                    oi_change = get_open_interest_change(sym)
+                    analysis['symbol'] = sym
+                    analysis['turnover24h'] = t['turnover24h']
+                    analysis['funding'] = t['fundingRate']
+                    analysis['oi_info'] = f"{oi_change:+}%/1h"
+                    scanned_signals.append(analysis)
 
+            # Sắp xếp danh sách theo điểm từ cao xuống thấp
             scanned_signals.sort(key=lambda x: x['score'], reverse=True)
 
-            if scanned_signals:
-                for sig in scanned_signals:
-                    if send_telegram_alert(sig):
-                        print(f"✅ [ALERT SENT] #{sig['symbol']} State: {sig['status']} | Call: lần {sig['call_count']} | Score: {sig['score']}", flush=True)
+            # 🔴 CHỈ LẤY ĐÚNG TOP 3 KÈO CÓ ĐIỂM SỐ CAO NHẤT THỊ TRƯỜNG
+            top_3_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
+
+            sent_count = 0
+            if top_3_signals:
+                for sig in top_3_signals:
+                    should_send, call_count = process_signal_dedup(sig['symbol'], sig['status'], sig['score'])
+                    if should_send:
+                        sig['call_count'] = call_count
+                        if send_telegram_alert(sig):
+                            sent_count += 1
+                            print(f"✅ [SNIPER TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Score: {sig['score']}", flush=True)
+                
+                if sent_count == 0:
+                    print("🔎 Top 3 kèo hôm nay đang nằm trong thời gian Cooldown, không gửi trùng.", flush=True)
             else:
-                print("🔎 Không có tín hiệu mới hoặc các tín hiệu đang trong thời gian Cooldown.", flush=True)
+                print("🔎 Không có tín hiệu nào đạt ngưỡng điểm tối thiểu.", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)

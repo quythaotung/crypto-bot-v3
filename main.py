@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Early Pump Engine (Dynamic TP/SL Tracking) Active 24/7!"
+    return "Bybit Early Pump Engine (/tonghop Command Enabled) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -39,7 +39,7 @@ DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 3. SQLITE DATABASE (CHỐNG SPAM & TỰ ĐỘNG QUẢN LÝ QUÁ TRÌNH TP/SL)
+# 3. SQLITE DATABASE (CHỐNG SPAM & QUẢN LÝ QUÁ TRÌNH TP/SL)
 # ==============================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -116,8 +116,71 @@ def save_active_trade(sig: dict):
         """, (sig['symbol'], sig['close_price'], sig['invalidation_sl'], sig['tp1'], sig['tp2'], sig['tp3'], now_ts))
         conn.commit()
 
+def get_summary_report() -> str:
+    """Tạo nội dung báo cáo khi gõ lệnh /tonghop"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT symbol, entry, sl, tp1, tp2, tp3, tp1_hit FROM active_trades WHERE status = 'OPEN' ORDER BY id DESC")
+        trades = cursor.fetchall()
+
+    if not trades:
+        return "📋 <b>BÁO CÁO TỔNG HỢP VỊ THẾ ACTIVE</b>\n\n🔎 Hiện tại chưa có kèo nào đang trong danh sách theo dõi."
+
+    msg = f"📊 <b>TỔNG HỢP CÁC KÈO ĐANG ACTIVE ({len(trades)} KÈO)</b>\n"
+    msg += "===================================="
+
+    for idx, t in enumerate(trades, 1):
+        sym, entry, sl, tp1, tp2, tp3, tp1_hit = t
+        
+        if tp1_hit == 1:
+            sl_status = f"<code>{entry:.4f}</code> (🛡 Đã cắn TP1 -> Dời SL về Breakeven)"
+            status_tag = "✅ <b>[ĐÃ HÍT TP1]</b>"
+        else:
+            sl_status = f"<code>{sl:.4f}</code>"
+            status_tag = "⏳ <b>[ĐANG THEO DÕI]</b>"
+
+        msg += f"""
+
+{idx}. #<b>{sym}</b> {status_tag}
+• 🎯 <b>Entry:</b> <code>{entry:.4f}</code>
+• 🛡 <b>Stop Loss:</b> {sl_status}
+• 🚀 <b>TP1 (+5%):</b> <code>{tp1:.4f}</code>
+• 🚀 <b>TP2:</b> <code>{tp2:.4f}</code>
+• 🚀 <b>TP3:</b> <code>{tp3:.4f}</code>"""
+
+    msg += "\n\n<i>⚠️ Lưu ý: Khi kèo cắn TP1, SL tự động được dời về Entry (Hòa vốn) để bảo vệ tài khoản.</i>"
+    return msg
+
 # ==============================================================================
-# 4. API BYBIT V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT
+# 4. BOT TELEGRAM COMMAND LISTENER (/tonghop)
+# ==============================================================================
+def listen_telegram_commands():
+    """Luồng chạy ngầm nhận lệnh /tonghop từ Telegram"""
+    if not BOT_TOKEN: return
+    last_update_id = 0
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+
+    while True:
+        try:
+            params = {"offset": last_update_id + 1, "timeout": 10}
+            res = requests.get(url, params=params, timeout=12).json()
+
+            if res.get("ok") and res.get("result"):
+                for update in res["result"]:
+                    last_update_id = update["update_id"]
+                    message = update.get("message", {})
+                    text = message.get("text", "")
+                    chat_id = str(message.get("chat", {}).get("id", ""))
+
+                    if text.strip().lower() in ["/tonghop", "/tonghop@your_bot_id", "tonghop"]:
+                        summary_msg = get_summary_report()
+                        send_direct_message(summary_msg, target_chat_id=chat_id if chat_id else CHAT_ID)
+        except Exception as e:
+            pass
+        time.sleep(2)
+
+# ==============================================================================
+# 5. API BYBIT V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -222,7 +285,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 5. ENGINE PHÁT HIỆN TRẠNG THÁI & CHẤM ĐIỂM
+# 6. ENGINE PHÁT HIỆN TRẠNG THÁI & CHẤM ĐIỂM
 # ==============================================================================
 def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: float) -> dict:
     if df_m15.empty or len(df_m15) < 35: return None
@@ -269,7 +332,6 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     risk = close_now - invalidation_sl
     if risk <= 0: return None
 
-    # Tính toán TP1 (tối thiểu +5.0%), TP2 (+10%), TP3 (+15%)
     tp1 = max(close_now + (risk * 2.0), close_now * 1.05)
     tp2 = close_now + (risk * 3.5)
     tp3 = close_now + (risk * 5.0)
@@ -321,7 +383,7 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     }
 
 # ==============================================================================
-# 6. HỆ THỐNG GỬI TELEGRAM & THEO DÕI CỦA THÁI DÒNG TP/SL
+# 7. HỆ THỐNG GỬI TELEGRAM & THEO DÕI QUÁ TRÌNH TP/SL
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
@@ -353,7 +415,7 @@ def send_telegram_alert(sig: dict) -> bool:
 
 🔗 <a href="https://www.bybit.com/trade/usdt/{sig['symbol']}">Biểu đồ Bybit {sig['symbol']}</a>
 
-<i>⚠️ Cảnh báo: Tín hiệu mang tính xác suất, không đảm bảo giá tăng. Quản lý rủi ro trước khi vào lệnh.</i>"""
+<i>💡 Gõ <b>/tonghop</b> trên Telegram để xem danh sách TP/SL tất cả các kèo đang Active.</i>"""
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -364,20 +426,17 @@ def send_telegram_alert(sig: dict) -> bool:
         print(f"[ERROR] Lỗi gửi Telegram: {e}", flush=True)
         return False
 
-def send_direct_message(text: str):
-    if not BOT_TOKEN or not CHAT_ID: return
+def send_direct_message(text: str, target_chat_id: str = None):
+    dest = target_chat_id if target_chat_id else CHAT_ID
+    if not BOT_TOKEN or not dest: return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": dest, "text": text, "parse_mode": "HTML"}
     try:
         requests.post(url, json=payload, timeout=8)
     except Exception:
         pass
 
 def track_and_update_active_trades(tickers_map: dict):
-    """
-    Tự động quét giá hiện tại, kiểm tra dính TP/SL.
-    KHI DÍNH TP1 -> DỜI SL VỀ ENTRY (HÒA VỐN) VÀ KHÔNG CÒN BỊ CẮT LỖ BẰNG SL CŨ NỮA!
-    """
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id, symbol, entry, sl, tp1, tp2, tp3, tp1_hit FROM active_trades WHERE status = 'OPEN'")
@@ -425,11 +484,14 @@ Kịch bản bị vô hiệu hóa."""
                 send_direct_message(msg)
 
 # ==============================================================================
-# 7. AUTOMATIC SCANNER LOOP
+# 8. AUTOMATIC SCANNER LOOP
 # ==============================================================================
 def run_scanner_loop():
     init_db()
-    print("⚡️ Bắt đầu Bybit Early Pump & Dynamic TP/SL Engine...", flush=True)
+    # Kích hoạt luồng lắng nghe lệnh /tonghop ngầm
+    Thread(target=listen_telegram_commands, daemon=True).start()
+
+    print("⚡️ Bắt đầu Bybit Early Pump & Dynamic TP/SL Engine (/tonghop Enabled)...", flush=True)
     while True:
         try:
             tickers = get_usdt_perpetual_tickers()
@@ -475,7 +537,7 @@ def run_scanner_loop():
                     if should_send:
                         sig['call_count'] = call_count
                         if send_telegram_alert(sig):
-                            save_active_trade(sig) # Lưu vị thế vào bảng theo dõi TP/SL
+                            save_active_trade(sig)
                             sent_count += 1
                             print(f"✅ [SNIPER TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Score: {sig['score']}", flush=True)
 

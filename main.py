@@ -14,37 +14,36 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Early Pump Engine (/tonghop Command Enabled) Active 24/7!"
+    return "Bybit Early Pump Engine (LUMIA Sensitive Mode) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 # ==============================================================================
-# 2. CẤU HÌNH BIẾN MÔI TRƯỜNG & NGƯỠNG LỌC
+# 2. CẤU HÌNH BIẾN MÔI TRƯỜNG & NGƯỠNG LỌC CẬP NHẬT
 # ==============================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
-MIN_SCORE = int(os.environ.get("MIN_SCORE", "80"))
+MIN_SCORE = int(os.environ.get("MIN_SCORE", "78"))                   # Hạ nhẹ điểm xuống 78 để không bỏ sót
 MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))
 MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.20"))
 MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "80"))
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "1800")) 
 
-MAX_ALERTS_PER_CYCLE = 3  # Tối đa Top 3 kèo chất lượng nhất mỗi chu kỳ
+MAX_ALERTS_PER_CYCLE = 5  # 🔴 NÂNG LÊN TOP 5 KÈO CÓ ĐIỂM SỐ CAO NHẤT MỖI CHU KỲ
 
 DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 3. SQLITE DATABASE (CHỐNG SPAM & QUẢN LÝ QUÁ TRÌNH TP/SL)
+# 3. SQLITE DATABASE (CHỐNG SPAM & QUẢN LÝ TP/SL DỘNG)
 # ==============================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        # Bảng chống lặp
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sent_signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,7 +55,6 @@ def init_db():
                 UNIQUE(symbol, status)
             )
         """)
-        # Bảng theo dõi giá TP/SL thời gian thực
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS active_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,7 +115,6 @@ def save_active_trade(sig: dict):
         conn.commit()
 
 def get_summary_report() -> str:
-    """Tạo nội dung báo cáo khi gõ lệnh /tonghop"""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT symbol, entry, sl, tp1, tp2, tp3, tp1_hit FROM active_trades WHERE status = 'OPEN' ORDER BY id DESC")
@@ -131,7 +128,6 @@ def get_summary_report() -> str:
 
     for idx, t in enumerate(trades, 1):
         sym, entry, sl, tp1, tp2, tp3, tp1_hit = t
-        
         if tp1_hit == 1:
             sl_status = f"<code>{entry:.4f}</code> (🛡 Đã cắn TP1 -> Dời SL về Breakeven)"
             status_tag = "✅ <b>[ĐÃ HÍT TP1]</b>"
@@ -151,11 +147,7 @@ def get_summary_report() -> str:
     msg += "\n\n<i>⚠️ Lưu ý: Khi kèo cắn TP1, SL tự động được dời về Entry (Hòa vốn) để bảo vệ tài khoản.</i>"
     return msg
 
-# ==============================================================================
-# 4. BOT TELEGRAM COMMAND LISTENER (/tonghop)
-# ==============================================================================
 def listen_telegram_commands():
-    """Luồng chạy ngầm nhận lệnh /tonghop từ Telegram"""
     if not BOT_TOKEN: return
     last_update_id = 0
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
@@ -172,15 +164,15 @@ def listen_telegram_commands():
                     text = message.get("text", "")
                     chat_id = str(message.get("chat", {}).get("id", ""))
 
-                    if text.strip().lower() in ["/tonghop", "/tonghop@your_bot_id", "tonghop"]:
+                    if text.strip().lower() in ["/tonghop", "tonghop"]:
                         summary_msg = get_summary_report()
                         send_direct_message(summary_msg, target_chat_id=chat_id if chat_id else CHAT_ID)
-        except Exception as e:
+        except Exception:
             pass
         time.sleep(2)
 
 # ==============================================================================
-# 5. API BYBIT V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT
+# 4. BYBIT API V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -285,7 +277,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 6. ENGINE PHÁT HIỆN TRẠNG THÁI & CHẤM ĐIỂM
+# 5. ENGINE PHÁT HIỆN TRẠNG THÁI & CHẤM ĐIỂM (TỐI ƯU NHẠY VỚI LUMIA)
 # ==============================================================================
 def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: float) -> dict:
     if df_m15.empty or len(df_m15) < 35: return None
@@ -303,23 +295,24 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     base_low = prev_candles['low'].min()
     base_range_pct = ((base_high - base_low) / base_low) * 100
 
-    is_tight_base = base_range_pct <= 10.0
-    is_bb_squeezed = bb_width_now <= 0.08
+    is_tight_base = base_range_pct <= 12.0
+    is_bb_squeezed = bb_width_now <= 0.10             # Nới nhẹ BB width lên 0.10
 
     status = None
     reasons = []
 
-    if close_now > base_high and vol_ratio_now >= 1.5:
+    # Hạ Volume Ratio xuống 1.2x để bắt các cây nến nổ sớm kiểu LUMIA
+    if close_now > base_high and vol_ratio_now >= 1.2:
         status = "BREAKOUT CONFIRMED"
         reasons.append(f"Đóng nến M15 ({close_now:.4f}) vượt đỉnh nền ({base_high:.4f})")
-        reasons.append(f"Volume bùng nổ {vol_ratio_now:.1f}x so với MA20")
+        reasons.append(f"Volume bắt đầu bùng nổ {vol_ratio_now:.1f}x so với MA20")
 
-    elif is_tight_base and is_bb_squeezed and (close_now >= base_high * 0.985):
+    elif is_tight_base and is_bb_squeezed and (close_now >= base_high * 0.980):
         status = "PRE-BREAKOUT"
         reasons.append(f"Nền tích lũy nén chặt {base_range_pct:.1f}% trong 24 nến M15")
-        reasons.append("Bollinger Bands siết chặt, áp sát vùng kháng cự")
+        reasons.append("Bollinger Bands siết hẹp, giá chạm sát vùng kháng cự")
 
-    elif close_now <= base_high * 1.01 and close_now >= base_high * 0.99 and vol_ratio_now < 1.3:
+    elif close_now <= base_high * 1.01 and close_now >= base_high * 0.985 and vol_ratio_now < 1.3:
         status = "RETEST WATCH"
         reasons.append(f"Giá test lại vùng phá nền ({base_high:.4f}) với Volume cạn")
 
@@ -345,11 +338,11 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     elif status == "PRE-BREAKOUT": score += 18
     elif status == "RETEST WATCH": score += 15
 
-    if vol_ratio_now >= 2.5: score += 20
-    elif vol_ratio_now >= 1.8: score += 15
+    if vol_ratio_now >= 2.0: score += 20
+    elif vol_ratio_now >= 1.2: score += 15
     else: score += 10
 
-    if 55 <= rsi_now <= 72: score += 15
+    if 50 <= rsi_now <= 75: score += 15
     else: score += 8
 
     if not df_h1.empty and len(df_h1) >= 20:
@@ -357,7 +350,7 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
         if last_h1['close'] > last_h1['ema34']: score += 10
 
     coin_perf = ((close_now - df_m15.iloc[0]['close']) / df_m15.iloc[0]['close']) * 100
-    if coin_perf > btc_perf + 2.0: score += 10
+    if coin_perf > btc_perf + 1.5: score += 10
     else: score += 5
 
     score += 5
@@ -383,7 +376,7 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     }
 
 # ==============================================================================
-# 7. HỆ THỐNG GỬI TELEGRAM & THEO DÕI QUÁ TRÌNH TP/SL
+# 6. HỆ THỐNG GỬI TELEGRAM & THEO DÕI TP/SL
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
@@ -415,7 +408,7 @@ def send_telegram_alert(sig: dict) -> bool:
 
 🔗 <a href="https://www.bybit.com/trade/usdt/{sig['symbol']}">Biểu đồ Bybit {sig['symbol']}</a>
 
-<i>💡 Gõ <b>/tonghop</b> trên Telegram để xem danh sách TP/SL tất cả các kèo đang Active.</i>"""
+<i>💡 Gõ <b>/tonghop</b> trên Telegram để xem danh sách TP/SL các kèo đang Active.</i>"""
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -488,7 +481,6 @@ Kịch bản bị vô hiệu hóa."""
 # ==============================================================================
 def run_scanner_loop():
     init_db()
-    # Kích hoạt luồng lắng nghe lệnh /tonghop ngầm
     Thread(target=listen_telegram_commands, daemon=True).start()
 
     print("⚡️ Bắt đầu Bybit Early Pump & Dynamic TP/SL Engine (/tonghop Enabled)...", flush=True)
@@ -528,11 +520,11 @@ def run_scanner_loop():
                     scanned_signals.append(analysis)
 
             scanned_signals.sort(key=lambda x: x['score'], reverse=True)
-            top_3_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
+            top_5_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
 
             sent_count = 0
-            if top_3_signals:
-                for sig in top_3_signals:
+            if top_5_signals:
+                for sig in top_5_signals:
                     should_send, call_count = process_signal_dedup(sig['symbol'], sig['status'], sig['score'])
                     if should_send:
                         sig['call_count'] = call_count

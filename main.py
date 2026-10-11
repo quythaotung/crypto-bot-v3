@@ -14,32 +14,34 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Early Pump Engine (LUMIA Sensitive Mode) Active 24/7!"
+    return "Bybit Early Pump Engine (88+ Points & Upgrade Criteria) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 # ==============================================================================
-# 2. CẤU HÌNH BIẾN MÔI TRƯỜNG & NGƯỠNG LỌC CẬP NHẬT
+# 2. CẤU HÌNH BIẾN MÔI TRƯỜNG & NGƯỠNG LỌC ĐIỂM
 # ==============================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
-MIN_SCORE = int(os.environ.get("MIN_SCORE", "78"))                   # Hạ nhẹ điểm xuống 78 để không bỏ sót
+HARD_MIN_SCORE = 88                                                  # 🔴 Chỉ báo ngay nếu >= 88 điểm
+POTENTIAL_MIN_SCORE = 83                                             # 🟡 Lưu theo dõi ngầm nếu từ 83 đến 87 điểm
+
 MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))
 MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.20"))
 MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "80"))
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "1800")) 
 
-MAX_ALERTS_PER_CYCLE = 5  # 🔴 NÂNG LÊN TOP 5 KÈO CÓ ĐIỂM SỐ CAO NHẤT MỖI CHU KỲ
+MAX_ALERTS_PER_CYCLE = 5  # Top 5 kèo có điểm số cao nhất mỗi chu kỳ
 
 DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 3. SQLITE DATABASE (CHỐNG SPAM & QUẢN LÝ TP/SL DỘNG)
+# 3. SQLITE DATABASE (XỬ LÝ ĐIỂM TIỀM NĂNG 83-87 & NÂNG ĐIỂM LẦN 2)
 # ==============================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -52,6 +54,7 @@ def init_db():
                 score INTEGER,
                 call_count INTEGER DEFAULT 1,
                 last_sent_at INTEGER NOT NULL,
+                has_been_alerted INTEGER DEFAULT 0,
                 UNIQUE(symbol, status)
             )
         """)
@@ -72,37 +75,80 @@ def init_db():
         """)
         conn.commit()
 
-def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
+def process_signal_scoring_logic(symbol: str, status: str, score: int) -> tuple:
+    """
+    Xử lý logic lọc điểm:
+    - Nếu score >= 88 ngay từ đầu: Cho phép báo ngay (has_been_alerted = 1).
+    - Nếu 83 <= score < 88 lần đầu: Lưu ngầm theo dõi (has_been_alerted = 0, không báo Telegram).
+    - Nếu coin 83-87 điểm ở các chu kỳ sau NÂNG LÊN >= 88 điểm: Cho phép báo Telegram (Call lần 2).
+    """
     now_ts = int(time.time())
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT call_count, last_sent_at, score FROM sent_signals WHERE symbol = ? AND status = ?",
+            "SELECT call_count, last_sent_at, score, has_been_alerted FROM sent_signals WHERE symbol = ? AND status = ?",
             (symbol, status)
         )
         row = cursor.fetchone()
 
         if row is None:
-            cursor.execute(
-                "INSERT INTO sent_signals (symbol, status, score, call_count, last_sent_at) VALUES (?, ?, ?, 1, ?)",
-                (symbol, status, score, now_ts)
-            )
-            conn.commit()
-            return True, 1
+            # Lần đầu tiên phát hiện coin
+            if score >= HARD_MIN_SCORE:
+                # Đạt hẳn >= 88 điểm -> Báo Telegram ngay
+                cursor.execute(
+                    "INSERT INTO sent_signals (symbol, status, score, call_count, last_sent_at, has_been_alerted) VALUES (?, ?, ?, 1, ?, 1)",
+                    (symbol, status, score, now_ts)
+                )
+                conn.commit()
+                return True, 1
+            elif score >= POTENTIAL_MIN_SCORE:
+                # Đạt từ 83 - 87 điểm -> Lưu ngầm theo dõi tiềm năng, KHÔNG gửi báo ngay
+                cursor.execute(
+                    "INSERT INTO sent_signals (symbol, status, score, call_count, last_sent_at, has_been_alerted) VALUES (?, ?, ?, 1, ?, 0)",
+                    (symbol, status, score, now_ts)
+                )
+                conn.commit()
+                return False, 1
+            else:
+                return False, 0
         else:
-            prev_call_count, last_sent_at, prev_score = row
+            prev_call_count, last_sent_at, prev_score, has_been_alerted = row
             time_passed = now_ts - last_sent_at
 
-            if time_passed < COOLDOWN_SECONDS and (score - prev_score) < 5:
-                return False, prev_call_count
+            # Coin cũ trước đó nằm ở vùng tiềm năng (83-87đ) chưa từng được báo
+            if has_been_alerted == 0:
+                if score >= HARD_MIN_SCORE:
+                    # ĐÃ NÂNG ĐIỂM THỰC SỰ TIỀM NĂNG (Nâng lên >= 88đ) -> Cho phép phát báo Telegram ở LẦN 2!
+                    new_call_count = prev_call_count + 1
+                    cursor.execute(
+                        "UPDATE sent_signals SET call_count = ?, last_sent_at = ?, score = ?, has_been_alerted = 1 WHERE symbol = ? AND status = ?",
+                        (new_call_count, now_ts, score, symbol, status)
+                    )
+                    conn.commit()
+                    return True, new_call_count
+                else:
+                    # Vẫn giậm chân ở điểm thấp < 88đ -> Cập nhật lại điểm, tiếp tục theo dõi ngầm
+                    cursor.execute(
+                        "UPDATE sent_signals SET score = ?, last_sent_at = ? WHERE symbol = ? AND status = ?",
+                        (score, now_ts, symbol, status)
+                    )
+                    conn.commit()
+                    return False, prev_call_count
 
-            new_call_count = prev_call_count + 1
-            cursor.execute(
-                "UPDATE sent_signals SET call_count = ?, last_sent_at = ?, score = ? WHERE symbol = ? AND status = ?",
-                (new_call_count, now_ts, score, symbol, status)
-            )
-            conn.commit()
-            return True, new_call_count
+            # Coin đã từng được báo Telegram trước đây (has_been_alerted == 1)
+            else:
+                if time_passed < COOLDOWN_SECONDS and (score - prev_score) < 5:
+                    return False, prev_call_count
+
+                if score >= HARD_MIN_SCORE:
+                    new_call_count = prev_call_count + 1
+                    cursor.execute(
+                        "UPDATE sent_signals SET call_count = ?, last_sent_at = ?, score = ? WHERE symbol = ? AND status = ?",
+                        (new_call_count, now_ts, score, symbol, status)
+                    )
+                    conn.commit()
+                    return True, new_call_count
+                return False, prev_call_count
 
 def save_active_trade(sig: dict):
     now_ts = int(time.time())
@@ -277,7 +323,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 5. ENGINE PHÁT HIỆN TRẠNG THÁI & CHẤM ĐIỂM (TỐI ƯU NHẠY VỚI LUMIA)
+# 5. ENGINE PHÁT HIỆN TRẠNG THÁI & CHẤM ĐIỂM
 # ==============================================================================
 def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: float) -> dict:
     if df_m15.empty or len(df_m15) < 35: return None
@@ -296,12 +342,11 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     base_range_pct = ((base_high - base_low) / base_low) * 100
 
     is_tight_base = base_range_pct <= 12.0
-    is_bb_squeezed = bb_width_now <= 0.10             # Nới nhẹ BB width lên 0.10
+    is_bb_squeezed = bb_width_now <= 0.10
 
     status = None
     reasons = []
 
-    # Hạ Volume Ratio xuống 1.2x để bắt các cây nến nổ sớm kiểu LUMIA
     if close_now > base_high and vol_ratio_now >= 1.2:
         status = "BREAKOUT CONFIRMED"
         reasons.append(f"Đóng nến M15 ({close_now:.4f}) vượt đỉnh nền ({base_high:.4f})")
@@ -483,7 +528,7 @@ def run_scanner_loop():
     init_db()
     Thread(target=listen_telegram_commands, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit Early Pump & Dynamic TP/SL Engine (/tonghop Enabled)...", flush=True)
+    print("⚡️ Bắt đầu Bybit Early Pump & Dynamic TP/SL Engine (88+ Points Filter)...", flush=True)
     while True:
         try:
             tickers = get_usdt_perpetual_tickers()
@@ -511,7 +556,8 @@ def run_scanner_loop():
                     df_h1 = add_indicators(df_h1)
 
                 analysis = analyze_early_pump(df_m15, df_h1, btc_perf)
-                if analysis and analysis['score'] >= MIN_SCORE:
+                # Chỉ xử lý nếu điểm đạt từ 83 trở lên (để đưa vào luồng kiểm tra / nâng điểm)
+                if analysis and analysis['score'] >= POTENTIAL_MIN_SCORE:
                     oi_change = get_open_interest_change(sym)
                     analysis['symbol'] = sym
                     analysis['turnover24h'] = t['turnover24h']
@@ -525,13 +571,13 @@ def run_scanner_loop():
             sent_count = 0
             if top_5_signals:
                 for sig in top_5_signals:
-                    should_send, call_count = process_signal_dedup(sig['symbol'], sig['status'], sig['score'])
+                    should_send, call_count = process_signal_scoring_logic(sig['symbol'], sig['status'], sig['score'])
                     if should_send:
                         sig['call_count'] = call_count
                         if send_telegram_alert(sig):
                             save_active_trade(sig)
                             sent_count += 1
-                            print(f"✅ [SNIPER TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Score: {sig['score']}", flush=True)
+                            print(f"✅ [SNIPER TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Call lần {call_count} | Score: {sig['score']}", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)

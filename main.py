@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Early Pump Engine (88+ Points & Upgrade Criteria) Active 24/7!"
+    return "Bybit Early Pump Engine (Anti-SL Hunt & Fixed TP Logic) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -26,8 +26,8 @@ def run_flask():
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
-HARD_MIN_SCORE = 88                                                  # 🔴 Chỉ báo ngay nếu >= 88 điểm
-POTENTIAL_MIN_SCORE = 83                                             # 🟡 Lưu theo dõi ngầm nếu từ 83 đến 87 điểm
+HARD_MIN_SCORE = 88                                                  # Chỉ báo ngay nếu >= 88 điểm
+POTENTIAL_MIN_SCORE = 83                                             # Lưu theo dõi ngầm nếu từ 83 đến 87 điểm
 
 MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))
 MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.20"))
@@ -76,12 +76,6 @@ def init_db():
         conn.commit()
 
 def process_signal_scoring_logic(symbol: str, status: str, score: int) -> tuple:
-    """
-    Xử lý logic lọc điểm:
-    - Nếu score >= 88 ngay từ đầu: Cho phép báo ngay (has_been_alerted = 1).
-    - Nếu 83 <= score < 88 lần đầu: Lưu ngầm theo dõi (has_been_alerted = 0, không báo Telegram).
-    - Nếu coin 83-87 điểm ở các chu kỳ sau NÂNG LÊN >= 88 điểm: Cho phép báo Telegram (Call lần 2).
-    """
     now_ts = int(time.time())
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
@@ -92,9 +86,7 @@ def process_signal_scoring_logic(symbol: str, status: str, score: int) -> tuple:
         row = cursor.fetchone()
 
         if row is None:
-            # Lần đầu tiên phát hiện coin
             if score >= HARD_MIN_SCORE:
-                # Đạt hẳn >= 88 điểm -> Báo Telegram ngay
                 cursor.execute(
                     "INSERT INTO sent_signals (symbol, status, score, call_count, last_sent_at, has_been_alerted) VALUES (?, ?, ?, 1, ?, 1)",
                     (symbol, status, score, now_ts)
@@ -102,7 +94,6 @@ def process_signal_scoring_logic(symbol: str, status: str, score: int) -> tuple:
                 conn.commit()
                 return True, 1
             elif score >= POTENTIAL_MIN_SCORE:
-                # Đạt từ 83 - 87 điểm -> Lưu ngầm theo dõi tiềm năng, KHÔNG gửi báo ngay
                 cursor.execute(
                     "INSERT INTO sent_signals (symbol, status, score, call_count, last_sent_at, has_been_alerted) VALUES (?, ?, ?, 1, ?, 0)",
                     (symbol, status, score, now_ts)
@@ -115,10 +106,8 @@ def process_signal_scoring_logic(symbol: str, status: str, score: int) -> tuple:
             prev_call_count, last_sent_at, prev_score, has_been_alerted = row
             time_passed = now_ts - last_sent_at
 
-            # Coin cũ trước đó nằm ở vùng tiềm năng (83-87đ) chưa từng được báo
             if has_been_alerted == 0:
                 if score >= HARD_MIN_SCORE:
-                    # ĐÃ NÂNG ĐIỂM THỰC SỰ TIỀM NĂNG (Nâng lên >= 88đ) -> Cho phép phát báo Telegram ở LẦN 2!
                     new_call_count = prev_call_count + 1
                     cursor.execute(
                         "UPDATE sent_signals SET call_count = ?, last_sent_at = ?, score = ?, has_been_alerted = 1 WHERE symbol = ? AND status = ?",
@@ -127,15 +116,12 @@ def process_signal_scoring_logic(symbol: str, status: str, score: int) -> tuple:
                     conn.commit()
                     return True, new_call_count
                 else:
-                    # Vẫn giậm chân ở điểm thấp < 88đ -> Cập nhật lại điểm, tiếp tục theo dõi ngầm
                     cursor.execute(
                         "UPDATE sent_signals SET score = ?, last_sent_at = ? WHERE symbol = ? AND status = ?",
                         (score, now_ts, symbol, status)
                     )
                     conn.commit()
                     return False, prev_call_count
-
-            # Coin đã từng được báo Telegram trước đây (has_been_alerted == 1)
             else:
                 if time_passed < COOLDOWN_SECONDS and (score - prev_score) < 5:
                     return False, prev_call_count
@@ -186,9 +172,9 @@ def get_summary_report() -> str:
 {idx}. #<b>{sym}</b> {status_tag}
 • 🎯 <b>Entry:</b> <code>{entry:.4f}</code>
 • 🛡 <b>Stop Loss:</b> {sl_status}
-• 🚀 <b>TP1 (+5%):</b> <code>{tp1:.4f}</code>
-• 🚀 <b>TP2:</b> <code>{tp2:.4f}</code>
-• 🚀 <b>TP3:</b> <code>{tp3:.4f}</code>"""
+• 🚀 <b>TP1 (R:R 1:1.5):</b> <code>{tp1:.4f}</code>
+• 🚀 <b>TP2 (R:R 1:2.5):</b> <code>{tp2:.4f}</code>
+• 🚀 <b>TP3 (R:R 1:4.0):</b> <code>{tp3:.4f}</code>"""
 
     msg += "\n\n<i>⚠️ Lưu ý: Khi kèo cắn TP1, SL tự động được dời về Entry (Hòa vốn) để bảo vệ tài khoản.</i>"
     return msg
@@ -323,7 +309,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 5. ENGINE PHÁT HIỆN TRẠNG THÁI & CHẤM ĐIỂM
+# 5. ENGINE PHÁT HIỆN TRẠNG THÁI & LỌC BẪY SL/VOLUME
 # ==============================================================================
 def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: float) -> dict:
     if df_m15.empty or len(df_m15) < 35: return None
@@ -341,7 +327,11 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     base_low = prev_candles['low'].min()
     base_range_pct = ((base_high - base_low) / base_low) * 100
 
-    is_tight_base = base_range_pct <= 12.0
+    # LỌC BẪY NỀN QUÁ MỎNG (< 1.5% DỄ BỊ BỐC HƠI BỞI RÂU NẾN)
+    if base_range_pct < 1.5:
+        base_range_pct = 2.0  # Chuẩn hóa để tính toán an toàn
+
+    is_tight_base = 1.5 <= base_range_pct <= 12.0
     is_bb_squeezed = bb_width_now <= 0.10
 
     status = None
@@ -350,7 +340,7 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     if close_now > base_high and vol_ratio_now >= 1.2:
         status = "BREAKOUT CONFIRMED"
         reasons.append(f"Đóng nến M15 ({close_now:.4f}) vượt đỉnh nền ({base_high:.4f})")
-        reasons.append(f"Volume bắt đầu bùng nổ {vol_ratio_now:.1f}x so với MA20")
+        reasons.append(f"Volume bắt đầu bùng nổ {vol_ratio_now:.1f}x so meo MA20")
 
     elif is_tight_base and is_bb_squeezed and (close_now >= base_high * 0.980):
         status = "PRE-BREAKOUT"
@@ -366,16 +356,25 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     pump_from_base = ((close_now - base_low) / base_low) * 100
     no_chase = pump_from_base > 12.0
 
-    invalidation_sl = base_low - (0.3 * atr_now)
+    # 🔴 ĐIỀU CHỈNH KHOẢNG CÁCH SL AN TOÀN (TỐI THIỂU 2.0% TRÁNH SL HUNT)
+    calculated_sl = base_low - (0.5 * atr_now)
+    sl_distance_pct = ((close_now - calculated_sl) / close_now) * 100
+
+    if sl_distance_pct < 2.0:
+        invalidation_sl = close_now * 0.98  # Ép khoảng cách SL tối thiểu 2%
+    else:
+        invalidation_sl = calculated_sl
+
     risk = close_now - invalidation_sl
     if risk <= 0: return None
 
-    tp1 = max(close_now + (risk * 2.0), close_now * 1.05)
-    tp2 = close_now + (risk * 3.5)
-    tp3 = close_now + (risk * 5.0)
+    # 🔴 ĐIỀU CHỈNH LOGIC CHUẨN ĐÚNG THỨ TỰ TP1 < TP2 < TP3 THEO TỶ LỆ R:R
+    tp1 = close_now + (risk * 1.5)
+    tp2 = close_now + (risk * 2.5)
+    tp3 = close_now + (risk * 4.0)
 
     score = 0
-    if base_range_pct <= 5.0: score += 20
+    if 3.0 <= base_range_pct <= 6.0: score += 20
     elif base_range_pct <= 8.0: score += 15
     else: score += 10
 
@@ -383,7 +382,10 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     elif status == "PRE-BREAKOUT": score += 18
     elif status == "RETEST WATCH": score += 15
 
-    if vol_ratio_now >= 2.0: score += 20
+    # 🔴 TRỪ ĐIỂM BẪY VOLUME ẢO (VOLUME > 10X KHI CHƯA PHÁ NỀN -> TRỪ 20đ)
+    if vol_ratio_now > 10.0 and status == "PRE-BREAKOUT":
+        score -= 20
+    elif 2.0 <= vol_ratio_now <= 6.0: score += 20
     elif vol_ratio_now >= 1.2: score += 15
     else: score += 10
 
@@ -402,7 +404,7 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
 
     return {
         "status": status,
-        "score": min(100, score),
+        "score": min(100, max(0, score)),
         "close_price": close_now,
         "base_high": base_high,
         "base_low": base_low,
@@ -414,7 +416,7 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
         "tp1": round(tp1, 4),
         "tp2": round(tp2, 4),
         "tp3": round(tp3, 4),
-        "rr_ratio": "1:2 / 1:3.5",
+        "rr_ratio": "1:1.5 / 1:2.5",
         "no_chase": no_chase,
         "reasons": reasons,
         "timestamp": last_candle['timestamp']
@@ -441,7 +443,7 @@ def send_telegram_alert(sig: dict) -> bool:
 🎯 <b>Kháng cự Breakout:</b> {sig['base_high']:.4f}
 🔄 <b>Vùng Retest tham khảo:</b> {sig['retest_zone']}
 🛡 <b>Hỗ trợ / Stop Loss:</b> {sig['invalidation_sl']:.4f}
-⛳️ <b>TP1 (+5%):</b> {sig['tp1']:.4f} | <b>TP2:</b> {sig['tp2']:.4f}
+⛳️ <b>TP1 (R:R 1:1.5):</b> {sig['tp1']:.4f} | <b>TP2 (R:R 1:2.5):</b> {sig['tp2']:.4f}
 
 📊 <b>Turnover 24h:</b> ${sig['turnover24h']/1e6:.2f}M USD
 🔥 <b>Volume / MA20:</b> {sig['vol_ratio']}x
@@ -493,7 +495,7 @@ def track_and_update_active_trades(tickers_map: dict):
                 msg = f"""🎉 <b>TAKE PROFIT ALERT — TP1 HIT!</b>
 
 #<b>{sym}</b>
-✅ Giá đã chạm <b>TP1: {tp1:.4f}</b> (+5.0%+)
+✅ Giá đã chạm <b>TP1: {tp1:.4f}</b>
 🛡 <b>CẬP NHẬT RỦI RO:</b> Đã dời SL về Breakeven (Hòa vốn) tại <b>{entry:.4f}</b>.
 👉 <b>Mức Stop Loss ban đầu ({sl:.4f}) KHÔNG CÒN HIỆU LỰC!</b> Vị thế hoàn toàn an toàn."""
                 send_direct_message(msg)
@@ -528,7 +530,7 @@ def run_scanner_loop():
     init_db()
     Thread(target=listen_telegram_commands, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit Early Pump & Dynamic TP/SL Engine (88+ Points Filter)...", flush=True)
+    print("⚡️ Bắt đầu Bybit Early Pump Engine (Anti-SL Hunt & Fixed TP)...", flush=True)
     while True:
         try:
             tickers = get_usdt_perpetual_tickers()
@@ -556,7 +558,6 @@ def run_scanner_loop():
                     df_h1 = add_indicators(df_h1)
 
                 analysis = analyze_early_pump(df_m15, df_h1, btc_perf)
-                # Chỉ xử lý nếu điểm đạt từ 83 trở lên (để đưa vào luồng kiểm tra / nâng điểm)
                 if analysis and analysis['score'] >= POTENTIAL_MIN_SCORE:
                     oi_change = get_open_interest_change(sym)
                     analysis['symbol'] = sym

@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Early Pump Engine (Anti-SL Hunt & Fixed TP Logic) Active 24/7!"
+    return "Bybit Early Pump Engine (Max 3 Calls & Strict TP/SL Lifecycle) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -35,13 +35,14 @@ MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "80"))
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "1800")) 
 
-MAX_ALERTS_PER_CYCLE = 5  # Top 5 kèo có điểm số cao nhất mỗi chu kỳ
+MAX_ALERTS_PER_CYCLE = 3  # Tối đa Top 3 kèo mới mỗi chu kỳ
+MAX_ACTIVE_TRADES = 5     # Tối đa 5 kèo đang chạy (chưa cắn SL/TP) cùng lúc
 
 DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 3. SQLITE DATABASE (XỬ LÝ ĐIỂM TIỀM NĂNG 83-87 & NÂNG ĐIỂM LẦN 2)
+# 3. SQLITE DATABASE (XỬ LÝ TỐI ĐA 3 LẦN CALL & QUẢN LÝ VÒNG ĐỜI KÈO)
 # ==============================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -75,7 +76,26 @@ def init_db():
         """)
         conn.commit()
 
+def is_symbol_currently_active(symbol: str) -> bool:
+    """Kiểm tra xem coin này có đang mở vị thế (chưa SL/TP) không"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM active_trades WHERE symbol = ? AND status = 'OPEN'", (symbol,))
+        return cursor.fetchone() is not None
+
+def get_active_trades_count() -> int:
+    """Đếm số lượng kèo đang chạy chưa chạm TP2/SL"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM active_trades WHERE status = 'OPEN'")
+        return cursor.fetchone()[0]
+
 def process_signal_scoring_logic(symbol: str, status: str, score: int) -> tuple:
+    """
+    Xử lý logic lọc điểm & giới hạn TỐI ĐA 3 LẦN CALL:
+    - Nếu call_count >= 3: DỪNG BÁO HOÀN TOÀN (Trả về False).
+    - Chỉ báo lại khi kèo cũ kết thúc (SL/TP) và xuất hiện tín hiệu mới.
+    """
     now_ts = int(time.time())
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
@@ -105,6 +125,10 @@ def process_signal_scoring_logic(symbol: str, status: str, score: int) -> tuple:
         else:
             prev_call_count, last_sent_at, prev_score, has_been_alerted = row
             time_passed = now_ts - last_sent_at
+
+            # 🔴 ĐÃ CALL ĐỦ 3 LẦN -> KHÔNG CALL THÊM NỮA!
+            if prev_call_count >= 3:
+                return False, prev_call_count
 
             if has_been_alerted == 0:
                 if score >= HARD_MIN_SCORE:
@@ -327,9 +351,8 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     base_low = prev_candles['low'].min()
     base_range_pct = ((base_high - base_low) / base_low) * 100
 
-    # LỌC BẪY NỀN QUÁ MỎNG (< 1.5% DỄ BỊ BỐC HƠI BỞI RÂU NẾN)
     if base_range_pct < 1.5:
-        base_range_pct = 2.0  # Chuẩn hóa để tính toán an toàn
+        base_range_pct = 2.0
 
     is_tight_base = 1.5 <= base_range_pct <= 12.0
     is_bb_squeezed = bb_width_now <= 0.10
@@ -340,7 +363,7 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     if close_now > base_high and vol_ratio_now >= 1.2:
         status = "BREAKOUT CONFIRMED"
         reasons.append(f"Đóng nến M15 ({close_now:.4f}) vượt đỉnh nền ({base_high:.4f})")
-        reasons.append(f"Volume bắt đầu bùng nổ {vol_ratio_now:.1f}x so meo MA20")
+        reasons.append(f"Volume bắt đầu bùng nổ {vol_ratio_now:.1f}x so với MA20")
 
     elif is_tight_base and is_bb_squeezed and (close_now >= base_high * 0.980):
         status = "PRE-BREAKOUT"
@@ -356,19 +379,17 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     pump_from_base = ((close_now - base_low) / base_low) * 100
     no_chase = pump_from_base > 12.0
 
-    # 🔴 ĐIỀU CHỈNH KHOẢNG CÁCH SL AN TOÀN (TỐI THIỂU 2.0% TRÁNH SL HUNT)
     calculated_sl = base_low - (0.5 * atr_now)
     sl_distance_pct = ((close_now - calculated_sl) / close_now) * 100
 
     if sl_distance_pct < 2.0:
-        invalidation_sl = close_now * 0.98  # Ép khoảng cách SL tối thiểu 2%
+        invalidation_sl = close_now * 0.98
     else:
         invalidation_sl = calculated_sl
 
     risk = close_now - invalidation_sl
     if risk <= 0: return None
 
-    # 🔴 ĐIỀU CHỈNH LOGIC CHUẨN ĐÚNG THỨ TỰ TP1 < TP2 < TP3 THEO TỶ LỆ R:R
     tp1 = close_now + (risk * 1.5)
     tp2 = close_now + (risk * 2.5)
     tp3 = close_now + (risk * 4.0)
@@ -382,7 +403,6 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     elif status == "PRE-BREAKOUT": score += 18
     elif status == "RETEST WATCH": score += 15
 
-    # 🔴 TRỪ ĐIỂM BẪY VOLUME ẢO (VOLUME > 10X KHI CHƯA PHÁ NỀN -> TRỪ 20đ)
     if vol_ratio_now > 10.0 and status == "PRE-BREAKOUT":
         score -= 20
     elif 2.0 <= vol_ratio_now <= 6.0: score += 20
@@ -423,7 +443,7 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     }
 
 # ==============================================================================
-# 6. HỆ THỐNG GỬI TELEGRAM & THEO DÕI TP/SL
+# 6. HỆ THỐNG GỬI TELEGRAM & THEO DÕI TP/SL (GIẢI PHÓNG KHI DÍNH SL/TP)
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
@@ -434,7 +454,7 @@ def send_telegram_alert(sig: dict) -> bool:
 
 <b>Coin:</b> #{sig['symbol']}
 <b>Trạng thái:</b> <code>{sig['status']}</code>
-🔔 <b>Lần thông báo:</b> <b>Call lần {sig['call_count']}</b>
+🔔 <b>Lần thông báo:</b> <b>Call lần {sig['call_count']}/3</b>
 ⭐ <b>Điểm xếp hạng:</b> <b>{sig['score']}/100</b>
 <b>Khung thời gian:</b> M15 + H1
 
@@ -477,6 +497,7 @@ def send_direct_message(text: str, target_chat_id: str = None):
         pass
 
 def track_and_update_active_trades(tickers_map: dict):
+    """🔴 KHI DÍNH SL HOẶC TP -> GIẢI PHÓNG ĐỂ BÁO SETUP MỚI"""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id, symbol, entry, sl, tp1, tp2, tp3, tp1_hit FROM active_trades WHERE status = 'OPEN'")
@@ -501,26 +522,28 @@ def track_and_update_active_trades(tickers_map: dict):
                 send_direct_message(msg)
                 print(f"🎯 [TP1 HIT] #{sym} -> SL updated to Entry", flush=True)
 
-            # 2. KIỂM TRA CHẠM TP2 HOẶC TP3
+            # 2. KIỂM TRA CHẠM TP2 HOẶC TP3 -> ĐÓNG VỊ THẾ & GIẢI PHÓNG
             elif tp1_hit == 1 and curr_price >= tp2:
                 cursor.execute("UPDATE active_trades SET status = 'CLOSED_TP2' WHERE id = ?", (trade_id,))
+                cursor.execute("DELETE FROM sent_signals WHERE symbol = ?", (sym,)) # Xóa bộ đếm call để sẵn sàng cho setup mới
                 conn.commit()
                 msg = f"""🚀 <b>TAKE PROFIT ALERT — TP2 HIT!</b>
 
 #<b>{sym}</b>
 ✅ Giá đã chốt lời thành công chặng 2 tại <b>TP2: {tp2:.4f}</b>!
-🎉 Chúc mừng bạn đã gặt hái lợi nhuận tối đa!"""
+🎉 Kèo đã hoàn tất thành công. Đã giải phóng để đón setup mới!"""
                 send_direct_message(msg)
 
-            # 3. KIỂM TRA DÍNH SL (Chỉ xảy ra nếu CHƯA chạm TP1)
+            # 3. KIỂM TRA DÍNH SL -> ĐÓNG VỊ THẾ & GIẢI PHÓNG
             elif tp1_hit == 0 and curr_price <= sl:
                 cursor.execute("UPDATE active_trades SET status = 'CLOSED_SL' WHERE id = ?", (trade_id,))
+                cursor.execute("DELETE FROM sent_signals WHERE symbol = ?", (sym,)) # Xóa bộ đếm call để sẵn sàng cho setup mới
                 conn.commit()
                 msg = f"""🛑 <b>STOP LOSS ALERT</b>
 
 #<b>{sym}</b>
 ❌ Giá đã chạm Stop Loss ban đầu tại <b>{sl:.4f}</b>.
-Kịch bản bị vô hiệu hóa."""
+Kèo đã đóng. Đã giải phóng để đón setup mới!"""
                 send_direct_message(msg)
 
 # ==============================================================================
@@ -530,7 +553,7 @@ def run_scanner_loop():
     init_db()
     Thread(target=listen_telegram_commands, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit Early Pump Engine (Anti-SL Hunt & Fixed TP)...", flush=True)
+    print("⚡️ Bắt đầu Bybit Early Pump Engine (Max 3 Calls & Dynamic Lifecycle)...", flush=True)
     while True:
         try:
             tickers = get_usdt_perpetual_tickers()
@@ -567,18 +590,23 @@ def run_scanner_loop():
                     scanned_signals.append(analysis)
 
             scanned_signals.sort(key=lambda x: x['score'], reverse=True)
-            top_5_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
+            top_3_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
 
             sent_count = 0
-            if top_5_signals:
-                for sig in top_5_signals:
+            if top_3_signals:
+                for sig in top_3_signals:
+                    # Nếu tổng số kèo đang Active đã vượt hạn mức -> Tạm dừng báo kèo mới
+                    if get_active_trades_count() >= MAX_ACTIVE_TRADES and not is_symbol_currently_active(sig['symbol']):
+                        print(f"⚠️ [SLOT FULL] Đã đủ {MAX_ACTIVE_TRADES} kèo đang chạy, tạm dừng báo kèo mới.", flush=True)
+                        break
+
                     should_send, call_count = process_signal_scoring_logic(sig['symbol'], sig['status'], sig['score'])
                     if should_send:
                         sig['call_count'] = call_count
                         if send_telegram_alert(sig):
                             save_active_trade(sig)
                             sent_count += 1
-                            print(f"✅ [SNIPER TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Call lần {call_count} | Score: {sig['score']}", flush=True)
+                            print(f"✅ [SNIPER TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Call lần {call_count}/3 | Score: {sig['score']}", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)

@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Crypto Multi-Setup Scanner (Strict Crypto Filter) Active 24/7!"
+    return "Bybit Pure Crypto Multi-Setup Scanner Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -242,7 +242,7 @@ def listen_telegram_commands():
         time.sleep(2)
 
 # ==============================================================================
-# 5. LẤY TICKERS BYBIT (BỘ LỌC CHẶN NGHIÊM NGẶT TẤT CẢ MÃ CỔ PHIẾU / STOCKS)
+# 5. LẤY TICKERS BYBIT (BỘ LỌC NGHĨA VỤ LOẠI BỎ ETF / CỔ PHIẾU / COMMODITIES)
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -257,18 +257,18 @@ def get_bybit_crypto_tickers():
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             tickers = res["result"]["list"]
             
-            # 🔴 DANH SÁCH TẤT CẢ MÃ CỔ PHIẾU, CHỈ SỐ, HÀNG HÓA, NGÂN HÀNG TRUYỀN THỐNG (TradFi)
+            # 🔴 TÊN BẮT BUỘC CHẶN (ETF, CỔ PHIẾU TRADFI, CHỈ SỐ, NGÂN HÀNG, KIM LOẠI)
             non_crypto_exact = [
-                # Kim loại quý & Hàng hóa
+                # ETFs & Stock Index
+                'SOXS', 'SOXL', 'TQQQ', 'SQQQ', 'UVXY', 'SPY', 'QQQ', 'DIA', 'IWM', 'TLT', 'NDX', 'SPX',
+                'US30', 'US100', 'US500', 'UK100', 'GER30', 'JPN225', 'SPCX', 'SXXP',
+                # Commodities & Metals
                 'XAU', 'XAG', 'WTI', 'USOIL', 'BRENT', 'COPPER', 'SILVER', 'GOLD', 'PLATINUM', 'PALLADIUM',
-                # Chỉ số chứng khoán
-                'QQQ', 'SPCX', 'SPY', 'DIA', 'IWM', 'TLT', 'NDX', 'SPX', 'US30', 'US100', 'US500', 'UK100', 'GER30', 'JPN225',
-                # Cổ phiếu Ngân hàng & Tài chính
+                # US Stocks & Banks
                 'JPM', 'BAC', 'C', 'WFC', 'GS', 'MS', 'BLK', 'AXP', 'V', 'MA', 'PYPL', 'SCHW',
-                # Cổ phiếu Công nghệ & Tập đoàn
                 'NVDA', 'TSLA', 'AAPL', 'AMZN', 'META', 'MSFT', 'GOOGL', 'NFLX', 'AMD', 'INTC', 'BABA', 'COIN',
                 'PLTR', 'MSTR', 'CRWD', 'HOOD', 'DIS', 'NKE', 'PFE', 'JNJ', 'PG', 'XOM', 'CVX',
-                # Leverage Tokens / Fiat / Index
+                # Leverage Token Suffixes
                 '3L', '3S', 'BEAR', 'BULL', 'HALF', 'HEDGE'
             ]
             
@@ -287,9 +287,16 @@ def get_bybit_crypto_tickers():
                 spread_pct = ((ask - bid) / bid * 100) if (bid > 0 and ask > 0) else 0.0
 
                 if sym.endswith("USDT") and not sym.startswith(("USDC", "BUSD", "DAI", "EUR", "GBP")):
-                    # Loại bỏ symbol nếu trùng với bất kỳ mã Cổ phiếu / Commodity nào
                     base_coin = sym.replace("USDT", "")
-                    if base_coin not in non_crypto_exact and not any(k in sym for k in non_crypto_exact):
+                    
+                    # BỘ LỌC TỰ ĐỘNG CHẶN TRUYỀN THỐNG TRỰC TIẾP
+                    is_non_crypto = (
+                        base_coin in non_crypto_exact or 
+                        any(k in sym for k in non_crypto_exact) or
+                        base_coin.startswith(("SOX", "TQQ", "SQQ", "USD", "EUR"))
+                    )
+
+                    if not is_non_crypto:
                         if turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT:
                             if price_change_pct >= 3.0:
                                 symbols_for_freq.append(sym)

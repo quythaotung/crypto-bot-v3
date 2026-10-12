@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Early Pump Engine (Ultimate Early Rebound & Anti-SL Hunt) Active 24/7!"
+    return "Bybit Early Pump Engine (STRK Shakeout & Early Compression Mode) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -77,25 +77,18 @@ def init_db():
         conn.commit()
 
 def is_symbol_currently_active(symbol: str) -> bool:
-    """Kiểm tra xem coin này có đang mở vị thế (chưa SL/TP) không"""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM active_trades WHERE symbol = ? AND status = 'OPEN'", (symbol,))
         return cursor.fetchone() is not None
 
 def get_active_trades_count() -> int:
-    """Đếm số lượng kèo đang chạy chưa chạm TP2/SL"""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM active_trades WHERE status = 'OPEN'")
         return cursor.fetchone()[0]
 
 def process_signal_scoring_logic(symbol: str, status: str, score: int) -> tuple:
-    """
-    Xử lý logic lọc điểm & giới hạn TỐI ĐA 3 LẦN CALL:
-    - Nếu call_count >= 3: DỪNG BÁO HOÀN TOÀN.
-    - Chỉ báo lại khi kèo cũ kết thúc (SL/TP) và xuất hiện tín hiệu mới.
-    """
     now_ts = int(time.time())
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
@@ -126,7 +119,6 @@ def process_signal_scoring_logic(symbol: str, status: str, score: int) -> tuple:
             prev_call_count, last_sent_at, prev_score, has_been_alerted = row
             time_passed = now_ts - last_sent_at
 
-            # ĐÃ CALL ĐỦ 3 LẦN -> KHÔNG CALL THÊM NỮA!
             if prev_call_count >= 3:
                 return False, prev_call_count
 
@@ -333,14 +325,15 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 5. ENGINE PHÁT HIỆN TRẠNG THÁI & LỌC BẪY (BẮT SỚM VÙNG ĐÁY NHƯ ALGO 0.118)
+# 5. ENGINE PHÁT HIỆN TRẠNG THÁI (BẮT ĐIỂM SỚM TÍCH LŨY VÙNG ĐÁY STRK)
 # ==============================================================================
 def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: float) -> dict:
     if df_m15.empty or len(df_m15) < 35: return None
 
     last_candle = df_m15.iloc[-1]
     
-    # Quét cả chu kỳ nén ngắn (16 nến ~ 4 tiếng) lẫn chu kỳ chuẩn (24 nến ~ 6 tiếng)
+    # 🔴 ĐA CHU KỲ: Quét cả chu kỳ siêu ngắn (12 nến M15 ~ 3 tiếng), ngắn (16 nến) và chuẩn (24 nến)
+    prev_candles_vshort = df_m15.iloc[-13:-1]
     prev_candles_short = df_m15.iloc[-17:-1]
     prev_candles_long = df_m15.iloc[-25:-1]
 
@@ -350,12 +343,17 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     bb_width_now = last_candle['bb_width']
     atr_now = last_candle['atr14']
 
+    # Chu kỳ siêu ngắn
+    base_high_vshort = prev_candles_vshort['high'].max()
+    base_low_vshort = prev_candles_vshort['low'].min()
+    base_range_vshort_pct = ((base_high_vshort - base_low_vshort) / base_low_vshort) * 100
+
     # Chu kỳ ngắn
     base_high_short = prev_candles_short['high'].max()
     base_low_short = prev_candles_short['low'].min()
     base_range_short_pct = ((base_high_short - base_low_short) / base_low_short) * 100
 
-    # Chu kỳ dài
+    # Chu kỳ chuẩn
     base_high_long = prev_candles_long['high'].max()
     base_low_long = prev_candles_long['low'].min()
     base_range_long_pct = ((base_high_long - base_low_long) / base_low_long) * 100
@@ -367,8 +365,8 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     if base_range_pct < 1.5:
         base_range_pct = 2.0
 
-    is_tight_base = 1.5 <= base_range_pct <= 12.0
-    is_bb_squeezed = bb_width_now <= 0.10
+    is_tight_base = 1.5 <= base_range_pct <= 15.0
+    is_bb_squeezed = bb_width_now <= 0.12
 
     status = None
     reasons = []
@@ -379,20 +377,20 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
         reasons.append(f"Đóng nến M15 ({close_now:.4f}) vượt đỉnh nền ({base_high:.4f})")
         reasons.append(f"Volume bắt đầu bùng nổ {vol_ratio_now:.1f}x so với MA20")
 
-    # 2. PRE-BREAKOUT STANDARD (Đi ngang chuẩn)
+    # 2. PRE-BREAKOUT STANDARD
     elif is_tight_base and is_bb_squeezed and (close_now >= base_high * 0.980):
         status = "PRE-BREAKOUT"
         reasons.append(f"Nền tích lũy nén chặt {base_range_pct:.1f}% trong 24 nến M15")
         reasons.append("Bollinger Bands siết hẹp, giá chạm sát vùng kháng cự")
 
-    # 3. EARLY REBOUND (Bắt sớm vùng đáy như ALGO ở 0.118 khi phá cản ngắn hạn)
-    elif base_range_short_pct <= 4.5 and close_now > base_high_short and vol_ratio_now >= 1.15:
+    # 🔴 3. EARLY REBOUND / COMPRESSION AFTER SHAKEOUT (Bắt sớm STRK tại 0.0712 sau cú rủ hẹp)
+    elif base_range_vshort_pct <= 4.0 and close_now >= base_high_vshort * 0.995 and vol_ratio_now >= 1.10:
         status = "PRE-BREAKOUT"
-        base_high = base_high_short
-        base_low = base_low_short
-        base_range_pct = base_range_short_pct
-        reasons.append(f"Tạo nền ngắn {base_range_short_pct:.1f}% ở vùng đáy và phá cản ngắn hạn {base_high_short:.4f}")
-        reasons.append("Lực mua chớm xuất hiện kích hoạt sóng đảo chiều sớm")
+        base_high = base_high_vshort
+        base_low = base_low_vshort
+        base_range_pct = base_range_vshort_pct
+        reasons.append(f"Nén siêu chặt {base_range_vshort_pct:.1f}% trong 12 nến M15 ở vùng đáy")
+        reasons.append(f"Chớm bứt phá cản ngắn hạn {base_high_vshort:.4f} kích hoạt đảo chiều")
 
     elif close_now <= base_high * 1.01 and close_now >= base_high * 0.985 and vol_ratio_now < 1.3:
         status = "RETEST WATCH"
@@ -403,7 +401,6 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     pump_from_base = ((close_now - base_low) / base_low) * 100
     no_chase = pump_from_base > 12.0
 
-    # KHOẢNG CÁCH SL AN TOÀN (TỐI THIỂU 2.0% TRÁNH SL HUNT)
     calculated_sl = base_low - (0.5 * atr_now)
     sl_distance_pct = ((close_now - calculated_sl) / close_now) * 100
 
@@ -415,33 +412,34 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     risk = close_now - invalidation_sl
     if risk <= 0: return None
 
-    # CHUẨN ĐÚNG THỨ TỰ TP1 < TP2 < TP3 THEO TỶ LỆ R:R
     tp1 = close_now + (risk * 1.5)
     tp2 = close_now + (risk * 2.5)
     tp3 = close_now + (risk * 4.0)
 
     score = 0
-    if 3.0 <= base_range_pct <= 6.0: score += 20
-    elif base_range_pct <= 8.0: score += 15
+    if 2.0 <= base_range_pct <= 6.0: score += 20
+    elif base_range_pct <= 10.0: score += 15
     else: score += 10
 
     if status == "BREAKOUT CONFIRMED": score += 20
     elif status == "PRE-BREAKOUT": score += 18
-    elif status == "RETEST WATCH": score += 15
 
-    # TRỪ ĐIỂM BẪY VOLUME ẢO (VOLUME > 10X KHI CHƯA PHÁ NỀN -> TRỪ 20đ)
     if vol_ratio_now > 10.0 and status == "PRE-BREAKOUT":
         score -= 20
     elif 2.0 <= vol_ratio_now <= 6.0: score += 20
-    elif vol_ratio_now >= 1.2: score += 15
+    elif vol_ratio_now >= 1.1: score += 15
     else: score += 10
 
     if 50 <= rsi_now <= 75: score += 15
     else: score += 8
 
+    # 🔴 ĐỒNG THUẬN XU HƯỚNG EMA H1 -> CỘNG THƯỞNG +8 ĐIỂM GIÚP VƯỢT MỐC 88
     if not df_h1.empty and len(df_h1) >= 20:
         last_h1 = df_h1.iloc[-1]
-        if last_h1['close'] > last_h1['ema34']: score += 10
+        if last_h1['close'] > last_h1['ema34']: 
+            score += 10
+        if last_h1['close'] > last_h1['ema89']:
+            score += 8  # Bonus điểm đồng thuận EMA
 
     coin_perf = ((close_now - df_m15.iloc[0]['close']) / df_m15.iloc[0]['close']) * 100
     if coin_perf > btc_perf + 1.5: score += 10
@@ -524,7 +522,6 @@ def send_direct_message(text: str, target_chat_id: str = None):
         pass
 
 def track_and_update_active_trades(tickers_map: dict):
-    """KHI DÍNH SL HOẶC TP -> GIẢI PHÓNG ĐỂ BÁO SETUP MỚI"""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id, symbol, entry, sl, tp1, tp2, tp3, tp1_hit FROM active_trades WHERE status = 'OPEN'")
@@ -580,13 +577,12 @@ def run_scanner_loop():
     init_db()
     Thread(target=listen_telegram_commands, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit Early Pump Engine (Ultimate Version Active)...", flush=True)
+    print("⚡️ Bắt đầu Bybit Early Pump Engine (Ultimate STRK Sensitivity Mode)...", flush=True)
     while True:
         try:
             tickers = get_usdt_perpetual_tickers()
             tickers_map = {t['symbol']: t['lastPrice'] for t in tickers}
 
-            # Cập nhật và kiểm tra TP/SL vị thế đang mở
             track_and_update_active_trades(tickers_map)
 
             target_tickers = tickers[:MAX_SYMBOLS_SCAN]

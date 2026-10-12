@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit H4 EMA20 Breakout Engine Active 24/7!"
+    return "Bybit H4 EMA20 Crypto-Only Scanner Engine Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -184,7 +184,7 @@ def get_24h_summary_report() -> str:
         """)
         open_trades = cursor.fetchall()
 
-    msg = "📊 <b>BÁO CÁO TỔNG HỢP KẾT QUẢ H4 EMA20 (24H)</b>\n"
+    msg = "📊 <b>BÁO CÁO TỔNG HỢP KẾT QUẢ CRYPTO H4 EMA20 (24H)</b>\n"
     msg += "===================================="
 
     if not closed_trades and not open_trades:
@@ -214,7 +214,7 @@ def get_24h_summary_report() -> str:
             st = "✅ (Đã cắn TP1 -> Dời SL về Entry)" if tp1_hit == 1 else "⏳ (Đang chạy)"
             msg += f"\n{idx}. #{sym} {st} | Entry: <code>{entry:.4f}</code> | SL: <code>{sl:.4f}</code>"
 
-    msg += "\n\n<i>💡 Chiến lược H4 Breakout + EMA20 Confirm.</i>"
+    msg += "\n\n<i>💡 Chiến lược H4 Breakout + EMA20 Confirm (Only Crypto).</i>"
     return msg
 
 def listen_telegram_commands():
@@ -242,7 +242,7 @@ def listen_telegram_commands():
         time.sleep(2)
 
 # ==============================================================================
-# 5. LẤY TOP GAINERS BYBIT (5% - 10%) & DỮ LIỆU H4
+# 5. LẤY TOP GAINERS BYBIT (CHỈ CẶP CRYPTO USDT PERPETUAL)
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -250,15 +250,21 @@ def safe_float(val, default=0.0):
     except (ValueError, TypeError):
         return default
 
-def get_bybit_top_gainers_5_10():
+def get_bybit_crypto_top_gainers_5_10():
     url = f"{BASE_URL}/v5/market/tickers?category=linear"
     try:
         res = requests.get(url, timeout=6).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             tickers = res["result"]["list"]
-            non_crypto = ['XAU', 'XAG', 'WTI', 'USOIL', 'BRENT', 'COPPER', 'SILVER', 'GOLD',
-                          'QQQ', 'SPCX', 'SPY', 'DIA', 'IWM', 'TLT', 'NDX', 'SPX',
-                          'NVDA', 'TSLA', 'AAPL', 'AMZN', 'META', 'MSFT', 'GOOGL', 'NFLX', '3L', '3S']
+            
+            # 🔴 DANH SÁCH BỎ QUA TẤT CẢ CỔ PHIẾU, CHỈ SỐ, KIM LOẠI QUÝ, FX, INDEX
+            non_crypto = [
+                'XAU', 'XAG', 'WTI', 'USOIL', 'BRENT', 'COPPER', 'SILVER', 'GOLD', 'PLATINUM', 'PALLADIUM',
+                'QQQ', 'SPCX', 'SPY', 'DIA', 'IWM', 'TLT', 'NDX', 'SPX', 'US30', 'US100', 'US500', 'UK100', 'GER30',
+                'NVDA', 'TSLA', 'AAPL', 'AMZN', 'META', 'MSFT', 'GOOGL', 'NFLX', 'AMD', 'INTC', 'BABA', 'COIN',
+                '3L', '3S', 'BEAR', 'BULL', 'HALF', 'HEDGE'
+            ]
+            
             valid = []
             symbols_for_freq = []
 
@@ -273,27 +279,27 @@ def get_bybit_top_gainers_5_10():
 
                 spread_pct = ((ask - bid) / bid * 100) if (bid > 0 and ask > 0) else 0.0
 
-                if sym.endswith("USDT") and not sym.startswith(("USDC", "BUSD", "DAI")):
-                    # ĐIỀU KIỆN 1: Mức tăng trong phạm vi 5% - 10%
-                    if 5.0 <= price_change_pct <= 10.0:
-                        symbols_for_freq.append(sym)
-                        if turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT and not any(k in sym for k in non_crypto):
-                            valid.append({
-                                "symbol": sym,
-                                "price24hPcnt": round(price_change_pct, 2),
-                                "turnover24h": turnover,
-                                "lastPrice": last_price,
-                                "fundingRate": funding_rate,
-                                "spread_pct": round(spread_pct, 3)
-                            })
+                # Lọc nghiêm ngặt: Chỉ lấy đuôi USDT, loại bỏ Stablecoin và các mã Non-Crypto
+                if sym.endswith("USDT") and not sym.startswith(("USDC", "BUSD", "DAI", "EUR", "GBP")):
+                    if not any(k in sym for k in non_crypto):
+                        if 5.0 <= price_change_pct <= 10.0:
+                            symbols_for_freq.append(sym)
+                            if turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT:
+                                valid.append({
+                                    "symbol": sym,
+                                    "price24hPcnt": round(price_change_pct, 2),
+                                    "turnover24h": turnover,
+                                    "lastPrice": last_price,
+                                    "fundingRate": funding_rate,
+                                    "spread_pct": round(spread_pct, 3)
+                                })
 
-            # Cập nhật tần suất xuất hiện thường xuyên trong Top Gainers
             if symbols_for_freq:
                 update_top_gainers_frequency(symbols_for_freq)
 
             return sorted(valid, key=lambda x: x["price24hPcnt"], reverse=True)
     except Exception as e:
-        print(f"[ERROR] Lỗi lấy Top Gainers: {e}", flush=True)
+        print(f"[ERROR] Lỗi lấy Top Gainers Crypto: {e}", flush=True)
     return []
 
 def get_closed_klines_df_h4(symbol: str, limit: int = 60) -> pd.DataFrame:
@@ -333,23 +339,20 @@ def add_h4_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 25: return df
     closes, vols = df['close'], df['volume']
 
-    # EMA 20 nến H4
     df['ema20'] = closes.ewm(span=20, adjust=False).mean()
-
-    # Volume MA20 H4
     df['vol_ma20'] = vols.rolling(20).mean()
     df['vol_ratio'] = vols / df['vol_ma20'].replace(0, np.nan)
 
     return df
 
 # ==============================================================================
-# 6. ENGINE BẮT SETUP: NẾN H4 ĐÓNG XANH MẠNH VƯỢT EMA 20 + VOLUME MẠNH
+# 6. ENGINE PHÁT HIỆN SETUP NẾN H4 + EMA 20 CONFIRM
 # ==============================================================================
 def analyze_h4_ema20_setup(df_h4: pd.DataFrame, gainer_freq: int) -> dict:
     if df_h4.empty or len(df_h4) < 25: return None
 
-    last_candle = df_h4.iloc[-1]       # Nến H4 vừa đóng
-    prev_candle = df_h4.iloc[-2]       # Nến H4 trước đó
+    last_candle = df_h4.iloc[-1]
+    prev_candle = df_h4.iloc[-2]
 
     close_now = last_candle['close']
     open_now = last_candle['open']
@@ -358,42 +361,33 @@ def analyze_h4_ema20_setup(df_h4: pd.DataFrame, gainer_freq: int) -> dict:
     ema20_now = last_candle['ema20']
     vol_ratio_now = last_candle['vol_ratio']
 
-    # ĐIỀU KIỆN 1: Nến xanh mạnh đóng qua EMA 20 H4
     is_green_candle = close_now > open_now
     is_close_above_ema20 = close_now > ema20_now
     is_breakout_ema20 = (prev_candle['close'] <= prev_candle['ema20']) or (close_now > ema20_now * 1.005)
 
-    # ĐIỀU KIỆN 2: Thân nến xanh dốc, đóng gần đỉnh cao nhất (Bullish Momentum)
     candle_body = close_now - open_now
     candle_range = high_now - low_now
     is_strong_body = (candle_body / candle_range >= 0.55) if candle_range > 0 else False
-
-    # ĐIỀU KIỆN 3: Volume H4 bùng nổ (Volume / MA20 >= 1.5x)
     is_strong_volume = vol_ratio_now >= 1.5
 
     if not (is_green_candle and is_close_above_ema20 and is_breakout_ema20 and is_strong_body and is_strong_volume):
         return None
 
-    # TÍNH STOP LOSS VÀ TAKE PROFIT THEO ĐÚNG TIÊU CHUẨN
-    # SL dưới đáy nến H4 xác nhận (có chút buffer an toàn)
     sl = low_now * 0.997
     risk_pct = ((close_now - sl) / close_now) * 100
 
-    # Khóa mức SL tối thiểu 2.0% tránh giật râu
     if risk_pct < 2.0:
         sl = close_now * 0.98
 
-    # TP theo yêu cầu: 5%, 10%, 20%
     tp1 = close_now * 1.05
     tp2 = close_now * 1.10
     tp3 = close_now * 1.20
 
-    # TÍNH ĐIỂM ƯU TIÊN (FOCUS CÁC CẶP THƯỜNG XUYÊN NẰM TOP GAINERS)
     score = 70
     if vol_ratio_now >= 3.0: score += 15
     elif vol_ratio_now >= 2.0: score += 10
 
-    if gainer_freq >= 5: score += 15       # Rất hay vào Top Gainers
+    if gainer_freq >= 5: score += 15
     elif gainer_freq >= 2: score += 10
 
     if (close_now - open_now) / open_now * 100 >= 3.0: score += 10
@@ -419,10 +413,10 @@ def analyze_h4_ema20_setup(df_h4: pd.DataFrame, gainer_freq: int) -> dict:
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
 
-    msg = f"""🚨 <b>BYBIT H4 EMA20 BREAKOUT SCANNER</b>
+    msg = f"""🚨 <b>BYBIT CRYPTO H4 EMA20 SCANNER</b>
 
 <b>Coin:</b> #{sig['symbol']} (Top Gainers {sig['price24hPcnt']}%)
-<b>Trạng thái:</b> <code>NẾN H4 VƯỢT EMA20 + VOL MẠNH</code>
+<b>Trạng thái:</b> <code>NẾN H4 XANH ĐÓNG MẠNH VƯỢT EMA20</code>
 🔔 <b>Lần thông báo:</b> <b>Call lần {sig['call_count']}/3</b>
 ⭐ <b>Độ ưu tiên Top Gainer:</b> <b>Xác suất cao (Xuất hiện {sig['gainer_freq']} lần)</b>
 <b>Khung thời gian:</b> H4 (4 Giờ)
@@ -484,21 +478,18 @@ def track_and_update_active_trades(tickers_map: dict):
 
             curr_price = tickers_map[sym]
 
-            # 1. KIỂM TRA CHẠM TP1 (+5%) -> DỜI SL VỀ ENTRY
             if tp1_hit == 0 and curr_price >= tp1:
                 cursor.execute("UPDATE active_trades SET tp1_hit = 1, sl = ?, updated_at = ? WHERE id = ?", (entry, now_ts, trade_id))
                 conn.commit()
                 status_changed = True
                 print(f"🎯 [TP1 +5% HIT] #{sym} -> SL dời về Entry", flush=True)
 
-            # 2. KIỂM TRA CHẠM TP2 (+10%)
             elif tp1_hit == 1 and tp2_hit == 0 and curr_price >= tp2:
                 cursor.execute("UPDATE active_trades SET tp2_hit = 1, updated_at = ? WHERE id = ?", (now_ts, trade_id))
                 conn.commit()
                 status_changed = True
                 print(f"🚀 [TP2 +10% HIT] #{sym}", flush=True)
 
-            # 3. KIỂM TRA CHẠM TP3 (+20%) -> ĐÓNG HOÀN TOÀN
             elif curr_price >= tp3:
                 cursor.execute("UPDATE active_trades SET status = 'CLOSED_TP3', updated_at = ? WHERE id = ?", (now_ts, trade_id))
                 cursor.execute("DELETE FROM sent_signals WHERE symbol = ?", (sym,))
@@ -506,7 +497,6 @@ def track_and_update_active_trades(tickers_map: dict):
                 status_changed = True
                 print(f"🚀🚀 [TP3 +20% HIT] #{sym} CLOSED", flush=True)
 
-            # 4. KIỂM TRA DÍNH SL -> ĐÓNG VỊ THẾ
             elif curr_price <= sl:
                 cursor.execute("UPDATE active_trades SET status = 'CLOSED_SL', updated_at = ? WHERE id = ?", (now_ts, trade_id))
                 cursor.execute("DELETE FROM sent_signals WHERE symbol = ?", (sym,))
@@ -519,22 +509,21 @@ def track_and_update_active_trades(tickers_map: dict):
         send_direct_message(summary_msg)
 
 # ==============================================================================
-# 8. AUTOMATIC SCANNER LOOP
+# 8. AUTOMATIC SCANNER LOOP (CRYPTO ONLY)
 # ==============================================================================
 def run_scanner_loop():
     init_db()
     Thread(target=listen_telegram_commands, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit H4 EMA20 Breakout Engine (Top Gainers 5-10%)...", flush=True)
+    print("⚡️ Bắt đầu Bybit H4 EMA20 Crypto-Only Scanner Engine...", flush=True)
     while True:
         try:
-            # 1. Quét danh sách Top Gainers Bybit trong phạm vi tăng 5% - 10%
-            top_gainers = get_bybit_top_gainers_5_10()
+            top_gainers = get_bybit_crypto_top_gainers_5_10()
             tickers_map = {t['symbol']: t['lastPrice'] for t in top_gainers}
 
             track_and_update_active_trades(tickers_map)
 
-            print(f"\n🔍 [SCANNER] Tìm thấy {len(top_gainers)} Altcoins trong Top Gainers (5% - 10%)...", flush=True)
+            print(f"\n🔍 [SCANNER] Tìm thấy {len(top_gainers)} Coin Crypto trong Top Gainers (5% - 10%)...", flush=True)
 
             scanned_signals = []
             for t in top_gainers[:MAX_SYMBOLS_SCAN]:
@@ -555,31 +544,10 @@ def run_scanner_loop():
                     analysis['oi_info'] = f"{oi_change:+}%/4h"
                     scanned_signals.append(analysis)
 
-            # Sắp xếp ưu tiên các coin xuất hiện thường xuyên trong Top Gainers
             scanned_signals.sort(key=lambda x: (x['gainer_freq'], x['score']), reverse=True)
             top_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
 
             sent_count = 0
             if top_signals:
                 for sig in top_signals:
-                    if get_active_trades_count() >= MAX_ACTIVE_TRADES and not is_symbol_currently_active(sig['symbol']):
-                        print(f"⚠️ [SLOT FULL] Đã đủ {MAX_ACTIVE_TRADES} kèo đang chạy, tạm dừng báo kèo mới.", flush=True)
-                        break
-
-                    should_send, call_count = process_signal_dedup(sig['symbol'], sig['status'], sig['score'])
-                    if should_send:
-                        sig['call_count'] = call_count
-                        if send_telegram_alert(sig):
-                            save_active_trade(sig)
-                            sent_count += 1
-                            print(f"✅ [H4 BREAKOUT TOP {sent_count}] #{sig['symbol']} Entry: {sig['close_price']} | SL: {sig['sl']}", flush=True)
-
-        except Exception as e:
-            print(f"[ERROR] Scanner Loop Error: {e}", flush=True)
-
-        print(f"⏳ Hoàn tất chu kỳ H4. Tạm nghỉ {SCAN_INTERVAL_SECONDS} giây...", flush=True)
-        time.sleep(SCAN_INTERVAL_SECONDS)
-
-if __name__ == "__main__":
-    Thread(target=run_flask, daemon=True).start()
-    run_scanner_loop()
+                    if get_active_trades_count() >= MAX_ACTIVE_TRADES

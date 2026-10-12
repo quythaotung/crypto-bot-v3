@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Early Pump Engine (STRK Shakeout & Early Compression Mode) Active 24/7!"
+    return "Bybit Early Pump Engine (24h Consolidated TP/SL Report) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -36,13 +36,13 @@ SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "1800")) 
 
 MAX_ALERTS_PER_CYCLE = 3  # Tối đa Top 3 kèo mới mỗi chu kỳ
-MAX_ACTIVE_TRADES = 5     # Tối đa 5 kèo đang chạy (chưa cắn SL/TP) cùng lúc
+MAX_ACTIVE_TRADES = 5     # Tối đa 5 kèo đang chạy cùng lúc
 
 DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 3. SQLITE DATABASE (XỬ LÝ TỐI ĐA 3 LẦN CALL & QUẢN LÝ VÒNG ĐỜI KÈO)
+# 3. SQLITE DATABASE (THÊM CỘT CẬP NHẬT THỜI GIAN KẾT THÚC KÈO)
 # ==============================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -71,7 +71,8 @@ def init_db():
                 tp1_hit INTEGER DEFAULT 0,
                 tp2_hit INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'OPEN',
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER DEFAULT 0
             )
         """)
         conn.commit()
@@ -157,42 +158,73 @@ def save_active_trade(sig: dict):
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO active_trades (symbol, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?)
-        """, (sig['symbol'], sig['close_price'], sig['invalidation_sl'], sig['tp1'], sig['tp2'], sig['tp3'], now_ts))
+            INSERT OR REPLACE INTO active_trades (symbol, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?, ?)
+        """, (sig['symbol'], sig['close_price'], sig['invalidation_sl'], sig['tp1'], sig['tp2'], sig['tp3'], now_ts, now_ts))
         conn.commit()
 
-def get_summary_report() -> str:
+# ==============================================================================
+# 4. HÀM TỔNG HỢP BÁO CÁO 24H (GỘP TẤT CẢ KÈO TP VÀ SL)
+# ==============================================================================
+def get_24h_summary_report() -> str:
+    now_ts = int(time.time())
+    cutoff_24h = now_ts - (24 * 3600)
+
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT symbol, entry, sl, tp1, tp2, tp3, tp1_hit FROM active_trades WHERE status = 'OPEN' ORDER BY id DESC")
-        trades = cursor.fetchall()
+        
+        # 1. Lấy danh sách các kèo đã đóng trong 24h (TP1, TP2, SL)
+        cursor.execute("""
+            SELECT symbol, entry, sl, tp1, tp2, status, updated_at 
+            FROM active_trades 
+            WHERE status IN ('CLOSED_TP1', 'CLOSED_TP2', 'CLOSED_SL') AND updated_at >= ?
+            ORDER BY updated_at DESC
+        """, (cutoff_24h,))
+        closed_trades = cursor.fetchall()
 
-    if not trades:
-        return "📋 <b>BÁO CÁO TỔNG HỢP VỊ THẾ ACTIVE</b>\n\n🔎 Hiện tại chưa có kèo nào đang trong danh sách theo dõi."
+        # 2. Lấy danh sách các kèo đang chạy (OPEN)
+        cursor.execute("""
+            SELECT symbol, entry, sl, tp1, tp2, tp1_hit 
+            FROM active_trades 
+            WHERE status = 'OPEN' 
+            ORDER BY created_at DESC
+        """)
+        open_trades = cursor.fetchall()
 
-    msg = f"📊 <b>TỔNG HỢP CÁC KÈO ĐANG ACTIVE ({len(trades)} KÈO)</b>\n"
+    msg = "📊 <b>BÁO CÁO TỔNG HỢP KẾT QUẢ KÈO TRONG 24H</b>\n"
     msg += "===================================="
 
-    for idx, t in enumerate(trades, 1):
-        sym, entry, sl, tp1, tp2, tp3, tp1_hit = t
-        if tp1_hit == 1:
-            sl_status = f"<code>{entry:.4f}</code> (🛡 Đã cắn TP1 -> Dời SL về Breakeven)"
-            status_tag = "✅ <b>[ĐÃ HÍT TP1]</b>"
-        else:
-            sl_status = f"<code>{sl:.4f}</code>"
-            status_tag = "⏳ <b>[ĐANG THEO DÕI]</b>"
+    if not closed_trades and not open_trades:
+        return msg + "\n\n🔎 Chưa có dữ liệu giao dịch trong 24h qua."
 
-        msg += f"""
+    # PHẦN 1: KÈO ĐÃ ĐÓNG TRONG 24H
+    if closed_trades:
+        msg += "\n\n🎯 <b>KÈO ĐÃ CHỐT KẾT QUẢ (24H QUA):</b>"
+        for idx, t in enumerate(closed_trades, 1):
+            sym, entry, sl, tp1, tp2, status, updated_at = t
+            if status == 'CLOSED_TP2':
+                tag = "🚀 <b>[ĐÃ TP2 (MAX PROFIT)]</b>"
+            elif status == 'CLOSED_TP1':
+                tag = "✅ <b>[ĐÃ TP1 (+5%)]</b>"
+            elif status == 'CLOSED_SL':
+                tag = "🛑 <b>[ĐÃ SL]</b>"
+            else:
+                tag = "<b>[ĐÃ ĐÓNG]</b>"
 
-{idx}. #<b>{sym}</b> {status_tag}
-• 🎯 <b>Entry:</b> <code>{entry:.4f}</code>
-• 🛡 <b>Stop Loss:</b> {sl_status}
-• 🚀 <b>TP1 (R:R 1:1.5):</b> <code>{tp1:.4f}</code>
-• 🚀 <b>TP2 (R:R 1:2.5):</b> <code>{tp2:.4f}</code>
-• 🚀 <b>TP3 (R:R 1:4.0):</b> <code>{tp3:.4f}</code>"""
+            msg += f"\n{idx}. #{sym} {tag} | Entry: <code>{entry:.4f}</code>"
 
-    msg += "\n\n<i>⚠️ Lưu ý: Khi kèo cắn TP1, SL tự động được dời về Entry (Hòa vốn) để bảo vệ tài khoản.</i>"
+    # PHẦN 2: KÈO ĐANG ACTIVE
+    if open_trades:
+        msg += "\n\n⏳ <b>KÈO ĐANG THEO DÕI (ACTIVE):</b>"
+        for idx, t in enumerate(open_trades, 1):
+            sym, entry, sl, tp1, tp2, tp1_hit = t
+            if tp1_hit == 1:
+                st = "✅ (Đã cắn TP1 -> Dời SL về Entry)"
+            else:
+                st = "⏳ (Đang chạy)"
+            msg += f"\n{idx}. #{sym} {st} | Entry: <code>{entry:.4f}</code>"
+
+    msg += "\n\n<i>💡 Hệ thống tự động cập nhật và tổng hợp dữ liệu giao dịch 24/7.</i>"
     return msg
 
 def listen_telegram_commands():
@@ -213,14 +245,14 @@ def listen_telegram_commands():
                     chat_id = str(message.get("chat", {}).get("id", ""))
 
                     if text.strip().lower() in ["/tonghop", "tonghop"]:
-                        summary_msg = get_summary_report()
+                        summary_msg = get_24h_summary_report()
                         send_direct_message(summary_msg, target_chat_id=chat_id if chat_id else CHAT_ID)
         except Exception:
             pass
         time.sleep(2)
 
 # ==============================================================================
-# 4. BYBIT API V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT
+# 5. BYBIT API V5 HELPERS & CÁC CHỈ BÁO KỸ THUẬT
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -325,14 +357,13 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 5. ENGINE PHÁT HIỆN TRẠNG THÁI (BẮT ĐIỂM SỚM TÍCH LŨY VÙNG ĐÁY STRK)
+# 6. ENGINE PHÁT HIỆN TRẠNG THÁI
 # ==============================================================================
 def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: float) -> dict:
     if df_m15.empty or len(df_m15) < 35: return None
 
     last_candle = df_m15.iloc[-1]
     
-    # 🔴 ĐA CHU KỲ: Quét cả chu kỳ siêu ngắn (12 nến M15 ~ 3 tiếng), ngắn (16 nến) và chuẩn (24 nến)
     prev_candles_vshort = df_m15.iloc[-13:-1]
     prev_candles_short = df_m15.iloc[-17:-1]
     prev_candles_long = df_m15.iloc[-25:-1]
@@ -343,17 +374,14 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     bb_width_now = last_candle['bb_width']
     atr_now = last_candle['atr14']
 
-    # Chu kỳ siêu ngắn
     base_high_vshort = prev_candles_vshort['high'].max()
     base_low_vshort = prev_candles_vshort['low'].min()
     base_range_vshort_pct = ((base_high_vshort - base_low_vshort) / base_low_vshort) * 100
 
-    # Chu kỳ ngắn
     base_high_short = prev_candles_short['high'].max()
     base_low_short = prev_candles_short['low'].min()
     base_range_short_pct = ((base_high_short - base_low_short) / base_low_short) * 100
 
-    # Chu kỳ chuẩn
     base_high_long = prev_candles_long['high'].max()
     base_low_long = prev_candles_long['low'].min()
     base_range_long_pct = ((base_high_long - base_low_long) / base_low_long) * 100
@@ -371,19 +399,16 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     status = None
     reasons = []
 
-    # 1. BREAKOUT CONFIRMED
     if close_now > base_high and vol_ratio_now >= 1.2:
         status = "BREAKOUT CONFIRMED"
         reasons.append(f"Đóng nến M15 ({close_now:.4f}) vượt đỉnh nền ({base_high:.4f})")
         reasons.append(f"Volume bắt đầu bùng nổ {vol_ratio_now:.1f}x so với MA20")
 
-    # 2. PRE-BREAKOUT STANDARD
     elif is_tight_base and is_bb_squeezed and (close_now >= base_high * 0.980):
         status = "PRE-BREAKOUT"
         reasons.append(f"Nền tích lũy nén chặt {base_range_pct:.1f}% trong 24 nến M15")
         reasons.append("Bollinger Bands siết hẹp, giá chạm sát vùng kháng cự")
 
-    # 🔴 3. EARLY REBOUND / COMPRESSION AFTER SHAKEOUT (Bắt sớm STRK tại 0.0712 sau cú rủ hẹp)
     elif base_range_vshort_pct <= 4.0 and close_now >= base_high_vshort * 0.995 and vol_ratio_now >= 1.10:
         status = "PRE-BREAKOUT"
         base_high = base_high_vshort
@@ -433,13 +458,12 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     if 50 <= rsi_now <= 75: score += 15
     else: score += 8
 
-    # 🔴 ĐỒNG THUẬN XU HƯỚNG EMA H1 -> CỘNG THƯỞNG +8 ĐIỂM GIÚP VƯỢT MỐC 88
     if not df_h1.empty and len(df_h1) >= 20:
         last_h1 = df_h1.iloc[-1]
         if last_h1['close'] > last_h1['ema34']: 
             score += 10
         if last_h1['close'] > last_h1['ema89']:
-            score += 8  # Bonus điểm đồng thuận EMA
+            score += 8
 
     coin_perf = ((close_now - df_m15.iloc[0]['close']) / df_m15.iloc[0]['close']) * 100
     if coin_perf > btc_perf + 1.5: score += 10
@@ -468,7 +492,7 @@ def analyze_early_pump(df_m15: pd.DataFrame, df_h1: pd.DataFrame, btc_perf: floa
     }
 
 # ==============================================================================
-# 6. HỆ THỐNG GỬI TELEGRAM & THEO DÕI TP/SL (GIẢI PHÓNG KHI DÍNH SL/TP)
+# 7. HỆ THỐNG GỬI TELEGRAM & THEO DÕI TP/SL (CẬP NHẬT TỔNG HỢP 24H)
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
@@ -500,7 +524,7 @@ def send_telegram_alert(sig: dict) -> bool:
 
 🔗 <a href="https://www.bybit.com/trade/usdt/{sig['symbol']}">Biểu đồ Bybit {sig['symbol']}</a>
 
-<i>💡 Gõ <b>/tonghop</b> trên Telegram để xem danh sách TP/SL các kèo đang Active.</i>"""
+<i>💡 Gõ <b>/tonghop</b> trên Telegram để xem báo cáo TP/SL tổng hợp trong 24h.</i>"""
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -522,6 +546,10 @@ def send_direct_message(text: str, target_chat_id: str = None):
         pass
 
 def track_and_update_active_trades(tickers_map: dict):
+    """KHI DÍNH SL HOẶC TP -> CẬP NHẬT TRẠNG THÁI & GỬI BÁO CÁO TỔNG HỢP 24H (KHÔNG BÁO LẺ)"""
+    now_ts = int(time.time())
+    status_changed = False
+
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id, symbol, entry, sl, tp1, tp2, tp3, tp1_hit FROM active_trades WHERE status = 'OPEN'")
@@ -535,49 +563,40 @@ def track_and_update_active_trades(tickers_map: dict):
 
             # 1. KIỂM TRA CHẠM TP1
             if tp1_hit == 0 and curr_price >= tp1:
-                cursor.execute("UPDATE active_trades SET tp1_hit = 1, sl = ? WHERE id = ?", (entry, trade_id))
+                cursor.execute("UPDATE active_trades SET tp1_hit = 1, sl = ?, updated_at = ? WHERE id = ?", (entry, now_ts, trade_id))
                 conn.commit()
-                msg = f"""🎉 <b>TAKE PROFIT ALERT — TP1 HIT!</b>
-
-#<b>{sym}</b>
-✅ Giá đã chạm <b>TP1: {tp1:.4f}</b>
-🛡 <b>CẬP NHẬT RỦI RO:</b> Đã dời SL về Breakeven (Hòa vốn) tại <b>{entry:.4f}</b>.
-👉 <b>Mức Stop Loss ban đầu ({sl:.4f}) KHÔNG CÒN HIỆU LỰC!</b> Vị thế hoàn toàn an toàn."""
-                send_direct_message(msg)
+                status_changed = True
                 print(f"🎯 [TP1 HIT] #{sym} -> SL updated to Entry", flush=True)
 
-            # 2. KIỂM TRA CHẠM TP2 HOẶC TP3 -> ĐÓNG VỊ THẾ & GIẢI PHÓNG
+            # 2. KIỂM TRA CHẠM TP2 HOẶC TP3 -> ĐÓNG VỊ THẾ
             elif tp1_hit == 1 and curr_price >= tp2:
-                cursor.execute("UPDATE active_trades SET status = 'CLOSED_TP2' WHERE id = ?", (trade_id,))
+                cursor.execute("UPDATE active_trades SET status = 'CLOSED_TP2', updated_at = ? WHERE id = ?", (now_ts, trade_id))
                 cursor.execute("DELETE FROM sent_signals WHERE symbol = ?", (sym,))
                 conn.commit()
-                msg = f"""🚀 <b>TAKE PROFIT ALERT — TP2 HIT!</b>
+                status_changed = True
+                print(f"🚀 [TP2 HIT] #{sym} CLOSED", flush=True)
 
-#<b>{sym}</b>
-✅ Giá đã chốt lời thành công chặng 2 tại <b>TP2: {tp2:.4f}</b>!
-🎉 Kèo đã hoàn tất thành công. Đã giải phóng để đón setup mới!"""
-                send_direct_message(msg)
-
-            # 3. KIỂM TRA DÍNH SL -> ĐÓNG VỊ THẾ & GIẢI PHÓNG
+            # 3. KIỂM TRA DÍNH SL -> ĐÓNG VỊ THẾ
             elif tp1_hit == 0 and curr_price <= sl:
-                cursor.execute("UPDATE active_trades SET status = 'CLOSED_SL' WHERE id = ?", (trade_id,))
+                cursor.execute("UPDATE active_trades SET status = 'CLOSED_SL', updated_at = ? WHERE id = ?", (now_ts, trade_id))
                 cursor.execute("DELETE FROM sent_signals WHERE symbol = ?", (sym,))
                 conn.commit()
-                msg = f"""🛑 <b>STOP LOSS ALERT</b>
+                status_changed = True
+                print(f"🛑 [SL HIT] #{sym} CLOSED", flush=True)
 
-#<b>{sym}</b>
-❌ Giá đã chạm Stop Loss ban đầu tại <b>{sl:.4f}</b>.
-Kèo đã đóng. Đã giải phóng để đón setup mới!"""
-                send_direct_message(msg)
+    # 🔴 NẾU CÓ KÈO VỪA CHẠM TP HOẶC SL -> GỬI BAN BÁO CÁO TỔNG HỢP 24H BẰNG 1 TIN NHẮN
+    if status_changed:
+        summary_msg = get_24h_summary_report()
+        send_direct_message(summary_msg)
 
 # ==============================================================================
-# 7. AUTOMATIC SCANNER LOOP
+# 8. AUTOMATIC SCANNER LOOP
 # ==============================================================================
 def run_scanner_loop():
     init_db()
     Thread(target=listen_telegram_commands, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit Early Pump Engine (Ultimate STRK Sensitivity Mode)...", flush=True)
+    print("⚡️ Bắt đầu Bybit Early Pump Engine (Consolidated 24h Summary Mode)...", flush=True)
     while True:
         try:
             tickers = get_usdt_perpetual_tickers()

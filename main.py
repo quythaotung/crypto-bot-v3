@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Pure Crypto Multi-Setup Scanner Active 24/7!"
+    return "Bybit Multi-Setup Crypto Scanner Engine Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -214,7 +214,7 @@ def get_24h_summary_report() -> str:
             st = "✅ (Đã cắn TP1 -> Dời SL về Entry)" if tp1_hit == 1 else "⏳ (Đang chạy)"
             msg += f"\n{idx}. #{sym} {st} | Entry: <code>{entry:.4f}</code> | SL: <code>{sl:.4f}</code>"
 
-    msg += "\n\n<i>💡 Hệ thống quét H4 EMA20 Breakout & Daily Support Pinbar.</i>"
+    msg += "\n\n<i>💡 Hệ thống quét H1 EMA20 Hold, H4 Box Breakout & Daily Support Pinbar.</i>"
     return msg
 
 def listen_telegram_commands():
@@ -242,7 +242,7 @@ def listen_telegram_commands():
         time.sleep(2)
 
 # ==============================================================================
-# 5. LẤY TICKERS BYBIT (BỘ LỌC NGHĨA VỤ LOẠI BỎ ETF / CỔ PHIẾU / COMMODITIES)
+# 5. LẤY TICKERS BYBIT (BỘ LỌC BẮT BUỘC CHẶN ETF / CỔ PHIẾU / COMMODITIES)
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -257,18 +257,13 @@ def get_bybit_crypto_tickers():
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             tickers = res["result"]["list"]
             
-            # 🔴 TÊN BẮT BUỘC CHẶN (ETF, CỔ PHIẾU TRADFI, CHỈ SỐ, NGÂN HÀNG, KIM LOẠI)
             non_crypto_exact = [
-                # ETFs & Stock Index
                 'SOXS', 'SOXL', 'TQQQ', 'SQQQ', 'UVXY', 'SPY', 'QQQ', 'DIA', 'IWM', 'TLT', 'NDX', 'SPX',
                 'US30', 'US100', 'US500', 'UK100', 'GER30', 'JPN225', 'SPCX', 'SXXP',
-                # Commodities & Metals
                 'XAU', 'XAG', 'WTI', 'USOIL', 'BRENT', 'COPPER', 'SILVER', 'GOLD', 'PLATINUM', 'PALLADIUM',
-                # US Stocks & Banks
                 'JPM', 'BAC', 'C', 'WFC', 'GS', 'MS', 'BLK', 'AXP', 'V', 'MA', 'PYPL', 'SCHW',
                 'NVDA', 'TSLA', 'AAPL', 'AMZN', 'META', 'MSFT', 'GOOGL', 'NFLX', 'AMD', 'INTC', 'BABA', 'COIN',
                 'PLTR', 'MSTR', 'CRWD', 'HOOD', 'DIS', 'NKE', 'PFE', 'JNJ', 'PG', 'XOM', 'CVX',
-                # Leverage Token Suffixes
                 '3L', '3S', 'BEAR', 'BULL', 'HALF', 'HEDGE'
             ]
             
@@ -289,7 +284,6 @@ def get_bybit_crypto_tickers():
                 if sym.endswith("USDT") and not sym.startswith(("USDC", "BUSD", "DAI", "EUR", "GBP")):
                     base_coin = sym.replace("USDT", "")
                     
-                    # BỘ LỌC TỰ ĐỘNG CHẶN TRUYỀN THỐNG TRỰC TIẾP
                     is_non_crypto = (
                         base_coin in non_crypto_exact or 
                         any(k in sym for k in non_crypto_exact) or
@@ -335,8 +329,8 @@ def get_closed_klines_df(symbol: str, interval: str, limit: int = 60) -> pd.Data
         pass
     return pd.DataFrame()
 
-def get_open_interest_change(symbol: str) -> float:
-    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime=4h&limit=3"
+def get_open_interest_change(symbol: str, interval: str = "60") -> float:
+    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval}&limit=3"
     try:
         res = requests.get(url, timeout=4).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
@@ -364,8 +358,74 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 6. ENGINE PHÁT HIỆN SETUP
+# 6. ENGINE PHÁT HIỆN SETUP (H1 PULLBACK HOLD EMA20, H4 A+ BOX & DAILY PINBAR)
 # ==============================================================================
+# 🔴 SETUP MỚI KHUNG H1: KHỦNG TĂNG 9-10% -> CHỈNH 4-5% BẬT NẾN XANH TRÊN EMA20
+def analyze_h1_ema20_pullback(df_h1: pd.DataFrame, realtime_price: float) -> dict:
+    if df_h1.empty or len(df_h1) < 25: return None
+
+    last_candle = df_h1.iloc[-1]
+    close_now = realtime_price if realtime_price > 0 else last_candle['close']
+    open_now = last_candle['open']
+    high_now = max(last_candle['high'], close_now)
+    low_now = min(last_candle['low'], close_now)
+    ema20_now = last_candle['ema20']
+    vol_ratio_now = last_candle['vol_ratio']
+
+    # Lấy 15 nến H1 gần nhất để đo sóng tăng và sóng chỉnh
+    recent_h1 = df_h1.iloc[-16:-1]
+    recent_max_high = recent_h1['high'].max()
+    recent_min_low = recent_h1['low'].min()
+
+    # 1. Đo mức tăng sóng trước (Khoảng 8% - 12%)
+    prev_pump_pct = ((recent_max_high - recent_min_low) / recent_min_low) * 100
+
+    # 2. Đo mức giảm điều chỉnh từ đỉnh (Khoảng 3.5% - 6.5%)
+    pullback_pct = ((recent_max_high - low_now) / recent_max_high) * 100 if recent_max_high > 0 else 0.0
+
+    # 3. ĐIỀU KIỆN ĐÓNG NẾN VẪN NẰM TRÊN EMA 20 H1
+    is_close_above_ema20 = close_now >= ema20_now
+    is_low_touched_ema20 = (low_now <= ema20_now * 1.01) # Nhúng về sát hoặc chạm EMA20
+    is_green_candle = close_now > open_now
+
+    is_setup_h1_pullback = (
+        (8.0 <= prev_pump_pct <= 15.0) and
+        (3.5 <= pullback_pct <= 7.0) and
+        is_close_above_ema20 and
+        is_low_touched_ema20 and
+        is_green_candle
+    )
+
+    if not is_setup_h1_pullback:
+        return None
+
+    sl = low_now * 0.997
+    risk_pct = ((close_now - sl) / close_now) * 100
+
+    if risk_pct < 2.0:
+        sl = close_now * 0.98
+
+    tp1 = close_now * 1.05
+    tp2 = close_now * 1.10
+    tp3 = close_now * 1.20
+
+    return {
+        "status": "H1 EMA20 HOLD PULLBACK",
+        "setup_desc": f"Tăng {prev_pump_pct:.1f}% -> Chỉnh {pullback_pct:.1f}% về sát EMA20 H1 và bật nến xanh (Giữ vững EMA20)",
+        "score": 88,
+        "close_price": close_now,
+        "ema20": round(ema20_now, 4),
+        "box_high": round(recent_max_high, 4),
+        "low_candle": round(low_now, 4),
+        "vol_ratio": round(vol_ratio_now, 2),
+        "gainer_freq": 1,
+        "sl": round(sl, 4),
+        "tp1": round(tp1, 4),
+        "tp2": round(tp2, 4),
+        "tp3": round(tp3, 4),
+        "timestamp": last_candle['timestamp']
+    }
+
 def analyze_h4_ema20_setup(df_h4: pd.DataFrame, gainer_freq: int, realtime_price: float) -> dict:
     if df_h4.empty or len(df_h4) < 25: return None
 
@@ -524,7 +584,7 @@ def send_telegram_alert(sig: dict) -> bool:
 ⭐ <b>Điểm tín hiệu:</b> <b>{sig['score']}/100</b>
 
 💵 <b>Giá vào (Entry Realtime):</b> <code>{sig['close_price']:.4f}</code>
-🎯 <b>Vùng Hỗ trợ cứng / Kháng cự:</b> <code>{sig['box_high']:.4f}</code>
+🎯 <b>Đỉnh sóng / Hỗ trợ cứng:</b> <code>{sig['box_high']:.4f}</code>
 🛡 <b>Stop Loss (Đáy râu nến):</b> <code>{sig['sl']:.4f}</code>
 
 🎯 <b>Take Profit Target:</b>
@@ -630,14 +690,28 @@ def run_scanner_loop():
                 sym = t['symbol']
                 realtime_price = t['lastPrice']
 
-                # 1. Quét Setup H4 (EMA20 A+ Box Breakout / Pullback)
+                # 1. Quét Setup H1 Mới (H1 EMA20 Hold Pullback)
+                df_h1 = get_closed_klines_df(sym, "60", limit=40)
+                if not df_h1.empty:
+                    df_h1 = add_indicators(df_h1)
+                    analysis_h1 = analyze_h1_ema20_pullback(df_h1, realtime_price)
+                    if analysis_h1:
+                        oi_change = get_open_interest_change(sym, "60")
+                        analysis_h1['symbol'] = sym
+                        analysis_h1['price24hPcnt'] = t['price24hPcnt']
+                        analysis_h1['turnover24h'] = t['turnover24h']
+                        analysis_h1['funding'] = t['fundingRate']
+                        analysis_h1['oi_info'] = f"{oi_change:+}%/1h"
+                        scanned_signals.append(analysis_h1)
+
+                # 2. Quét Setup H4 (EMA20 A+ Box Breakout / Pullback)
                 df_h4 = get_closed_klines_df(sym, "240", limit=40)
                 if not df_h4.empty:
                     df_h4 = add_indicators(df_h4)
                     gainer_freq = get_gainer_frequency(sym)
                     analysis_h4 = analyze_h4_ema20_setup(df_h4, gainer_freq, realtime_price)
                     if analysis_h4:
-                        oi_change = get_open_interest_change(sym)
+                        oi_change = get_open_interest_change(sym, "240")
                         analysis_h4['symbol'] = sym
                         analysis_h4['price24hPcnt'] = t['price24hPcnt']
                         analysis_h4['turnover24h'] = t['turnover24h']
@@ -645,13 +719,13 @@ def run_scanner_loop():
                         analysis_h4['oi_info'] = f"{oi_change:+}%/4h"
                         scanned_signals.append(analysis_h4)
 
-                # 2. Quét Setup Daily (Daily Support Pinbar Rút Chân)
+                # 3. Quét Setup Daily (Daily Support Pinbar Rút Chân)
                 df_daily = get_closed_klines_df(sym, "D", limit=40)
                 if not df_daily.empty:
                     df_daily = add_indicators(df_daily)
                     analysis_daily = analyze_daily_support_pinbar(df_daily, realtime_price)
                     if analysis_daily:
-                        oi_change = get_open_interest_change(sym)
+                        oi_change = get_open_interest_change(sym, "D")
                         analysis_daily['symbol'] = sym
                         analysis_daily['price24hPcnt'] = t['price24hPcnt']
                         analysis_daily['turnover24h'] = t['turnover24h']

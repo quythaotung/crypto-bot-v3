@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Crypto Multi-Setup Scanner (H4 EMA20 & Daily Support Pinbar) Active 24/7!"
+    return "Bybit Crypto Multi-Setup Scanner (Strict Crypto Filter) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -242,7 +242,7 @@ def listen_telegram_commands():
         time.sleep(2)
 
 # ==============================================================================
-# 5. LẤY TOP GAINERS & DỮ LIỆU KLINES BYBIT (H4 + DAILY)
+# 5. LẤY TICKERS BYBIT (BỘ LỌC CHẶN NGHIÊM NGẶT TẤT CẢ MÃ CỔ PHIẾU / STOCKS)
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -257,10 +257,18 @@ def get_bybit_crypto_tickers():
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
             tickers = res["result"]["list"]
             
-            non_crypto = [
+            # 🔴 DANH SÁCH TẤT CẢ MÃ CỔ PHIẾU, CHỈ SỐ, HÀNG HÓA, NGÂN HÀNG TRUYỀN THỐNG (TradFi)
+            non_crypto_exact = [
+                # Kim loại quý & Hàng hóa
                 'XAU', 'XAG', 'WTI', 'USOIL', 'BRENT', 'COPPER', 'SILVER', 'GOLD', 'PLATINUM', 'PALLADIUM',
-                'QQQ', 'SPCX', 'SPY', 'DIA', 'IWM', 'TLT', 'NDX', 'SPX', 'US30', 'US100', 'US500', 'UK100', 'GER30',
+                # Chỉ số chứng khoán
+                'QQQ', 'SPCX', 'SPY', 'DIA', 'IWM', 'TLT', 'NDX', 'SPX', 'US30', 'US100', 'US500', 'UK100', 'GER30', 'JPN225',
+                # Cổ phiếu Ngân hàng & Tài chính
+                'JPM', 'BAC', 'C', 'WFC', 'GS', 'MS', 'BLK', 'AXP', 'V', 'MA', 'PYPL', 'SCHW',
+                # Cổ phiếu Công nghệ & Tập đoàn
                 'NVDA', 'TSLA', 'AAPL', 'AMZN', 'META', 'MSFT', 'GOOGL', 'NFLX', 'AMD', 'INTC', 'BABA', 'COIN',
+                'PLTR', 'MSTR', 'CRWD', 'HOOD', 'DIS', 'NKE', 'PFE', 'JNJ', 'PG', 'XOM', 'CVX',
+                # Leverage Tokens / Fiat / Index
                 '3L', '3S', 'BEAR', 'BULL', 'HALF', 'HEDGE'
             ]
             
@@ -279,7 +287,9 @@ def get_bybit_crypto_tickers():
                 spread_pct = ((ask - bid) / bid * 100) if (bid > 0 and ask > 0) else 0.0
 
                 if sym.endswith("USDT") and not sym.startswith(("USDC", "BUSD", "DAI", "EUR", "GBP")):
-                    if not any(k in sym for k in non_crypto):
+                    # Loại bỏ symbol nếu trùng với bất kỳ mã Cổ phiếu / Commodity nào
+                    base_coin = sym.replace("USDT", "")
+                    if base_coin not in non_crypto_exact and not any(k in sym for k in non_crypto_exact):
                         if turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT:
                             if price_change_pct >= 3.0:
                                 symbols_for_freq.append(sym)
@@ -347,7 +357,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 6. ENGINE PHÁT HIỆN SETUP: (1) H4 EMA20 A+ VÀ (2) DAILY PINBAR AT SUPPORT
+# 6. ENGINE PHÁT HIỆN SETUP
 # ==============================================================================
 def analyze_h4_ema20_setup(df_h4: pd.DataFrame, gainer_freq: int, realtime_price: float) -> dict:
     if df_h4.empty or len(df_h4) < 25: return None
@@ -431,12 +441,11 @@ def analyze_h4_ema20_setup(df_h4: pd.DataFrame, gainer_freq: int, realtime_price
         "timestamp": last_candle['timestamp']
     }
 
-# 🔴 SETUP MỚI KHUNG NGÀY: DAILY REJECTION PINBAR AT STRONG SUPPORT (ẢNH MINH HỌA)
 def analyze_daily_support_pinbar(df_daily: pd.DataFrame, realtime_price: float) -> dict:
     if df_daily.empty or len(df_daily) < 30: return None
 
     last_candle = df_daily.iloc[-1]
-    prev_daily_candles = df_daily.iloc[-30:-1] # 30 nến Daily trước đó
+    prev_daily_candles = df_daily.iloc[-30:-1]
 
     close_now = realtime_price if realtime_price > 0 else last_candle['close']
     open_now = last_candle['open']
@@ -445,34 +454,28 @@ def analyze_daily_support_pinbar(df_daily: pd.DataFrame, realtime_price: float) 
     ema89_now = last_candle['ema89']
     ema200_now = last_candle['ema200']
 
-    # TÍNH TOÁN VÙNG HỖ TRỢ CỨNG KHUNG NGÀY (HỘP XANH KHUNG D KHAI THÁC TỪ 30 NẾN TÍCH LŨY TRƯỚC)
     support_zone_low = prev_daily_candles['low'].min()
     support_zone_high = prev_daily_candles['low'].nsmallest(5).max()
 
-    # Hợp lưu với các đường EMA lớn (EMA89 / EMA200)
     ema_support = min(ema89_now, ema200_now) if ema89_now > 0 and ema200_now > 0 else max(ema89_now, ema200_now)
 
-    # ĐIỀU KIỆN 1: Giá thấp nhất nến chọc sát hoặc chạm vùng hỗ trợ cứng Khung D
     touched_support = (low_now <= support_zone_high * 1.015) and (low_now >= support_zone_low * 0.985)
     touched_ema_support = (low_now <= ema_support * 1.015) and (low_now >= ema_support * 0.985)
 
     is_at_strong_support = touched_support or touched_ema_support
 
-    # ĐIỀU KIỆN 2: Nến Rút Chân Đẹp (Bullish Pinbar / Rejection Shadow)
     candle_total_range = high_now - low_now
     if candle_total_range <= 0: return None
 
     lower_shadow = min(open_now, close_now) - low_now
     lower_shadow_pct = (lower_shadow / candle_total_range) * 100
 
-    # Râu dưới chiếm ít nhất 45% tổng chiều dài nến & Giá đóng ở nửa trên
     is_pinbar_shadow = lower_shadow_pct >= 45.0
     is_close_upper_half = close_now >= (low_now + candle_total_range * 0.45)
 
     if not (is_at_strong_support and is_pinbar_shadow and is_close_upper_half):
         return None
 
-    # SL đặt ngay dưới râu nến chọc thủng đáy hỗ trợ
     sl = low_now * 0.995
     risk_pct = ((close_now - sl) / close_now) * 100
 
@@ -605,7 +608,7 @@ def run_scanner_loop():
     init_db()
     Thread(target=listen_telegram_commands, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit Multi-Setup Engine (H4 & Daily Support Pinbar)...", flush=True)
+    print("⚡️ Bắt đầu Bybit Multi-Setup Engine (Strict Crypto Only)...", flush=True)
     while True:
         try:
             tickers = get_bybit_crypto_tickers()

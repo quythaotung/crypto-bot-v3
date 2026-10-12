@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit H4 EMA20 A+ Realtime Price Scanner Engine Active 24/7!"
+    return "Bybit Crypto Multi-Setup Scanner (H4 EMA20 & Daily Support Pinbar) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -184,7 +184,7 @@ def get_24h_summary_report() -> str:
         """)
         open_trades = cursor.fetchall()
 
-    msg = "📊 <b>BÁO CÁO TỔNG HỢP KẾT QUẢ CRYPTO H4 EMA20 A+ (24H)</b>\n"
+    msg = "📊 <b>BÁO CÁO TỔNG HỢP KẾT QUẢ CRYPTO (24H)</b>\n"
     msg += "===================================="
 
     if not closed_trades and not open_trades:
@@ -214,7 +214,7 @@ def get_24h_summary_report() -> str:
             st = "✅ (Đã cắn TP1 -> Dời SL về Entry)" if tp1_hit == 1 else "⏳ (Đang chạy)"
             msg += f"\n{idx}. #{sym} {st} | Entry: <code>{entry:.4f}</code> | SL: <code>{sl:.4f}</code>"
 
-    msg += "\n\n<i>💡 Chiến lược H4 Breakout Hộp Sideway + EMA20 Confirm A+.</i>"
+    msg += "\n\n<i>💡 Hệ thống quét H4 EMA20 Breakout & Daily Support Pinbar.</i>"
     return msg
 
 def listen_telegram_commands():
@@ -242,7 +242,7 @@ def listen_telegram_commands():
         time.sleep(2)
 
 # ==============================================================================
-# 5. LẤY TOP GAINERS BYBIT (CRYPTO ONLY)
+# 5. LẤY TOP GAINERS & DỮ LIỆU KLINES BYBIT (H4 + DAILY)
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -250,7 +250,7 @@ def safe_float(val, default=0.0):
     except (ValueError, TypeError):
         return default
 
-def get_bybit_crypto_top_gainers_5_10():
+def get_bybit_crypto_tickers():
     url = f"{BASE_URL}/v5/market/tickers?category=linear"
     try:
         res = requests.get(url, timeout=6).json()
@@ -280,28 +280,28 @@ def get_bybit_crypto_top_gainers_5_10():
 
                 if sym.endswith("USDT") and not sym.startswith(("USDC", "BUSD", "DAI", "EUR", "GBP")):
                     if not any(k in sym for k in non_crypto):
-                        if price_change_pct >= 4.0:
-                            symbols_for_freq.append(sym)
-                            if turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT:
-                                valid.append({
-                                    "symbol": sym,
-                                    "price24hPcnt": round(price_change_pct, 2),
-                                    "turnover24h": turnover,
-                                    "lastPrice": last_price,
-                                    "fundingRate": funding_rate,
-                                    "spread_pct": round(spread_pct, 3)
-                                })
+                        if turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT:
+                            if price_change_pct >= 3.0:
+                                symbols_for_freq.append(sym)
+                            valid.append({
+                                "symbol": sym,
+                                "price24hPcnt": round(price_change_pct, 2),
+                                "turnover24h": turnover,
+                                "lastPrice": last_price,
+                                "fundingRate": funding_rate,
+                                "spread_pct": round(spread_pct, 3)
+                            })
 
             if symbols_for_freq:
                 update_top_gainers_frequency(symbols_for_freq)
 
-            return sorted(valid, key=lambda x: x["price24hPcnt"], reverse=True)
+            return sorted(valid, key=lambda x: x["turnover24h"], reverse=True)
     except Exception as e:
-        print(f"[ERROR] Lỗi lấy Top Gainers Crypto: {e}", flush=True)
+        print(f"[ERROR] Lỗi lấy Tickers Crypto: {e}", flush=True)
     return []
 
-def get_closed_klines_df_h4(symbol: str, limit: int = 60) -> pd.DataFrame:
-    url = f"{BASE_URL}/v5/market/kline?category=linear&symbol={symbol}&interval=240&limit={limit+1}"
+def get_closed_klines_df(symbol: str, interval: str, limit: int = 60) -> pd.DataFrame:
+    url = f"{BASE_URL}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit+1}"
     try:
         res = requests.get(url, timeout=5).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
@@ -333,18 +333,21 @@ def get_open_interest_change(symbol: str) -> float:
         pass
     return 0.0
 
-def add_h4_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 25: return df
     closes, vols = df['close'], df['volume']
 
     df['ema20'] = closes.ewm(span=20, adjust=False).mean()
+    df['ema89'] = closes.ewm(span=89, adjust=False).mean()
+    df['ema200'] = closes.ewm(span=200, adjust=False).mean()
+
     df['vol_ma20'] = vols.rolling(20).mean()
     df['vol_ratio'] = vols / df['vol_ma20'].replace(0, np.nan)
 
     return df
 
 # ==============================================================================
-# 6. ENGINE BẮT SETUP A+ (LẤY GIÁ TRỰC TIẾP CHUẨN XÁC REALTIME)
+# 6. ENGINE PHÁT HIỆN SETUP: (1) H4 EMA20 A+ VÀ (2) DAILY PINBAR AT SUPPORT
 # ==============================================================================
 def analyze_h4_ema20_setup(df_h4: pd.DataFrame, gainer_freq: int, realtime_price: float) -> dict:
     if df_h4.empty or len(df_h4) < 25: return None
@@ -352,7 +355,6 @@ def analyze_h4_ema20_setup(df_h4: pd.DataFrame, gainer_freq: int, realtime_price
     last_candle = df_h4.iloc[-1]
     prev_box_candles = df_h4.iloc[-9:-1]
 
-    # 🔴 ĐIỀU CHỈNH: Dùng realtime_price (giá hiện tại sàn) thay vì giá nến H4 cũ
     close_now = realtime_price if realtime_price > 0 else last_candle['close']
     open_now = last_candle['open']
     high_now = max(last_candle['high'], close_now)
@@ -398,14 +400,12 @@ def analyze_h4_ema20_setup(df_h4: pd.DataFrame, gainer_freq: int, realtime_price
     if not setup_type:
         return None
 
-    # SL bên dưới đáy râu nến H4 / Đáy hộp
     sl = min(low_now, box_low) * 0.997
     risk_pct = ((close_now - sl) / close_now) * 100
 
     if risk_pct < 2.0:
         sl = close_now * 0.98
 
-    # 🔴 ĐIỀU CHỈNH: Tính TP1/TP2/TP3 dựa đúng trên Entry Realtime
     tp1 = close_now * 1.05
     tp2 = close_now * 1.10
     tp3 = close_now * 1.20
@@ -431,38 +431,104 @@ def analyze_h4_ema20_setup(df_h4: pd.DataFrame, gainer_freq: int, realtime_price
         "timestamp": last_candle['timestamp']
     }
 
+# 🔴 SETUP MỚI KHUNG NGÀY: DAILY REJECTION PINBAR AT STRONG SUPPORT (ẢNH MINH HỌA)
+def analyze_daily_support_pinbar(df_daily: pd.DataFrame, realtime_price: float) -> dict:
+    if df_daily.empty or len(df_daily) < 30: return None
+
+    last_candle = df_daily.iloc[-1]
+    prev_daily_candles = df_daily.iloc[-30:-1] # 30 nến Daily trước đó
+
+    close_now = realtime_price if realtime_price > 0 else last_candle['close']
+    open_now = last_candle['open']
+    high_now = max(last_candle['high'], close_now)
+    low_now = min(last_candle['low'], close_now)
+    ema89_now = last_candle['ema89']
+    ema200_now = last_candle['ema200']
+
+    # TÍNH TOÁN VÙNG HỖ TRỢ CỨNG KHUNG NGÀY (HỘP XANH KHUNG D KHAI THÁC TỪ 30 NẾN TÍCH LŨY TRƯỚC)
+    support_zone_low = prev_daily_candles['low'].min()
+    support_zone_high = prev_daily_candles['low'].nsmallest(5).max()
+
+    # Hợp lưu với các đường EMA lớn (EMA89 / EMA200)
+    ema_support = min(ema89_now, ema200_now) if ema89_now > 0 and ema200_now > 0 else max(ema89_now, ema200_now)
+
+    # ĐIỀU KIỆN 1: Giá thấp nhất nến chọc sát hoặc chạm vùng hỗ trợ cứng Khung D
+    touched_support = (low_now <= support_zone_high * 1.015) and (low_now >= support_zone_low * 0.985)
+    touched_ema_support = (low_now <= ema_support * 1.015) and (low_now >= ema_support * 0.985)
+
+    is_at_strong_support = touched_support or touched_ema_support
+
+    # ĐIỀU KIỆN 2: Nến Rút Chân Đẹp (Bullish Pinbar / Rejection Shadow)
+    candle_total_range = high_now - low_now
+    if candle_total_range <= 0: return None
+
+    lower_shadow = min(open_now, close_now) - low_now
+    lower_shadow_pct = (lower_shadow / candle_total_range) * 100
+
+    # Râu dưới chiếm ít nhất 45% tổng chiều dài nến & Giá đóng ở nửa trên
+    is_pinbar_shadow = lower_shadow_pct >= 45.0
+    is_close_upper_half = close_now >= (low_now + candle_total_range * 0.45)
+
+    if not (is_at_strong_support and is_pinbar_shadow and is_close_upper_half):
+        return None
+
+    # SL đặt ngay dưới râu nến chọc thủng đáy hỗ trợ
+    sl = low_now * 0.995
+    risk_pct = ((close_now - sl) / close_now) * 100
+
+    if risk_pct < 2.0:
+        sl = close_now * 0.98
+
+    tp1 = close_now * 1.05
+    tp2 = close_now * 1.10
+    tp3 = close_now * 1.20
+
+    return {
+        "status": "DAILY SUPPORT PINBAR",
+        "setup_desc": f"Nến Ngày rút chân cực đẹp (Râu dưới {lower_shadow_pct:.1f}%) sát vùng Hỗ trợ cứng Khung D",
+        "score": 90,
+        "close_price": close_now,
+        "ema20": round(ema89_now, 4),
+        "box_high": round(support_zone_high, 4),
+        "low_candle": round(low_now, 4),
+        "vol_ratio": round(last_candle['vol_ratio'], 2),
+        "gainer_freq": 1,
+        "sl": round(sl, 4),
+        "tp1": round(tp1, 4),
+        "tp2": round(tp2, 4),
+        "tp3": round(tp3, 4),
+        "timestamp": last_candle['timestamp']
+    }
+
 # ==============================================================================
 # 7. HỆ THỐNG GỬI TELEGRAM & CẬP NHẬT TRẠNG THÁI ACTIVE
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
 
-    msg = f"""🚨 <b>BYBIT H4 EMA20 SETUP A+ SCANNER</b>
+    msg = f"""🚨 <b>BYBIT CRYPTO CANDLE SCANNER</b>
 
-<b>Coin:</b> #{sig['symbol']} (Top Gainers {sig['price24hPcnt']}%)
+<b>Coin:</b> #{sig['symbol']} (24h Change: {sig['price24hPcnt']}%)
 <b>Trạng thái:</b> <code>{sig['status']}</code>
 🔔 <b>Lần thông báo:</b> <b>Call lần {sig['call_count']}/3</b>
-⭐ <b>Điểm chuẩn A+:</b> <b>{sig['score']}/100</b>
-<b>Khung thời gian:</b> H4 (4 Giờ)
+⭐ <b>Điểm tín hiệu:</b> <b>{sig['score']}/100</b>
 
 💵 <b>Giá vào (Entry Realtime):</b> <code>{sig['close_price']:.4f}</code>
-🎯 <b>Cản đỉnh hộp Sideway:</b> <code>{sig['box_high']:.4f}</code>
-📉 <b>Đường EMA 20 H4:</b> <code>{sig['ema20']:.4f}</code>
-🛡 <b>Stop Loss (Đáy nến H4/Đáy hộp):</b> <code>{sig['sl']:.4f}</code>
+🎯 <b>Vùng Hỗ trợ cứng / Kháng cự:</b> <code>{sig['box_high']:.4f}</code>
+🛡 <b>Stop Loss (Đáy râu nến):</b> <code>{sig['sl']:.4f}</code>
 
-🎯 <b>Take Profit Target (Tính từ Entry Realtime):</b>
+🎯 <b>Take Profit Target:</b>
 • <b>TP1 (+5%):</b> <code>{sig['tp1']:.4f}</code>
 • <b>TP2 (+10%):</b> <code>{sig['tp2']:.4f}</code>
 • <b>TP3 (+20%):</b> <code>{sig['tp3']:.4f}</code>
 
 📊 <b>Turnover 24h:</b> ${sig['turnover24h']/1e6:.2f}M USD
-🔥 <b>Volume H4 / MA20:</b> {sig['vol_ratio']}x
-📈 <b>OI H4 Change:</b> {sig['oi_info']}
+🔥 <b>Volume Ratio:</b> {sig['vol_ratio']}x
+📈 <b>OI Change:</b> {sig['oi_info']}
 💸 <b>Funding Rate:</b> {sig['funding']:.4f}%
 
 💡 <b>Mô tả tín hiệu:</b>
 • {sig['setup_desc']}
-• Nằm trong Top Gainers Bybit (tăng {sig['price24hPcnt']}%)
 
 🔗 <a href="https://www.bybit.com/trade/usdt/{sig['symbol']}">Biểu đồ Bybit {sig['symbol']}</a>
 
@@ -539,38 +605,51 @@ def run_scanner_loop():
     init_db()
     Thread(target=listen_telegram_commands, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit H4 EMA20 Realtime Engine...", flush=True)
+    print("⚡️ Bắt đầu Bybit Multi-Setup Engine (H4 & Daily Support Pinbar)...", flush=True)
     while True:
         try:
-            top_gainers = get_bybit_crypto_top_gainers_5_10()
-            tickers_map = {t['symbol']: t['lastPrice'] for t in top_gainers}
+            tickers = get_bybit_crypto_tickers()
+            tickers_map = {t['symbol']: t['lastPrice'] for t in tickers}
 
             track_and_update_active_trades(tickers_map)
 
-            print(f"\n🔍 [SCANNER] Tìm thấy {len(top_gainers)} Coin Crypto trong Top Gainers...", flush=True)
+            print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins thanh khoản cao...", flush=True)
 
             scanned_signals = []
-            for t in top_gainers[:MAX_SYMBOLS_SCAN]:
+            for t in tickers[:MAX_SYMBOLS_SCAN]:
                 sym = t['symbol']
-                realtime_price = t['lastPrice'] # 🔴 Lấy giá realtime từ Ticker API
+                realtime_price = t['lastPrice']
 
-                df_h4 = get_closed_klines_df_h4(sym, limit=40)
-                if df_h4.empty: continue
+                # 1. Quét Setup H4 (EMA20 A+ Box Breakout / Pullback)
+                df_h4 = get_closed_klines_df(sym, "240", limit=40)
+                if not df_h4.empty:
+                    df_h4 = add_indicators(df_h4)
+                    gainer_freq = get_gainer_frequency(sym)
+                    analysis_h4 = analyze_h4_ema20_setup(df_h4, gainer_freq, realtime_price)
+                    if analysis_h4:
+                        oi_change = get_open_interest_change(sym)
+                        analysis_h4['symbol'] = sym
+                        analysis_h4['price24hPcnt'] = t['price24hPcnt']
+                        analysis_h4['turnover24h'] = t['turnover24h']
+                        analysis_h4['funding'] = t['fundingRate']
+                        analysis_h4['oi_info'] = f"{oi_change:+}%/4h"
+                        scanned_signals.append(analysis_h4)
 
-                df_h4 = add_h4_indicators(df_h4)
-                gainer_freq = get_gainer_frequency(sym)
+                # 2. Quét Setup Daily (Daily Support Pinbar Rút Chân)
+                df_daily = get_closed_klines_df(sym, "D", limit=40)
+                if not df_daily.empty:
+                    df_daily = add_indicators(df_daily)
+                    analysis_daily = analyze_daily_support_pinbar(df_daily, realtime_price)
+                    if analysis_daily:
+                        oi_change = get_open_interest_change(sym)
+                        analysis_daily['symbol'] = sym
+                        analysis_daily['price24hPcnt'] = t['price24hPcnt']
+                        analysis_daily['turnover24h'] = t['turnover24h']
+                        analysis_daily['funding'] = t['fundingRate']
+                        analysis_daily['oi_info'] = f"{oi_change:+}%/1d"
+                        scanned_signals.append(analysis_daily)
 
-                analysis = analyze_h4_ema20_setup(df_h4, gainer_freq, realtime_price)
-                if analysis:
-                    oi_change = get_open_interest_change(sym)
-                    analysis['symbol'] = sym
-                    analysis['price24hPcnt'] = t['price24hPcnt']
-                    analysis['turnover24h'] = t['turnover24h']
-                    analysis['funding'] = t['fundingRate']
-                    analysis['oi_info'] = f"{oi_change:+}%/4h"
-                    scanned_signals.append(analysis)
-
-            scanned_signals.sort(key=lambda x: (x['gainer_freq'], x['score']), reverse=True)
+            scanned_signals.sort(key=lambda x: x['score'], reverse=True)
             top_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
 
             sent_count = 0
@@ -586,12 +665,12 @@ def run_scanner_loop():
                         if send_telegram_alert(sig):
                             save_active_trade(sig)
                             sent_count += 1
-                            print(f"✅ [H4 SETUP A+ TOP {sent_count}] #{sig['symbol']} Realtime Entry: {sig['close_price']} | SL: {sig['sl']}", flush=True)
+                            print(f"✅ [SETUP TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Realtime Entry: {sig['close_price']} | SL: {sig['sl']}", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)
 
-        print(f"⏳ Hoàn tất chu kỳ H4. Tạm nghỉ {SCAN_INTERVAL_SECONDS} giây...", flush=True)
+        print(f"⏳ Hoàn tất chu kỳ. Tạm nghỉ {SCAN_INTERVAL_SECONDS} giây...", flush=True)
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 if __name__ == "__main__":

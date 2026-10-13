@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit MA20 Breakout & Retest Rebound Scanner Active 24/7!"
+    return "Bybit Multi-Setup MA20 Scanner Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -214,7 +214,7 @@ def get_24h_summary_report() -> str:
             st = "✅ (Đã cắn TP1 -> Dời SL về Entry)" if tp1_hit == 1 else "⏳ (Đang chạy)"
             msg += f"\n{idx}. #{sym} {st} | Entry Retest: <code>{entry:.4f}</code> | SL: <code>{sl:.4f}</code>"
 
-    msg += "\n\n<i>💡 Hệ thống quét H4 MA20 Breakout & Retest Rebound.</i>"
+    msg += "\n\n<i>💡 Hệ thống quét MA20 Retest & Breakout Khung H1 & H4.</i>"
     return msg
 
 def listen_telegram_commands():
@@ -358,8 +358,68 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 6. ENGINE PHÁT HIỆN SETUP: ĐÓNG NẾN QUA MA20 -> RETEST SÁT MA20 RÚT CHÂN / ĐÓNG XANH H4
+# 6. ENGINE PHÁT HIỆN SETUP (H4 PURE BREAKOUT, H4 RETEST & H1 PULLBACK)
 # ==============================================================================
+
+# 🔴 SETUP 1 (MỚI): KHUNG H4 PURE BREAKOUT MA20 (GIÁ Ở DƯỚI DỰA ĐÓNG NẾN VƯỢT NẾN XANH KHOẺ)
+def analyze_h4_pure_ma20_breakout(df_h4: pd.DataFrame, realtime_price: float) -> dict:
+    if df_h4.empty or len(df_h4) < 25: return None
+
+    last_candle = df_h4.iloc[-1]
+    prev_candles = df_h4.iloc[-6:-1] # 5 nến trước đó
+
+    close_now = realtime_price if realtime_price > 0 else last_candle['close']
+    open_now = last_candle['open']
+    high_now = max(last_candle['high'], close_now)
+    low_now = min(last_candle['low'], close_now)
+    ema20_now = last_candle['ema20']
+
+    # 1. Các nến trước đó nằm dưới đường MA 20
+    under_ma20_count = sum(1 for _, row in prev_candles.iterrows() if row['close'] < row['ema20'])
+    is_prev_under_ma20 = under_ma20_count >= 3
+
+    # 2. Cây nến H4 hiện tại đóng hẳn lên trên MA20 và là nến xanh có lực đẩy
+    is_close_above_ma20 = close_now > ema20_now
+    is_green_candle = close_now > open_now
+    candle_body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
+
+    if not (is_prev_under_ma20 and is_close_above_ma20 and is_green_candle and candle_body_pct >= 1.5):
+        return None
+
+    retest_entry = ema20_now * 1.002
+    is_fomo = close_now > retest_entry * 1.025
+
+    sl = low_now * 0.997
+    risk_pct = ((retest_entry - sl) / retest_entry) * 100
+
+    if risk_pct < 2.0:
+        sl = retest_entry * 0.98
+
+    tp1 = retest_entry * 1.05
+    tp2 = retest_entry * 1.10
+    tp3 = retest_entry * 1.20
+
+    return {
+        "timeframe": "H4",
+        "status": "H4 PURE MA20 BREAKOUT",
+        "setup_desc": f"Nến H4 xanh dốc đóng vượt thẳng đường MA20 (+{candle_body_pct:.1f}%) từ vùng tích lũy dưới MA20",
+        "score": 96,
+        "close_price": close_now,
+        "retest_entry": round(retest_entry, 4),
+        "is_fomo": is_fomo,
+        "ema20": round(ema20_now, 4),
+        "box_high": round(high_now, 4),
+        "low_candle": round(low_now, 4),
+        "vol_ratio": round(last_candle['vol_ratio'], 2),
+        "gainer_freq": 1,
+        "sl": round(sl, 4),
+        "tp1": round(tp1, 4),
+        "tp2": round(tp2, 4),
+        "tp3": round(tp3, 4),
+        "timestamp": last_candle['timestamp']
+    }
+
+# 🔴 SETUP 2: KHUNG H4 MA20 BREAKOUT & RETEST BOUNCE
 def analyze_h4_ma20_breakout_retest(df_h4: pd.DataFrame, realtime_price: float) -> dict:
     if df_h4.empty or len(df_h4) < 25: return None
 
@@ -371,26 +431,18 @@ def analyze_h4_ma20_breakout_retest(df_h4: pd.DataFrame, realtime_price: float) 
     high_now = max(last_candle['high'], close_now)
     low_now = min(last_candle['low'], close_now)
     ema20_now = last_candle['ema20']
-    vol_ratio_now = last_candle['vol_ratio']
 
-    # 1. ĐÃ TỪNG ĐÓNG NẾN VƯỢT QUA MA20 Ở CÂY NẾN TRƯỚC HỌẶC GẦN ĐÂY
     is_breakout_above_ma20 = (prev_candle['close'] > prev_candle['ema20']) or (df_h4.iloc[-3]['close'] > df_h4.iloc[-3]['ema20'])
+    is_testing_ma20 = (low_now <= ema20_now * 1.02) and (low_now >= ema20_now * 0.98)
 
-    # 2. CÂY NẾN H4 HIỆN TẠI TEST LẠI SÁT/CHẠM ĐƯỜNG MA20 (RÂU LOW CHỌC SÁT MA20)
-    is_testing_ma20 = (low_now <= ema20_now * 1.015) and (low_now >= ema20_now * 0.985)
-
-    # 3. ĐÓNG NẾN TRÊN MA20 VÀ CÓ LỰC RÚT CHÂN / ĐÓNG NẾN XANH KẾT THÚC CÂY RETEST
     is_close_above_ma20 = close_now > ema20_now
     lower_shadow = min(open_now, close_now) - low_now
     candle_range = high_now - low_now
     is_strong_rebound = (close_now > open_now) or (candle_range > 0 and lower_shadow / candle_range >= 0.35)
 
-    is_setup_retest = is_breakout_above_ma20 and is_testing_ma20 and is_close_above_ma20 and is_strong_rebound
-
-    if not is_setup_retest:
+    if not (is_breakout_above_ma20 and is_testing_ma20 and is_close_above_ma20 and is_strong_rebound):
         return None
 
-    # TÍNH ENTRY LIMIT RETEST AN TOÀN TẠI VÙNG MA20
     retest_entry = ema20_now * 1.002
     is_fomo = close_now > retest_entry * 1.02
 
@@ -405,16 +457,87 @@ def analyze_h4_ma20_breakout_retest(df_h4: pd.DataFrame, realtime_price: float) 
     tp3 = retest_entry * 1.20
 
     return {
+        "timeframe": "H4",
         "status": "H4 MA20 BREAKOUT & RETEST BOUNCE",
-        "setup_desc": "Đóng nến qua MA20 -> Nến sau nhúng test sát MA20 rút chân / đóng xanh đủ lực đẩy giá tiếp tục xu hướng",
-        "score": 95,
+        "setup_desc": "Đóng nến H4 qua MA20 -> Nhúng retest sát MA20 rút chân / đóng xanh đủ lực đẩy tiếp xu hướng",
+        "score": 94,
         "close_price": close_now,
         "retest_entry": round(retest_entry, 4),
         "is_fomo": is_fomo,
         "ema20": round(ema20_now, 4),
         "box_high": round(prev_candle['high'], 4),
         "low_candle": round(low_now, 4),
-        "vol_ratio": round(vol_ratio_now, 2),
+        "vol_ratio": round(last_candle['vol_ratio'], 2),
+        "gainer_freq": 1,
+        "sl": round(sl, 4),
+        "tp1": round(tp1, 4),
+        "tp2": round(tp2, 4),
+        "tp3": round(tp3, 4),
+        "timestamp": last_candle['timestamp']
+    }
+
+# 🔴 SETUP 3: KHUNG H1 PULLBACK (TĂNG 10-15% -> GIẢM 4-7% GẦN MA20 ĐÓNG NẾN TRÊN MA20)
+def analyze_h1_ema20_pullback(df_h1: pd.DataFrame, realtime_price: float) -> dict:
+    if df_h1.empty or len(df_h1) < 25: return None
+
+    last_candle = df_h1.iloc[-1]
+
+    close_now = realtime_price if realtime_price > 0 else last_candle['close']
+    open_now = last_candle['open']
+    high_now = max(last_candle['high'], close_now)
+    low_now = min(last_candle['low'], close_now)
+    ema20_now = last_candle['ema20']
+
+    recent_h1 = df_h1.iloc[-17:-1]
+    recent_max_high = recent_h1['high'].max()
+    recent_min_low = recent_h1['low'].min()
+
+    prev_pump_pct = ((recent_max_high - recent_min_low) / recent_min_low) * 100
+    pullback_pct = ((recent_max_high - low_now) / recent_max_high) * 100 if recent_max_high > 0 else 0.0
+
+    is_close_above_ma20 = close_now >= ema20_now
+    is_near_ma20 = (low_now <= ema20_now * 1.02) and (low_now >= ema20_now * 0.98)
+    
+    lower_shadow = min(open_now, close_now) - low_now
+    candle_range = high_now - low_now
+    is_strong_rebound = (close_now > open_now) or (candle_range > 0 and lower_shadow / candle_range >= 0.30)
+
+    is_setup_h1_pullback = (
+        (10.0 <= prev_pump_pct <= 18.0) and
+        (3.5 <= pullback_pct <= 8.0) and
+        is_close_above_ma20 and
+        is_near_ma20 and
+        is_strong_rebound
+    )
+
+    if not is_setup_h1_pullback:
+        return None
+
+    retest_entry = ema20_now * 1.002
+    is_fomo = close_now > retest_entry * 1.015
+
+    sl = low_now * 0.997
+    risk_pct = ((retest_entry - sl) / retest_entry) * 100
+
+    if risk_pct < 2.0:
+        sl = retest_entry * 0.98
+
+    tp1 = retest_entry * 1.05
+    tp2 = retest_entry * 1.10
+    tp3 = retest_entry * 1.20
+
+    return {
+        "timeframe": "H1",
+        "status": "H1 MA20 HOLD PULLBACK",
+        "setup_desc": f"Tăng {prev_pump_pct:.1f}% -> Giảm {pullback_pct:.1f}% về sát MA20 H1 và đóng nến trên MA20 đủ lực",
+        "score": 90,
+        "close_price": close_now,
+        "retest_entry": round(retest_entry, 4),
+        "is_fomo": is_fomo,
+        "ema20": round(ema20_now, 4),
+        "box_high": round(recent_max_high, 4),
+        "low_candle": round(low_now, 4),
+        "vol_ratio": round(last_candle['vol_ratio'], 2),
         "gainer_freq": 1,
         "sl": round(sl, 4),
         "tp1": round(tp1, 4),
@@ -433,7 +556,7 @@ def send_telegram_alert(sig: dict) -> bool:
     if sig.get('is_fomo', False):
         fomo_warning = f"\n⚠️ <b>CẢNH BÁO MUA ĐUỔI (FOMO):</b> Giá hiện tại ({sig['close_price']:.4f}) đã đẩy cao. <b>NÊN ĐẶT LỆNH LIMIT</b> ở điểm retest sát MA20 bên dưới!\n"
 
-    msg = f"""🚨 <b>BYBIT CRYPTO CANDLE SCANNER</b>
+    msg = f"""🚨 <b>BYBIT CRYPTO CANDLE SCANNER ({sig['timeframe']})</b>
 
 <b>Coin:</b> #{sig['symbol']} (24h Change: {sig['price24hPcnt']}%)
 <b>Trạng thái:</b> <code>{sig['status']}</code>
@@ -442,7 +565,7 @@ def send_telegram_alert(sig: dict) -> bool:
 {fomo_warning}
 🎯 <b>ĐIỂM VÀO LIMIT RETEST MA20:</b> <code>{sig['retest_entry']:.4f}</code>
 💵 <b>Giá Realtime sàn hiện tại:</b> <code>{sig['close_price']:.4f}</code>
-📉 <b>Đường MA 20 H4:</b> <code>{sig['ema20']:.4f}</code>
+📉 <b>Đường MA 20 ({sig['timeframe']}):</b> <code>{sig['ema20']:.4f}</code>
 🛡 <b>Stop Loss (Đáy râu nến retest):</b> <code>{sig['sl']:.4f}</code>
 
 🎯 <b>Take Profit Target (Tính từ Entry Retest):</b>
@@ -533,7 +656,7 @@ def run_scanner_loop():
     init_db()
     Thread(target=listen_telegram_commands, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit MA20 Retest Scanner Engine...", flush=True)
+    print("⚡️ Bắt đầu Bybit Multi-Timeframe (H1 & H4) MA20 Scanner Engine...", flush=True)
     while True:
         try:
             tickers = get_bybit_crypto_tickers()
@@ -548,11 +671,23 @@ def run_scanner_loop():
                 sym = t['symbol']
                 realtime_price = t['lastPrice']
 
-                # Quét Setup H4 Breakout & Retest MA20 chuẩn
+                # 1. Quét Setup Khung H4
                 df_h4 = get_closed_klines_df(sym, "240", limit=40)
                 if not df_h4.empty:
                     df_h4 = add_indicators(df_h4)
                     
+                    # 1.1 H4 Pure MA20 Breakout (MỚI BỔ SUNG)
+                    analysis_h4_pure = analyze_h4_pure_ma20_breakout(df_h4, realtime_price)
+                    if analysis_h4_pure:
+                        oi_change = get_open_interest_change(sym, "240")
+                        analysis_h4_pure['symbol'] = sym
+                        analysis_h4_pure['price24hPcnt'] = t['price24hPcnt']
+                        analysis_h4_pure['turnover24h'] = t['turnover24h']
+                        analysis_h4_pure['funding'] = t['fundingRate']
+                        analysis_h4_pure['oi_info'] = f"{oi_change:+}%/4h"
+                        scanned_signals.append(analysis_h4_pure)
+
+                    # 1.2 H4 Retest MA20
                     analysis_h4_retest = analyze_h4_ma20_breakout_retest(df_h4, realtime_price)
                     if analysis_h4_retest:
                         oi_change = get_open_interest_change(sym, "240")
@@ -562,6 +697,20 @@ def run_scanner_loop():
                         analysis_h4_retest['funding'] = t['fundingRate']
                         analysis_h4_retest['oi_info'] = f"{oi_change:+}%/4h"
                         scanned_signals.append(analysis_h4_retest)
+
+                # 2. Quét Setup Khung H1 (Pullback 10-15% -> 4-7% về MA20)
+                df_h1 = get_closed_klines_df(sym, "60", limit=40)
+                if not df_h1.empty:
+                    df_h1 = add_indicators(df_h1)
+                    analysis_h1 = analyze_h1_ema20_pullback(df_h1, realtime_price)
+                    if analysis_h1:
+                        oi_change = get_open_interest_change(sym, "60")
+                        analysis_h1['symbol'] = sym
+                        analysis_h1['price24hPcnt'] = t['price24hPcnt']
+                        analysis_h1['turnover24h'] = t['turnover24h']
+                        analysis_h1['funding'] = t['fundingRate']
+                        analysis_h1['oi_info'] = f"{oi_change:+}%/1h"
+                        scanned_signals.append(analysis_h1)
 
             scanned_signals.sort(key=lambda x: x['score'], reverse=True)
             top_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
@@ -579,7 +728,7 @@ def run_scanner_loop():
                         if send_telegram_alert(sig):
                             save_active_trade(sig)
                             sent_count += 1
-                            print(f"✅ [SETUP TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Retest Entry: {sig['retest_entry']} | SL: {sig['sl']}", flush=True)
+                            print(f"✅ [{sig['timeframe']} TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Entry Retest: {sig['retest_entry']} | SL: {sig['sl']}", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)

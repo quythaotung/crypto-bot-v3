@@ -358,7 +358,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 6. ENGINE PHÁT HIỆN SETUP (H4 PURE BREAKOUT, H4 RETEST, H1 ENGULFING SIDEWAY & H1 PULLBACK)
+# 6. ENGINE PHÁT HIỆN SETUP
 # ==============================================================================
 
 # 🔴 SETUP H4 (1): PURE BREAKOUT MA20
@@ -474,13 +474,68 @@ def analyze_h4_ma20_breakout_retest(df_h4: pd.DataFrame, realtime_price: float) 
         "timestamp": last_candle['timestamp']
     }
 
-# 🔴 SETUP H1 (1) MỚI: TÍCH LŨY QUANH MA20 -> NẾN ĐỎ -> NẾN XANH NHẤN CHÌM ÁP ĐẢO VÀ TĂNG TIẾP DIỄN
+# 🔴 SETUP H1 (1) MỚI: TÍCH LŨY DƯỚI MA20 -> ĐÓNG NẾN QUA MA20 -> 2-3 NẾN TIẾP THEO GIỮ VỮNG TRÊN MA20
+def analyze_h1_consolidation_above_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
+    if df_h1.empty or len(df_h1) < 25: return None
+
+    last_candle = df_h1.iloc[-1]
+    
+    close_now = realtime_price if realtime_price > 0 else last_candle['close']
+    low_now = min(last_candle['low'], close_now)
+    ema20_now = last_candle['ema20']
+
+    # 1. Đoạn nến từ 5 đến 10 nến trước nằm ở dưới MA20
+    prev_under_candles = df_h1.iloc[-12:-4]
+    under_ma20_count = sum(1 for _, row in prev_under_candles.iterrows() if row['close'] < row['ema20'])
+    is_prev_under_ma20 = under_ma20_count >= 4
+
+    # 2. Các cây nến gần nhất (2-3 nến) ĐỀU ĐÓNG CỬA NẰM TRÊN MA20
+    recent_3_candles = df_h1.iloc[-3:]
+    is_hold_above_ma20 = all(r['close'] >= r['ema20'] for _, r in recent_3_candles.iterrows()) and (close_now >= ema20_now)
+
+    if not (is_prev_under_ma20 and is_hold_above_ma20):
+        return None
+
+    retest_entry = ema20_now * 1.002
+    is_fomo = close_now > retest_entry * 1.02
+
+    sl = min(r['low'] for _, r in recent_3_candles.iterrows()) * 0.997
+    risk_pct = ((retest_entry - sl) / retest_entry) * 100
+
+    if risk_pct < 2.0:
+        sl = retest_entry * 0.98
+
+    tp1 = retest_entry * 1.05
+    tp2 = retest_entry * 1.10
+    tp3 = retest_entry * 1.20
+
+    return {
+        "timeframe": "H1",
+        "status": "H1 CONSOLIDATION ABOVE MA20",
+        "setup_desc": "Đường giá dưới MA20 đóng vượt lên MA20 VÀ giữ vững đóng nến trên MA20 suốt 2-3 cây nến H1 liên tiếp chuẩn bị bùng nổ",
+        "score": 95,
+        "close_price": close_now,
+        "retest_entry": round(retest_entry, 4),
+        "is_fomo": is_fomo,
+        "ema20": round(ema20_now, 4),
+        "box_high": round(max(r['high'] for _, r in recent_3_candles.iterrows()), 4),
+        "low_candle": round(low_now, 4),
+        "vol_ratio": round(last_candle['vol_ratio'], 2),
+        "gainer_freq": 1,
+        "sl": round(sl, 4),
+        "tp1": round(tp1, 4),
+        "tp2": round(tp2, 4),
+        "tp3": round(tp3, 4),
+        "timestamp": last_candle['timestamp']
+    }
+
+# 🔴 SETUP H1 (2): ENGULFING SIDEWAY MA20
 def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
     if df_h1.empty or len(df_h1) < 25: return None
 
     last_candle = df_h1.iloc[-1]
     prev_candle = df_h1.iloc[-2]
-    prev_candles_sideway = df_h1.iloc[-8:-2] # 6 nến trước đó
+    prev_candles_sideway = df_h1.iloc[-8:-2]
 
     close_now = realtime_price if realtime_price > 0 else last_candle['close']
     open_now = last_candle['open']
@@ -488,14 +543,11 @@ def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float
     low_now = min(last_candle['low'], close_now)
     ema20_now = last_candle['ema20']
 
-    # 1. Đường giá tích lũy đi ngang sát dải MA 20 H1 (Biến động dưới 3% quanh MA20)
     sideway_diff_pct = [(abs(r['close'] - r['ema20']) / r['ema20']) * 100 for _, r in prev_candles_sideway.iterrows()]
     is_sideway_ma20 = (sum(sideway_diff_pct) / len(sideway_diff_pct)) <= 2.5
 
-    # 2. Cây nến liền trước là nến ĐỎ tích lũy
     is_prev_red = prev_candle['close'] < prev_candle['open']
 
-    # 3. Nến hiện tại là NẾN XANH LỚN NHẤN CHÌM ÁP ĐẢO (Thân nến xanh lớn hơn nến đỏ VÀ đóng vượt đỉnh nến đỏ)
     is_green_now = close_now > open_now
     is_close_above_ma20 = close_now > ema20_now
     is_engulfing = (close_now > prev_candle['open']) and (close_now > prev_candle['high'])
@@ -521,8 +573,8 @@ def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float
     return {
         "timeframe": "H1",
         "status": "H1 BULLISH ENGULFING SIDEWAY MA20",
-        "setup_desc": f"Tích lũy quanh MA20 H1 -> Nến xanh áp đảo tuyệt đối nến đỏ trước đó (+{green_body_pct:.1f}%) thể hiện lực tăng tiếp diễn",
-        "score": 95,
+        "setup_desc": f"Tích lũy quanh MA20 H1 -> Nến xanh áp đảo tuyệt đối nến đỏ trước đó (+{green_body_pct:.1f}%)",
+        "score": 93,
         "close_price": close_now,
         "retest_entry": round(retest_entry, 4),
         "is_fomo": is_fomo,
@@ -538,7 +590,7 @@ def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float
         "timestamp": last_candle['timestamp']
     }
 
-# 🔴 SETUP H1 (2): PULLBACK 10-15% -> 4-7% VỀ SÁT MA20
+# 🔴 SETUP H1 (3): PULLBACK 10-15% -> 4-7% VỀ SÁT MA20
 def analyze_h1_ema20_pullback(df_h1: pd.DataFrame, realtime_price: float) -> dict:
     if df_h1.empty or len(df_h1) < 25: return None
 
@@ -733,7 +785,7 @@ def run_scanner_loop():
                 sym = t['symbol']
                 realtime_price = t['lastPrice']
 
-                # 1. Quét các Setup Khung H4
+                # 1. Quét Setup Khung H4
                 df_h4 = get_closed_klines_df(sym, "240", limit=40)
                 if not df_h4.empty:
                     df_h4 = add_indicators(df_h4)
@@ -758,12 +810,23 @@ def run_scanner_loop():
                         analysis_h4_retest['oi_info'] = f"{oi_change:+}%/4h"
                         scanned_signals.append(analysis_h4_retest)
 
-                # 2. Quét các Setup Khung H1
+                # 2. Quét Setup Khung H1
                 df_h1 = get_closed_klines_df(sym, "60", limit=40)
                 if not df_h1.empty:
                     df_h1 = add_indicators(df_h1)
                     
-                    # 2.1 H1 Engulfing Sideway MA20 (MỚI THEO HÌNH BAT/USDT)
+                    # 2.1 H1 Consolidation Above MA20 (MỚI THEO YÊU CẦU)
+                    analysis_h1_consol = analyze_h1_consolidation_above_ma20(df_h1, realtime_price)
+                    if analysis_h1_consol:
+                        oi_change = get_open_interest_change(sym, "60")
+                        analysis_h1_consol['symbol'] = sym
+                        analysis_h1_consol['price24hPcnt'] = t['price24hPcnt']
+                        analysis_h1_consol['turnover24h'] = t['turnover24h']
+                        analysis_h1_consol['funding'] = t['fundingRate']
+                        analysis_h1_consol['oi_info'] = f"{oi_change:+}%/1h"
+                        scanned_signals.append(analysis_h1_consol)
+
+                    # 2.2 H1 Engulfing Sideway MA20
                     analysis_h1_engulfing = analyze_h1_engulfing_sideway_ma20(df_h1, realtime_price)
                     if analysis_h1_engulfing:
                         oi_change = get_open_interest_change(sym, "60")
@@ -774,7 +837,7 @@ def run_scanner_loop():
                         analysis_h1_engulfing['oi_info'] = f"{oi_change:+}%/1h"
                         scanned_signals.append(analysis_h1_engulfing)
 
-                    # 2.2 H1 Pullback MA20
+                    # 2.3 H1 Pullback MA20
                     analysis_h1_pullback = analyze_h1_ema20_pullback(df_h1, realtime_price)
                     if analysis_h1_pullback:
                         oi_change = get_open_interest_change(sym, "60")

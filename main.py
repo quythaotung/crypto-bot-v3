@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Direct Market Entry Scanner Active 24/7!"
+    return "Bybit Multi-Setup MA20 Scanner Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -358,8 +358,68 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 6. ENGINE PHÁT HIỆN SETUP (TÍNH TOÁN THEO GIÁ MARKET REALTIME TRỰC TIẾP)
+# 6. ENGINE PHÁT HIỆN SETUP
 # ==============================================================================
+
+# 🔴 SETUP H1 AA+ SỚM (MỚI): VỪA ĐÓNG 2-3 NẾN TRÊN MA20 VÀ GIÁ VẪN ĐANG Ở NỀN (CHƯA TĂNG SLIPPAGE MẠNH)
+def analyze_h1_early_accumulation_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
+    if df_h1.empty or len(df_h1) < 25: return None
+
+    last_candle = df_h1.iloc[-1]
+    
+    close_now = realtime_price if realtime_price > 0 else last_candle['close']
+    low_now = min(last_candle['low'], close_now)
+    open_now = last_candle['open']
+    ema20_now = last_candle['ema20']
+
+    # 1. Chuỗi nến trước đó nằm dưới đường MA20
+    prev_under_candles = df_h1.iloc[-12:-4]
+    under_ma20_count = sum(1 for _, row in prev_under_candles.iterrows() if row['close'] < row['ema20'])
+    is_prev_under_ma20 = under_ma20_count >= 4
+
+    # 2. Liên tiếp 2-3 nến gần nhất đóng trên MA20
+    recent_3_candles = df_h1.iloc[-3:]
+    is_hold_above_ma20 = all(r['close'] >= r['ema20'] for _, r in recent_3_candles.iterrows()) and (close_now >= ema20_now)
+
+    # 3. ĐIỀU KIỆN AA+ KHỐNG CHẾ CHƯA TĂNG MẠNH: Giá hiện tại chỉ cách MA20 tối đa 1.8%
+    dist_from_ma20_pct = ((close_now - ema20_now) / ema20_now) * 100
+    is_still_at_base = (0.0 <= dist_from_ma20_pct <= 1.8)
+    
+    # Nến hiện tại chưa phải là cột dựng quá dài (< 2.2%)
+    candle_body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
+
+    if not (is_prev_under_ma20 and is_hold_above_ma20 and is_still_at_base and candle_body_pct <= 2.2):
+        return None
+
+    market_entry = close_now
+    sl = min(r['low'] for _, r in recent_3_candles.iterrows()) * 0.997
+    risk_pct = ((market_entry - sl) / market_entry) * 100
+
+    if risk_pct < 2.0:
+        sl = market_entry * 0.98
+
+    tp1 = market_entry * 1.05
+    tp2 = market_entry * 1.10
+    tp3 = market_entry * 1.20
+
+    return {
+        "timeframe": "H1",
+        "status": "H1 EARLY ACCUMULATION MA20 (SETUP AA+)",
+        "setup_desc": f"Nền giá vừa tích lũy 2-3 nến trên MA20 H1 (cách MA20 chỉ +{dist_from_ma20_pct:.1f}%) -> CHƯA TĂNG, ĐÓN ĐÚNG GỐC SÓNG BÙNG NỔ!",
+        "score": 99,
+        "close_price": close_now,
+        "market_entry": round(market_entry, 4),
+        "ema20": round(ema20_now, 4),
+        "box_high": round(max(r['high'] for _, r in recent_3_candles.iterrows()), 4),
+        "low_candle": round(low_now, 4),
+        "vol_ratio": round(last_candle['vol_ratio'], 2),
+        "gainer_freq": 1,
+        "sl": round(sl, 4),
+        "tp1": round(tp1, 4),
+        "tp2": round(tp2, 4),
+        "tp3": round(tp3, 4),
+        "timestamp": last_candle['timestamp']
+    }
 
 # 🔴 SETUP H4 (1): PURE BREAKOUT MA20
 def analyze_h4_pure_ma20_breakout(df_h4: pd.DataFrame, realtime_price: float) -> dict:
@@ -458,56 +518,6 @@ def analyze_h4_ma20_breakout_retest(df_h4: pd.DataFrame, realtime_price: float) 
         "market_entry": round(market_entry, 4),
         "ema20": round(ema20_now, 4),
         "box_high": round(prev_candle['high'], 4),
-        "low_candle": round(low_now, 4),
-        "vol_ratio": round(last_candle['vol_ratio'], 2),
-        "gainer_freq": 1,
-        "sl": round(sl, 4),
-        "tp1": round(tp1, 4),
-        "tp2": round(tp2, 4),
-        "tp3": round(tp3, 4),
-        "timestamp": last_candle['timestamp']
-    }
-
-# 🔴 SETUP H1 (1): TÍCH LŨY DƯỚI MA20 -> ĐÓNG NẾN QUA MA20 -> 2-3 NẾN TIẾP THEO GIỮ VỮNG TRÊN MA20
-def analyze_h1_consolidation_above_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
-    if df_h1.empty or len(df_h1) < 25: return None
-
-    last_candle = df_h1.iloc[-1]
-    
-    close_now = realtime_price if realtime_price > 0 else last_candle['close']
-    low_now = min(last_candle['low'], close_now)
-    ema20_now = last_candle['ema20']
-
-    prev_under_candles = df_h1.iloc[-12:-4]
-    under_ma20_count = sum(1 for _, row in prev_under_candles.iterrows() if row['close'] < row['ema20'])
-    is_prev_under_ma20 = under_ma20_count >= 4
-
-    recent_3_candles = df_h1.iloc[-3:]
-    is_hold_above_ma20 = all(r['close'] >= r['ema20'] for _, r in recent_3_candles.iterrows()) and (close_now >= ema20_now)
-
-    if not (is_prev_under_ma20 and is_hold_above_ma20):
-        return None
-
-    market_entry = close_now
-    sl = min(r['low'] for _, r in recent_3_candles.iterrows()) * 0.997
-    risk_pct = ((market_entry - sl) / market_entry) * 100
-
-    if risk_pct < 2.0:
-        sl = market_entry * 0.98
-
-    tp1 = market_entry * 1.05
-    tp2 = market_entry * 1.10
-    tp3 = market_entry * 1.20
-
-    return {
-        "timeframe": "H1",
-        "status": "H1 CONSOLIDATION ABOVE MA20",
-        "setup_desc": "Đường giá dưới MA20 đóng vượt lên MA20 VÀ giữ vững đóng nến trên MA20 suốt 2-3 cây nến H1 liên tiếp chuẩn bị bùng nổ",
-        "score": 95,
-        "close_price": close_now,
-        "market_entry": round(market_entry, 4),
-        "ema20": round(ema20_now, 4),
-        "box_high": round(max(r['high'] for _, r in recent_3_candles.iterrows()), 4),
         "low_candle": round(low_now, 4),
         "vol_ratio": round(last_candle['vol_ratio'], 2),
         "gainer_freq": 1,
@@ -793,16 +803,18 @@ def run_scanner_loop():
                 if not df_h1.empty:
                     df_h1 = add_indicators(df_h1)
                     
-                    analysis_h1_consol = analyze_h1_consolidation_above_ma20(df_h1, realtime_price)
-                    if analysis_h1_consol:
+                    # 2.1 H1 Early Accumulation MA20 (SETUP AA+ SỚM MỚI BỔ SUNG)
+                    analysis_h1_early = analyze_h1_early_accumulation_ma20(df_h1, realtime_price)
+                    if analysis_h1_early:
                         oi_change = get_open_interest_change(sym, "60")
-                        analysis_h1_consol['symbol'] = sym
-                        analysis_h1_consol['price24hPcnt'] = t['price24hPcnt']
-                        analysis_h1_consol['turnover24h'] = t['turnover24h']
-                        analysis_h1_consol['funding'] = t['fundingRate']
-                        analysis_h1_consol['oi_info'] = f"{oi_change:+}%/1h"
-                        scanned_signals.append(analysis_h1_consol)
+                        analysis_h1_early['symbol'] = sym
+                        analysis_h1_early['price24hPcnt'] = t['price24hPcnt']
+                        analysis_h1_early['turnover24h'] = t['turnover24h']
+                        analysis_h1_early['funding'] = t['fundingRate']
+                        analysis_h1_early['oi_info'] = f"{oi_change:+}%/1h"
+                        scanned_signals.append(analysis_h1_early)
 
+                    # 2.2 H1 Engulfing Sideway MA20
                     analysis_h1_engulfing = analyze_h1_engulfing_sideway_ma20(df_h1, realtime_price)
                     if analysis_h1_engulfing:
                         oi_change = get_open_interest_change(sym, "60")
@@ -813,6 +825,7 @@ def run_scanner_loop():
                         analysis_h1_engulfing['oi_info'] = f"{oi_change:+}%/1h"
                         scanned_signals.append(analysis_h1_engulfing)
 
+                    # 2.3 H1 Pullback MA20
                     analysis_h1_pullback = analyze_h1_ema20_pullback(df_h1, realtime_price)
                     if analysis_h1_pullback:
                         oi_change = get_open_interest_change(sym, "60")

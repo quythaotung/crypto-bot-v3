@@ -39,7 +39,7 @@ DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 3. SQLITE DATABASE
+# 3. SQLITE DATABASE (BỔ SUNG CỘT SETUP_NAME)
 # ==============================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -67,10 +67,18 @@ def init_db():
                 tp1_hit INTEGER DEFAULT 0,
                 tp2_hit INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'OPEN',
+                setup_name TEXT DEFAULT 'UNKNOWN',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER DEFAULT 0
             )
         """)
+        
+        # Kiểm tra tự động bổ sung cột setup_name nếu DB cũ chưa có
+        cursor.execute("PRAGMA table_info(active_trades)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if 'setup_name' not in columns:
+            cursor.execute("ALTER TABLE active_trades ADD COLUMN setup_name TEXT DEFAULT 'UNKNOWN'")
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS top_gainers_tracker (
                 symbol TEXT PRIMARY KEY,
@@ -93,13 +101,6 @@ def update_top_gainers_frequency(symbols_in_top: list):
                     last_seen = ?
             """, (sym, now_ts, now_ts))
         conn.commit()
-
-def get_gainer_frequency(symbol: str) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT appear_count FROM top_gainers_tracker WHERE symbol = ?", (symbol,))
-        row = cursor.fetchone()
-        return row[0] if row else 1
 
 def is_symbol_currently_active(symbol: str) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
@@ -134,10 +135,7 @@ def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
             prev_call_count, last_sent_at = row
             time_passed = now_ts - last_sent_at
 
-            if prev_call_count >= 3:
-                return False, prev_call_count
-
-            if time_passed < COOLDOWN_SECONDS:
+            if prev_call_count >= 3 or time_passed < COOLDOWN_SECONDS:
                 return False, prev_call_count
 
             new_call_count = prev_call_count + 1
@@ -153,23 +151,65 @@ def save_active_trade(sig: dict):
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO active_trades (symbol, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?, ?)
-        """, (sig['symbol'], sig['market_entry'], sig['sl'], sig['tp1'], sig['tp2'], sig['tp3'], now_ts, now_ts))
+            INSERT OR REPLACE INTO active_trades (symbol, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, status, setup_name, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?, ?, ?)
+        """, (sig['symbol'], sig['market_entry'], sig['sl'], sig['tp1'], sig['tp2'], sig['tp3'], sig['status'], now_ts, now_ts))
         conn.commit()
 
 # ==============================================================================
-# 4. HÀM TỔNG HỢP BÁO CÁO 24H
+# 4. HÀM THỐNG KÊ LÃI LỖ THEO SETUP BỔ SUNG
 # ==============================================================================
+def get_setup_statistics_report() -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT setup_name, status, COUNT(*) 
+            FROM active_trades 
+            WHERE status IN ('CLOSED_TP1', 'CLOSED_TP2', 'CLOSED_TP3', 'CLOSED_SL')
+            GROUP BY setup_name, status
+        """)
+        rows = cursor.fetchall()
+
+    if not rows:
+        return "📊 <b>THỐNG KÊ HIỆU SUẤT SETUP</b>\n\n🔎 Chưa có dữ liệu lịch sử kèo đã đóng."
+
+    stats = {}
+    for setup_name, status, count in rows:
+        if setup_name not in stats:
+            stats[setup_name] = {'win': 0, 'loss': 0, 'total': 0}
+        
+        if status in ['CLOSED_TP1', 'CLOSED_TP2', 'CLOSED_TP3']:
+            stats[setup_name]['win'] += count
+        elif status == 'CLOSED_SL':
+            stats[setup_name]['loss'] += count
+        
+        stats[setup_name]['total'] += count
+
+    msg = "📊 <b>THỐNG KÊ HIỆU SUẤT LÃI/LỖ THEO TỪNG SETUP</b>\n"
+    msg += "===================================="
+
+    for setup, data in stats.items():
+        total = data['total']
+        win = data['win']
+        loss = data['loss']
+        winrate = (win / total * 100) if total > 0 else 0.0
+
+        msg += f"\n\n⚙️ <b>Setup:</b> <code>{setup}</code>"
+        msg += f"\n• Tổng số lệnh: <b>{total}</b>"
+        msg += f"\n• Thắng (TP): ✅ <b>{win}</b> | Thua (SL): 🛑 <b>{loss}</b>"
+        msg += f"\n• Tỷ lệ thắng (Winrate): 🔥 <b>{winrate:.1f}%</b>"
+
+    msg += "\n\n<i>💡 Nhắn /tonghop để xem chi tiết danh sách kèo 24h.</i>"
+    return msg
+
 def get_24h_summary_report() -> str:
     now_ts = int(time.time())
     cutoff_24h = now_ts - (24 * 3600)
 
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        
         cursor.execute("""
-            SELECT symbol, entry, sl, tp1, tp2, tp3, status, updated_at 
+            SELECT symbol, entry, sl, tp1, tp2, tp3, status, setup_name, updated_at 
             FROM active_trades 
             WHERE status IN ('CLOSED_TP1', 'CLOSED_TP2', 'CLOSED_TP3', 'CLOSED_SL') AND updated_at >= ?
             ORDER BY updated_at DESC
@@ -177,7 +217,7 @@ def get_24h_summary_report() -> str:
         closed_trades = cursor.fetchall()
 
         cursor.execute("""
-            SELECT symbol, entry, sl, tp1, tp2, tp3, tp1_hit 
+            SELECT symbol, entry, sl, tp1, tp2, tp3, tp1_hit, setup_name 
             FROM active_trades 
             WHERE status = 'OPEN' 
             ORDER BY created_at DESC
@@ -193,28 +233,18 @@ def get_24h_summary_report() -> str:
     if closed_trades:
         msg += "\n\n🎯 <b>KÈO ĐÃ CHỐT KẾT QUẢ (24H QUA):</b>"
         for idx, t in enumerate(closed_trades, 1):
-            sym, entry, sl, tp1, tp2, tp3, status, updated_at = t
-            if status == 'CLOSED_TP3':
-                tag = "🚀🚀 <b>[ĐÃ TP3 (+20%)]</b>"
-            elif status == 'CLOSED_TP2':
-                tag = "🚀 <b>[ĐÃ TP2 (+10%)]</b>"
-            elif status == 'CLOSED_TP1':
-                tag = "✅ <b>[ĐÃ TP1 (+5%)]</b>"
-            elif status == 'CLOSED_SL':
-                tag = "🛑 <b>[ĐÃ SL]</b>"
-            else:
-                tag = "<b>[ĐÃ ĐÓNG]</b>"
-
-            msg += f"\n{idx}. #{sym} {tag} | Entry Market: <code>{entry:.4f}</code>"
+            sym, entry, sl, tp1, tp2, tp3, status, setup_name, updated_at = t
+            tag = "🚀🚀 <b>[ĐÃ TP3 (+20%)]</b>" if status == 'CLOSED_TP3' else "🚀 <b>[ĐÃ TP2 (+10%)]</b>" if status == 'CLOSED_TP2' else "✅ <b>[ĐÃ TP1 (+5%)]</b>" if status == 'CLOSED_TP1' else "🛑 <b>[ĐÃ SL]</b>"
+            msg += f"\n{idx}. #{sym} {tag}\n   └ Setup: <code>{setup_name}</code> | Entry: <code>{entry:.4f}</code>"
 
     if open_trades:
         msg += "\n\n⏳ <b>KÈO ĐANG THEO DÕI (ACTIVE):</b>"
         for idx, t in enumerate(open_trades, 1):
-            sym, entry, sl, tp1, tp2, tp3, tp1_hit = t
+            sym, entry, sl, tp1, tp2, tp3, tp1_hit, setup_name = t
             st = "✅ (Đã cắn TP1 -> Dời SL về Entry)" if tp1_hit == 1 else "⏳ (Đang chạy)"
-            msg += f"\n{idx}. #{sym} {st} | Entry Market: <code>{entry:.4f}</code> | SL: <code>{sl:.4f}</code>"
+            msg += f"\n{idx}. #{sym} {st}\n   └ Setup: <code>{setup_name}</code> | Entry: <code>{entry:.4f}</code> | SL: <code>{sl:.4f}</code>"
 
-    msg += "\n\n<i>💡 Hệ thống quét tín hiệu VÀO MARKET NGAY Khung H1 & H4.</i>"
+    msg += "\n\n<i>💡 Nhắn /thongke để xem tỷ lệ Winrate theo từng Setup.</i>"
     return msg
 
 def listen_telegram_commands():
@@ -231,18 +261,20 @@ def listen_telegram_commands():
                 for update in res["result"]:
                     last_update_id = update["update_id"]
                     message = update.get("message", {})
-                    text = message.get("text", "")
+                    text = message.get("text", "").strip().lower()
                     chat_id = str(message.get("chat", {}).get("id", ""))
+                    target_chat = chat_id if chat_id else CHAT_ID
 
-                    if text.strip().lower() in ["/tonghop", "tonghop"]:
-                        summary_msg = get_24h_summary_report()
-                        send_direct_message(summary_msg, target_chat_id=chat_id if chat_id else CHAT_ID)
+                    if text in ["/tonghop", "tonghop"]:
+                        send_direct_message(get_24h_summary_report(), target_chat_id=target_chat)
+                    elif text in ["/thongke", "thongke", "/setup_stats"]:
+                        send_direct_message(get_setup_statistics_report(), target_chat_id=target_chat)
         except Exception:
             pass
         time.sleep(2)
 
 # ==============================================================================
-# 5. LẤY TICKERS BYBIT (CHẶN ETF / STOCKS / TRADFI)
+# 5. LẤY TICKERS BYBIT & KLINE DATA
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -268,8 +300,6 @@ def get_bybit_crypto_tickers():
             ]
             
             valid = []
-            symbols_for_freq = []
-
             for t in tickers:
                 sym = t.get("symbol", "")
                 turnover = safe_float(t.get("turnover24h", 0))
@@ -283,28 +313,21 @@ def get_bybit_crypto_tickers():
 
                 if sym.endswith("USDT") and not sym.startswith(("USDC", "BUSD", "DAI", "EUR", "GBP")):
                     base_coin = sym.replace("USDT", "")
-                    
                     is_non_crypto = (
                         base_coin in non_crypto_exact or 
                         any(k in sym for k in non_crypto_exact) or
                         base_coin.startswith(("SOX", "TQQ", "SQQ", "USD", "EUR"))
                     )
 
-                    if not is_non_crypto:
-                        if turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT:
-                            if price_change_pct >= 3.0:
-                                symbols_for_freq.append(sym)
-                            valid.append({
-                                "symbol": sym,
-                                "price24hPcnt": round(price_change_pct, 2),
-                                "turnover24h": turnover,
-                                "lastPrice": last_price,
-                                "fundingRate": funding_rate,
-                                "spread_pct": round(spread_pct, 3)
-                            })
-
-            if symbols_for_freq:
-                update_top_gainers_frequency(symbols_for_freq)
+                    if not is_non_crypto and turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT:
+                        valid.append({
+                            "symbol": sym,
+                            "price24hPcnt": round(price_change_pct, 2),
+                            "turnover24h": turnover,
+                            "lastPrice": last_price,
+                            "fundingRate": funding_rate,
+                            "spread_pct": round(spread_pct, 3)
+                        })
 
             return sorted(valid, key=lambda x: x["turnover24h"], reverse=True)
     except Exception as e:
@@ -349,43 +372,34 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     closes, vols = df['close'], df['volume']
 
     df['ema20'] = closes.ewm(span=20, adjust=False).mean()
-    df['ema89'] = closes.ewm(span=89, adjust=False).mean()
-    df['ema200'] = closes.ewm(span=200, adjust=False).mean()
-
     df['vol_ma20'] = vols.rolling(20).mean()
     df['vol_ratio'] = vols / df['vol_ma20'].replace(0, np.nan)
 
     return df
 
 # ==============================================================================
-# 6. ENGINE PHÁT HIỆN SETUP
+# 6. ENGINE PHÁT HIỆN SETUP (H1 & H4)
 # ==============================================================================
 
-# 🔴 SETUP H1 AA+ SỚM (MỚI): VỪA ĐÓNG 2-3 NẾN TRÊN MA20 VÀ GIÁ VẪN ĐANG Ở NỀN (CHƯA TĂNG SLIPPAGE MẠNH)
+# 🔴 SETUP H1 AA+ SỚM
 def analyze_h1_early_accumulation_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
     if df_h1.empty or len(df_h1) < 25: return None
 
     last_candle = df_h1.iloc[-1]
-    
     close_now = realtime_price if realtime_price > 0 else last_candle['close']
     low_now = min(last_candle['low'], close_now)
     open_now = last_candle['open']
     ema20_now = last_candle['ema20']
 
-    # 1. Chuỗi nến trước đó nằm dưới đường MA20
     prev_under_candles = df_h1.iloc[-12:-4]
     under_ma20_count = sum(1 for _, row in prev_under_candles.iterrows() if row['close'] < row['ema20'])
     is_prev_under_ma20 = under_ma20_count >= 4
 
-    # 2. Liên tiếp 2-3 nến gần nhất đóng trên MA20
     recent_3_candles = df_h1.iloc[-3:]
     is_hold_above_ma20 = all(r['close'] >= r['ema20'] for _, r in recent_3_candles.iterrows()) and (close_now >= ema20_now)
 
-    # 3. ĐIỀU KIỆN AA+ KHỐNG CHẾ CHƯA TĂNG MẠNH: Giá hiện tại chỉ cách MA20 tối đa 1.8%
     dist_from_ma20_pct = ((close_now - ema20_now) / ema20_now) * 100
     is_still_at_base = (0.0 <= dist_from_ma20_pct <= 1.8)
-    
-    # Nến hiện tại chưa phải là cột dựng quá dài (< 2.2%)
     candle_body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
 
     if not (is_prev_under_ma20 and is_hold_above_ma20 and is_still_at_base and candle_body_pct <= 2.2):
@@ -393,35 +407,26 @@ def analyze_h1_early_accumulation_ma20(df_h1: pd.DataFrame, realtime_price: floa
 
     market_entry = close_now
     sl = min(r['low'] for _, r in recent_3_candles.iterrows()) * 0.997
-    risk_pct = ((market_entry - sl) / market_entry) * 100
-
-    if risk_pct < 2.0:
+    if ((market_entry - sl) / market_entry) * 100 < 2.0:
         sl = market_entry * 0.98
-
-    tp1 = market_entry * 1.05
-    tp2 = market_entry * 1.10
-    tp3 = market_entry * 1.20
 
     return {
         "timeframe": "H1",
         "status": "H1 EARLY ACCUMULATION MA20 (SETUP AA+)",
-        "setup_desc": f"Nền giá vừa tích lũy 2-3 nến trên MA20 H1 (cách MA20 chỉ +{dist_from_ma20_pct:.1f}%) -> CHƯA TĂNG, ĐÓN ĐÚNG GỐC SÓNG BÙNG NỔ!",
+        "setup_desc": f"Nền giá vừa tích lũy 2-3 nến trên MA20 H1 (cách MA20 chỉ +{dist_from_ma20_pct:.1f}%)",
         "score": 99,
         "close_price": close_now,
         "market_entry": round(market_entry, 4),
         "ema20": round(ema20_now, 4),
-        "box_high": round(max(r['high'] for _, r in recent_3_candles.iterrows()), 4),
-        "low_candle": round(low_now, 4),
         "vol_ratio": round(last_candle['vol_ratio'], 2),
-        "gainer_freq": 1,
         "sl": round(sl, 4),
-        "tp1": round(tp1, 4),
-        "tp2": round(tp2, 4),
-        "tp3": round(tp3, 4),
+        "tp1": round(market_entry * 1.05, 4),
+        "tp2": round(market_entry * 1.10, 4),
+        "tp3": round(market_entry * 1.20, 4),
         "timestamp": last_candle['timestamp']
     }
 
-# 🔴 SETUP H4 (1): PURE BREAKOUT MA20
+# 🔴 SETUP H4 PURE BREAKOUT
 def analyze_h4_pure_ma20_breakout(df_h4: pd.DataFrame, realtime_price: float) -> dict:
     if df_h4.empty or len(df_h4) < 25: return None
 
@@ -430,7 +435,6 @@ def analyze_h4_pure_ma20_breakout(df_h4: pd.DataFrame, realtime_price: float) ->
 
     close_now = realtime_price if realtime_price > 0 else last_candle['close']
     open_now = last_candle['open']
-    high_now = max(last_candle['high'], close_now)
     low_now = min(last_candle['low'], close_now)
     ema20_now = last_candle['ema20']
 
@@ -446,89 +450,26 @@ def analyze_h4_pure_ma20_breakout(df_h4: pd.DataFrame, realtime_price: float) ->
 
     market_entry = close_now
     sl = low_now * 0.997
-    risk_pct = ((market_entry - sl) / market_entry) * 100
-
-    if risk_pct < 2.0:
+    if ((market_entry - sl) / market_entry) * 100 < 2.0:
         sl = market_entry * 0.98
-
-    tp1 = market_entry * 1.05
-    tp2 = market_entry * 1.10
-    tp3 = market_entry * 1.20
 
     return {
         "timeframe": "H4",
         "status": "H4 PURE MA20 BREAKOUT",
-        "setup_desc": f"Nến H4 xanh dốc đóng vượt thẳng đường MA20 (+{candle_body_pct:.1f}%) từ tích lũy dưới MA20",
+        "setup_desc": f"Nến H4 xanh dốc bùng nổ đóng vượt MA20 (+{candle_body_pct:.1f}%)",
         "score": 96,
         "close_price": close_now,
         "market_entry": round(market_entry, 4),
         "ema20": round(ema20_now, 4),
-        "box_high": round(high_now, 4),
-        "low_candle": round(low_now, 4),
         "vol_ratio": round(last_candle['vol_ratio'], 2),
-        "gainer_freq": 1,
         "sl": round(sl, 4),
-        "tp1": round(tp1, 4),
-        "tp2": round(tp2, 4),
-        "tp3": round(tp3, 4),
+        "tp1": round(market_entry * 1.05, 4),
+        "tp2": round(market_entry * 1.10, 4),
+        "tp3": round(market_entry * 1.20, 4),
         "timestamp": last_candle['timestamp']
     }
 
-# 🔴 SETUP H4 (2): MA20 RETEST BOUNCE
-def analyze_h4_ma20_breakout_retest(df_h4: pd.DataFrame, realtime_price: float) -> dict:
-    if df_h4.empty or len(df_h4) < 25: return None
-
-    last_candle = df_h4.iloc[-1]
-    prev_candle = df_h4.iloc[-2]
-
-    close_now = realtime_price if realtime_price > 0 else last_candle['close']
-    open_now = last_candle['open']
-    high_now = max(last_candle['high'], close_now)
-    low_now = min(last_candle['low'], close_now)
-    ema20_now = last_candle['ema20']
-
-    is_breakout_above_ma20 = (prev_candle['close'] > prev_candle['ema20']) or (df_h4.iloc[-3]['close'] > df_h4.iloc[-3]['ema20'])
-    is_testing_ma20 = (low_now <= ema20_now * 1.02) and (low_now >= ema20_now * 0.98)
-
-    is_close_above_ma20 = close_now > ema20_now
-    lower_shadow = min(open_now, close_now) - low_now
-    candle_range = high_now - low_now
-    is_strong_rebound = (close_now > open_now) or (candle_range > 0 and lower_shadow / candle_range >= 0.35)
-
-    if not (is_breakout_above_ma20 and is_testing_ma20 and is_close_above_ma20 and is_strong_rebound):
-        return None
-
-    market_entry = close_now
-    sl = low_now * 0.997
-    risk_pct = ((market_entry - sl) / market_entry) * 100
-
-    if risk_pct < 2.0:
-        sl = market_entry * 0.98
-
-    tp1 = market_entry * 1.05
-    tp2 = market_entry * 1.10
-    tp3 = market_entry * 1.20
-
-    return {
-        "timeframe": "H4",
-        "status": "H4 MA20 BREAKOUT & RETEST BOUNCE",
-        "setup_desc": "Đóng nến H4 qua MA20 -> Nhúng retest sát MA20 rút chân / đóng xanh đủ lực đẩy tiếp",
-        "score": 94,
-        "close_price": close_now,
-        "market_entry": round(market_entry, 4),
-        "ema20": round(ema20_now, 4),
-        "box_high": round(prev_candle['high'], 4),
-        "low_candle": round(low_now, 4),
-        "vol_ratio": round(last_candle['vol_ratio'], 2),
-        "gainer_freq": 1,
-        "sl": round(sl, 4),
-        "tp1": round(tp1, 4),
-        "tp2": round(tp2, 4),
-        "tp3": round(tp3, 4),
-        "timestamp": last_candle['timestamp']
-    }
-
-# 🔴 SETUP H1 (2): ENGULFING SIDEWAY MA20
+# 🔴 SETUP H1 ENGULFING SIDEWAY
 def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
     if df_h1.empty or len(df_h1) < 25: return None
 
@@ -538,7 +479,6 @@ def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float
 
     close_now = realtime_price if realtime_price > 0 else last_candle['close']
     open_now = last_candle['open']
-    high_now = max(last_candle['high'], close_now)
     low_now = min(last_candle['low'], close_now)
     ema20_now = last_candle['ema20']
 
@@ -546,11 +486,9 @@ def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float
     is_sideway_ma20 = (sum(sideway_diff_pct) / len(sideway_diff_pct)) <= 2.5
 
     is_prev_red = prev_candle['close'] < prev_candle['open']
-
     is_green_now = close_now > open_now
     is_close_above_ma20 = close_now > ema20_now
     is_engulfing = (close_now > prev_candle['open']) and (close_now > prev_candle['high'])
-    
     green_body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
 
     if not (is_sideway_ma20 and is_prev_red and is_green_now and is_close_above_ma20 and is_engulfing and green_body_pct >= 1.8):
@@ -558,14 +496,8 @@ def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float
 
     market_entry = close_now
     sl = min(low_now, prev_candle['low']) * 0.997
-    risk_pct = ((market_entry - sl) / market_entry) * 100
-
-    if risk_pct < 2.0:
+    if ((market_entry - sl) / market_entry) * 100 < 2.0:
         sl = market_entry * 0.98
-
-    tp1 = market_entry * 1.05
-    tp2 = market_entry * 1.10
-    tp3 = market_entry * 1.20
 
     return {
         "timeframe": "H1",
@@ -575,81 +507,11 @@ def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float
         "close_price": close_now,
         "market_entry": round(market_entry, 4),
         "ema20": round(ema20_now, 4),
-        "box_high": round(prev_candle['high'], 4),
-        "low_candle": round(low_now, 4),
         "vol_ratio": round(last_candle['vol_ratio'], 2),
-        "gainer_freq": 1,
         "sl": round(sl, 4),
-        "tp1": round(tp1, 4),
-        "tp2": round(tp2, 4),
-        "tp3": round(tp3, 4),
-        "timestamp": last_candle['timestamp']
-    }
-
-# 🔴 SETUP H1 (3): PULLBACK 10-15% -> 4-7% VỀ SÁT MA20
-def analyze_h1_ema20_pullback(df_h1: pd.DataFrame, realtime_price: float) -> dict:
-    if df_h1.empty or len(df_h1) < 25: return None
-
-    last_candle = df_h1.iloc[-1]
-
-    close_now = realtime_price if realtime_price > 0 else last_candle['close']
-    open_now = last_candle['open']
-    high_now = max(last_candle['high'], close_now)
-    low_now = min(last_candle['low'], close_now)
-    ema20_now = last_candle['ema20']
-
-    recent_h1 = df_h1.iloc[-17:-1]
-    recent_max_high = recent_h1['high'].max()
-    recent_min_low = recent_h1['low'].min()
-
-    prev_pump_pct = ((recent_max_high - recent_min_low) / recent_min_low) * 100
-    pullback_pct = ((recent_max_high - low_now) / recent_max_high) * 100 if recent_max_high > 0 else 0.0
-
-    is_close_above_ma20 = close_now >= ema20_now
-    is_near_ma20 = (low_now <= ema20_now * 1.02) and (low_now >= ema20_now * 0.98)
-    
-    lower_shadow = min(open_now, close_now) - low_now
-    candle_range = high_now - low_now
-    is_strong_rebound = (close_now > open_now) or (candle_range > 0 and lower_shadow / candle_range >= 0.30)
-
-    is_setup_h1_pullback = (
-        (10.0 <= prev_pump_pct <= 18.0) and
-        (3.5 <= pullback_pct <= 8.0) and
-        is_close_above_ma20 and
-        is_near_ma20 and
-        is_strong_rebound
-    )
-
-    if not is_setup_h1_pullback:
-        return None
-
-    market_entry = close_now
-    sl = low_now * 0.997
-    risk_pct = ((market_entry - sl) / market_entry) * 100
-
-    if risk_pct < 2.0:
-        sl = market_entry * 0.98
-
-    tp1 = market_entry * 1.05
-    tp2 = market_entry * 1.10
-    tp3 = market_entry * 1.20
-
-    return {
-        "timeframe": "H1",
-        "status": "H1 MA20 HOLD PULLBACK",
-        "setup_desc": f"Tăng {prev_pump_pct:.1f}% -> Giảm {pullback_pct:.1f}% về sát MA20 H1 và đóng nến trên MA20 đủ lực",
-        "score": 90,
-        "close_price": close_now,
-        "market_entry": round(market_entry, 4),
-        "ema20": round(ema20_now, 4),
-        "box_high": round(recent_max_high, 4),
-        "low_candle": round(low_now, 4),
-        "vol_ratio": round(last_candle['vol_ratio'], 2),
-        "gainer_freq": 1,
-        "sl": round(sl, 4),
-        "tp1": round(tp1, 4),
-        "tp2": round(tp2, 4),
-        "tp3": round(tp3, 4),
+        "tp1": round(market_entry * 1.05, 4),
+        "tp2": round(market_entry * 1.10, 4),
+        "tp3": round(market_entry * 1.20, 4),
         "timestamp": last_candle['timestamp']
     }
 
@@ -659,33 +521,29 @@ def analyze_h1_ema20_pullback(df_h1: pd.DataFrame, realtime_price: float) -> dic
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
 
-    msg = f"""🚨 <b>BYBIT CRYPTO CANDLE SCANNER ({sig['timeframe']})</b>
+    msg = f"""🚨 <b>BYBIT SCANNER ({sig['timeframe']})</b>
 
 <b>Coin:</b> #{sig['symbol']} (24h Change: {sig['price24hPcnt']}%)
-<b>Trạng thái:</b> <code>{sig['status']}</code>
+<b>Trạng thái Setup:</b> <code>{sig['status']}</code>
 🔔 <b>Lần thông báo:</b> <b>Call lần {sig['call_count']}/3</b>
 ⭐ <b>Điểm tín hiệu:</b> <b>{sig['score']}/100</b>
 
 ⚡️ <b>GIÁ VÀO MARKET NGAY:</b> <code>{sig['market_entry']:.4f}</code>
 📉 <b>Đường MA 20 ({sig['timeframe']}):</b> <code>{sig['ema20']:.4f}</code>
-🛡 <b>Stop Loss (Đáy râu nến):</b> <code>{sig['sl']:.4f}</code>
+🛡 <b>Stop Loss:</b> <code>{sig['sl']:.4f}</code>
 
-🎯 <b>Take Profit Target (Tính từ Giá Market):</b>
+🎯 <b>Take Profit Target:</b>
 • <b>TP1 (+5%):</b> <code>{sig['tp1']:.4f}</code>
 • <b>TP2 (+10%):</b> <code>{sig['tp2']:.4f}</code>
 • <b>TP3 (+20%):</b> <code>{sig['tp3']:.4f}</code>
 
-📊 <b>Turnover 24h:</b> ${sig['turnover24h']/1e6:.2f}M USD
-🔥 <b>Volume Ratio:</b> {sig['vol_ratio']}x
-📈 <b>OI Change:</b> {sig['oi_info']}
-💸 <b>Funding Rate:</b> {sig['funding']:.4f}%
+📊 <b>Turnover 24h:</b> ${sig['turnover24h']/1e6:.2f}M USD | <b>Vol Ratio:</b> {sig['vol_ratio']}x
+📈 <b>OI Change:</b> {sig['oi_info']} | <b>Funding:</b> {sig['funding']:.4f}%
 
 💡 <b>Mô tả tín hiệu:</b>
 • {sig['setup_desc']}
 
-🔗 <a href="https://www.bybit.com/trade/usdt/{sig['symbol']}">Biểu đồ Bybit {sig['symbol']}</a>
-
-<i>💡 Gõ <b>/tonghop</b> trên Telegram để xem báo cáo TP/SL tổng hợp trong 24h.</i>"""
+🔗 <a href="https://www.bybit.com/trade/usdt/{sig['symbol']}">Biểu đồ Bybit {sig['symbol']}</a>"""
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -700,9 +558,8 @@ def send_direct_message(text: str, target_chat_id: str = None):
     dest = target_chat_id if target_chat_id else CHAT_ID
     if not BOT_TOKEN or not dest: return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": dest, "text": text, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=8)
+        requests.post(url, json={"chat_id": dest, "text": text, "parse_mode": "HTML"}, timeout=8)
     except Exception:
         pass
 
@@ -718,38 +575,25 @@ def track_and_update_active_trades(tickers_map: dict):
         for t in trades:
             trade_id, sym, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit = t
             if sym not in tickers_map: continue
-
             curr_price = tickers_map[sym]
 
             if tp1_hit == 0 and curr_price >= tp1:
                 cursor.execute("UPDATE active_trades SET tp1_hit = 1, sl = ?, updated_at = ? WHERE id = ?", (entry, now_ts, trade_id))
                 conn.commit()
                 status_changed = True
-                print(f"🎯 [TP1 +5% HIT] #{sym} -> SL dời về Entry Market", flush=True)
-
-            elif tp1_hit == 1 and tp2_hit == 0 and curr_price >= tp2:
-                cursor.execute("UPDATE active_trades SET tp2_hit = 1, updated_at = ? WHERE id = ?", (now_ts, trade_id))
-                conn.commit()
-                status_changed = True
-                print(f"🚀 [TP2 +10% HIT] #{sym}", flush=True)
-
             elif curr_price >= tp3:
                 cursor.execute("UPDATE active_trades SET status = 'CLOSED_TP3', updated_at = ? WHERE id = ?", (now_ts, trade_id))
                 cursor.execute("DELETE FROM sent_signals WHERE symbol = ?", (sym,))
                 conn.commit()
                 status_changed = True
-                print(f"🚀🚀 [TP3 +20% HIT] #{sym} CLOSED", flush=True)
-
             elif curr_price <= sl:
                 cursor.execute("UPDATE active_trades SET status = 'CLOSED_SL', updated_at = ? WHERE id = ?", (now_ts, trade_id))
                 cursor.execute("DELETE FROM sent_signals WHERE symbol = ?", (sym,))
                 conn.commit()
                 status_changed = True
-                print(f"🛑 [SL HIT] #{sym} CLOSED", flush=True)
 
     if status_changed:
-        summary_msg = get_24h_summary_report()
-        send_direct_message(summary_msg)
+        send_direct_message(get_24h_summary_report())
 
 # ==============================================================================
 # 8. AUTOMATIC SCANNER LOOP
@@ -758,83 +602,54 @@ def run_scanner_loop():
     init_db()
     Thread(target=listen_telegram_commands, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit Direct Market Entry Scanner Engine...", flush=True)
+    print("⚡️ Bắt đầu Scanner Engine...", flush=True)
     while True:
         try:
             tickers = get_bybit_crypto_tickers()
             tickers_map = {t['symbol']: t['lastPrice'] for t in tickers}
-
             track_and_update_active_trades(tickers_map)
 
-            print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins thanh khoản cao...", flush=True)
+            print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins...", flush=True)
 
             scanned_signals = []
             for t in tickers[:MAX_SYMBOLS_SCAN]:
                 sym = t['symbol']
                 realtime_price = t['lastPrice']
 
-                # 1. Quét Setup Khung H4
+                # 1. Quét H1 Early Accumulation (AA+)
+                df_h1 = get_closed_klines_df(sym, "60", limit=40)
+                if not df_h1.empty:
+                    df_h1 = add_indicators(df_h1)
+                    analysis_h1_early = analyze_h1_early_accumulation_ma20(df_h1, realtime_price)
+                    if analysis_h1_early:
+                        analysis_h1_early['symbol'] = sym
+                        analysis_h1_early['price24hPcnt'] = t['price24hPcnt']
+                        analysis_h1_early['turnover24h'] = t['turnover24h']
+                        analysis_h1_early['funding'] = t['fundingRate']
+                        analysis_h1_early['oi_info'] = f"{get_open_interest_change(sym, '60'):+}%/1h"
+                        scanned_signals.append(analysis_h1_early)
+
+                    analysis_h1_engulfing = analyze_h1_engulfing_sideway_ma20(df_h1, realtime_price)
+                    if analysis_h1_engulfing:
+                        analysis_h1_engulfing['symbol'] = sym
+                        analysis_h1_engulfing['price24hPcnt'] = t['price24hPcnt']
+                        analysis_h1_engulfing['turnover24h'] = t['turnover24h']
+                        analysis_h1_engulfing['funding'] = t['fundingRate']
+                        analysis_h1_engulfing['oi_info'] = f"{get_open_interest_change(sym, '60'):+}%/1h"
+                        scanned_signals.append(analysis_h1_engulfing)
+
+                # 2. Quét H4 Breakout
                 df_h4 = get_closed_klines_df(sym, "240", limit=40)
                 if not df_h4.empty:
                     df_h4 = add_indicators(df_h4)
-                    
                     analysis_h4_pure = analyze_h4_pure_ma20_breakout(df_h4, realtime_price)
                     if analysis_h4_pure:
-                        oi_change = get_open_interest_change(sym, "240")
                         analysis_h4_pure['symbol'] = sym
                         analysis_h4_pure['price24hPcnt'] = t['price24hPcnt']
                         analysis_h4_pure['turnover24h'] = t['turnover24h']
                         analysis_h4_pure['funding'] = t['fundingRate']
                         analysis_h4_pure['oi_info'] = f"{oi_change:+}%/4h"
                         scanned_signals.append(analysis_h4_pure)
-
-                    analysis_h4_retest = analyze_h4_ma20_breakout_retest(df_h4, realtime_price)
-                    if analysis_h4_retest:
-                        oi_change = get_open_interest_change(sym, "240")
-                        analysis_h4_retest['symbol'] = sym
-                        analysis_h4_retest['price24hPcnt'] = t['price24hPcnt']
-                        analysis_h4_retest['turnover24h'] = t['turnover24h']
-                        analysis_h4_retest['funding'] = t['fundingRate']
-                        analysis_h4_retest['oi_info'] = f"{oi_change:+}%/4h"
-                        scanned_signals.append(analysis_h4_retest)
-
-                # 2. Quét Setup Khung H1
-                df_h1 = get_closed_klines_df(sym, "60", limit=40)
-                if not df_h1.empty:
-                    df_h1 = add_indicators(df_h1)
-                    
-                    # 2.1 H1 Early Accumulation MA20 (SETUP AA+ SỚM MỚI BỔ SUNG)
-                    analysis_h1_early = analyze_h1_early_accumulation_ma20(df_h1, realtime_price)
-                    if analysis_h1_early:
-                        oi_change = get_open_interest_change(sym, "60")
-                        analysis_h1_early['symbol'] = sym
-                        analysis_h1_early['price24hPcnt'] = t['price24hPcnt']
-                        analysis_h1_early['turnover24h'] = t['turnover24h']
-                        analysis_h1_early['funding'] = t['fundingRate']
-                        analysis_h1_early['oi_info'] = f"{oi_change:+}%/1h"
-                        scanned_signals.append(analysis_h1_early)
-
-                    # 2.2 H1 Engulfing Sideway MA20
-                    analysis_h1_engulfing = analyze_h1_engulfing_sideway_ma20(df_h1, realtime_price)
-                    if analysis_h1_engulfing:
-                        oi_change = get_open_interest_change(sym, "60")
-                        analysis_h1_engulfing['symbol'] = sym
-                        analysis_h1_engulfing['price24hPcnt'] = t['price24hPcnt']
-                        analysis_h1_engulfing['turnover24h'] = t['turnover24h']
-                        analysis_h1_engulfing['funding'] = t['fundingRate']
-                        analysis_h1_engulfing['oi_info'] = f"{oi_change:+}%/1h"
-                        scanned_signals.append(analysis_h1_engulfing)
-
-                    # 2.3 H1 Pullback MA20
-                    analysis_h1_pullback = analyze_h1_ema20_pullback(df_h1, realtime_price)
-                    if analysis_h1_pullback:
-                        oi_change = get_open_interest_change(sym, "60")
-                        analysis_h1_pullback['symbol'] = sym
-                        analysis_h1_pullback['price24hPcnt'] = t['price24hPcnt']
-                        analysis_h1_pullback['turnover24h'] = t['turnover24h']
-                        analysis_h1_pullback['funding'] = t['fundingRate']
-                        analysis_h1_pullback['oi_info'] = f"{oi_change:+}%/1h"
-                        scanned_signals.append(analysis_h1_pullback)
 
             scanned_signals.sort(key=lambda x: x['score'], reverse=True)
             top_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
@@ -843,7 +658,6 @@ def run_scanner_loop():
             if top_signals:
                 for sig in top_signals:
                     if get_active_trades_count() >= MAX_ACTIVE_TRADES and not is_symbol_currently_active(sig['symbol']):
-                        print(f"⚠️ [SLOT FULL] Đã đủ {MAX_ACTIVE_TRADES} kèo đang chạy, tạm dừng báo kèo mới.", flush=True)
                         break
 
                     should_send, call_count = process_signal_dedup(sig['symbol'], sig['status'], sig['score'])
@@ -852,12 +666,11 @@ def run_scanner_loop():
                         if send_telegram_alert(sig):
                             save_active_trade(sig)
                             sent_count += 1
-                            print(f"✅ [{sig['timeframe']} TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Market Entry: {sig['market_entry']} | SL: {sig['sl']}", flush=True)
+                            print(f"✅ [TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Entry: {sig['market_entry']}", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)
 
-        print(f"⏳ Hoàn tất chu kỳ. Tạm nghỉ {SCAN_INTERVAL_SECONDS} giây...", flush=True)
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 if __name__ == "__main__":

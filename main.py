@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Multi-Setup MA20 Scanner Active 24/7!"
+    return "Bybit Crypto Signal Engine Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -39,7 +39,7 @@ DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 3. SQLITE DATABASE (BỔ SUNG CỘT SETUP_NAME)
+# 3. SQLITE DATABASE
 # ==============================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -73,7 +73,6 @@ def init_db():
             )
         """)
         
-        # Kiểm tra tự động bổ sung cột setup_name nếu DB cũ chưa có
         cursor.execute("PRAGMA table_info(active_trades)")
         columns = [col[1] for col in cursor.fetchall()]
         if 'setup_name' not in columns:
@@ -157,7 +156,7 @@ def save_active_trade(sig: dict):
         conn.commit()
 
 # ==============================================================================
-# 4. HÀM THỐNG KÊ LÃI LỖ THEO SETUP BỔ SUNG
+# 4. HÀM THỐNG KÊ LÃI LỖ THEO SETUP
 # ==============================================================================
 def get_setup_statistics_report() -> str:
     with sqlite3.connect(DB_PATH) as conn:
@@ -171,7 +170,7 @@ def get_setup_statistics_report() -> str:
         rows = cursor.fetchall()
 
     if not rows:
-        return "📊 <b>THỐNG KÊ HIỆU SUẤT SETUP</b>\n\n🔎 Chưa có dữ liệu lịch sử kèo đã đóng."
+        return "📊 <b>THỐNG KÊ HIỆU SUẤT TRADING</b>\n\n🔎 Chưa có dữ liệu lịch sử kèo đã đóng."
 
     stats = {}
     for setup_name, status, count in rows:
@@ -185,7 +184,7 @@ def get_setup_statistics_report() -> str:
         
         stats[setup_name]['total'] += count
 
-    msg = "📊 <b>THỐNG KÊ HIỆU SUẤT LÃI/LỖ THEO TỪNG SETUP</b>\n"
+    msg = "📊 <b>THỐNG KÊ HIỆU SUẤT LÃI/LỖ TỔNG HỢP</b>\n"
     msg += "===================================="
 
     for setup, data in stats.items():
@@ -194,7 +193,7 @@ def get_setup_statistics_report() -> str:
         loss = data['loss']
         winrate = (win / total * 100) if total > 0 else 0.0
 
-        msg += f"\n\n⚙️ <b>Setup:</b> <code>{setup}</code>"
+        msg += f"\n\n⚙️ <b>Danh mục tín hiệu {setup}:</b>"
         msg += f"\n• Tổng số lệnh: <b>{total}</b>"
         msg += f"\n• Thắng (TP): ✅ <b>{win}</b> | Thua (SL): 🛑 <b>{loss}</b>"
         msg += f"\n• Tỷ lệ thắng (Winrate): 🔥 <b>{winrate:.1f}%</b>"
@@ -209,7 +208,7 @@ def get_24h_summary_report() -> str:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT symbol, entry, sl, tp1, tp2, tp3, status, setup_name, updated_at 
+            SELECT symbol, entry, sl, tp1, tp2, tp3, status, updated_at 
             FROM active_trades 
             WHERE status IN ('CLOSED_TP1', 'CLOSED_TP2', 'CLOSED_TP3', 'CLOSED_SL') AND updated_at >= ?
             ORDER BY updated_at DESC
@@ -217,7 +216,7 @@ def get_24h_summary_report() -> str:
         closed_trades = cursor.fetchall()
 
         cursor.execute("""
-            SELECT symbol, entry, sl, tp1, tp2, tp3, tp1_hit, setup_name 
+            SELECT symbol, entry, sl, tp1, tp2, tp3, tp1_hit 
             FROM active_trades 
             WHERE status = 'OPEN' 
             ORDER BY created_at DESC
@@ -233,18 +232,18 @@ def get_24h_summary_report() -> str:
     if closed_trades:
         msg += "\n\n🎯 <b>KÈO ĐÃ CHỐT KẾT QUẢ (24H QUA):</b>"
         for idx, t in enumerate(closed_trades, 1):
-            sym, entry, sl, tp1, tp2, tp3, status, setup_name, updated_at = t
+            sym, entry, sl, tp1, tp2, tp3, status, updated_at = t
             tag = "🚀🚀 <b>[ĐÃ TP3 (+20%)]</b>" if status == 'CLOSED_TP3' else "🚀 <b>[ĐÃ TP2 (+10%)]</b>" if status == 'CLOSED_TP2' else "✅ <b>[ĐÃ TP1 (+5%)]</b>" if status == 'CLOSED_TP1' else "🛑 <b>[ĐÃ SL]</b>"
-            msg += f"\n{idx}. #{sym} {tag}\n   └ Setup: <code>{setup_name}</code> | Entry: <code>{entry:.4f}</code>"
+            msg += f"\n{idx}. #{sym} {tag} | Entry: <code>{entry:.4f}</code>"
 
     if open_trades:
         msg += "\n\n⏳ <b>KÈO ĐANG THEO DÕI (ACTIVE):</b>"
         for idx, t in enumerate(open_trades, 1):
-            sym, entry, sl, tp1, tp2, tp3, tp1_hit, setup_name = t
+            sym, entry, sl, tp1, tp2, tp3, tp1_hit = t
             st = "✅ (Đã cắn TP1 -> Dời SL về Entry)" if tp1_hit == 1 else "⏳ (Đang chạy)"
-            msg += f"\n{idx}. #{sym} {st}\n   └ Setup: <code>{setup_name}</code> | Entry: <code>{entry:.4f}</code> | SL: <code>{sl:.4f}</code>"
+            msg += f"\n{idx}. #{sym} {st} | Entry: <code>{entry:.4f}</code> | SL: <code>{sl:.4f}</code>"
 
-    msg += "\n\n<i>💡 Nhắn /thongke để xem tỷ lệ Winrate theo từng Setup.</i>"
+    msg += "\n\n<i>💡 Nhắn /thongke để xem tỷ lệ Winrate tổng hợp.</i>"
     return msg
 
 def listen_telegram_commands():
@@ -412,13 +411,11 @@ def analyze_h1_early_accumulation_ma20(df_h1: pd.DataFrame, realtime_price: floa
 
     return {
         "timeframe": "H1",
-        "status": "H1 EARLY ACCUMULATION MA20 (SETUP AA+)",
-        "setup_desc": f"Nền giá vừa tích lũy 2-3 nến trên MA20 H1 (cách MA20 chỉ +{dist_from_ma20_pct:.1f}%)",
+        "status": "BUY SIGNAL H1",
         "score": 99,
         "close_price": close_now,
         "market_entry": round(market_entry, 4),
         "ema20": round(ema20_now, 4),
-        "vol_ratio": round(last_candle['vol_ratio'], 2),
         "sl": round(sl, 4),
         "tp1": round(market_entry * 1.05, 4),
         "tp2": round(market_entry * 1.10, 4),
@@ -455,13 +452,11 @@ def analyze_h4_pure_ma20_breakout(df_h4: pd.DataFrame, realtime_price: float) ->
 
     return {
         "timeframe": "H4",
-        "status": "H4 PURE MA20 BREAKOUT",
-        "setup_desc": f"Nến H4 xanh dốc bùng nổ đóng vượt MA20 (+{candle_body_pct:.1f}%)",
+        "status": "BUY SIGNAL H4",
         "score": 96,
         "close_price": close_now,
         "market_entry": round(market_entry, 4),
         "ema20": round(ema20_now, 4),
-        "vol_ratio": round(last_candle['vol_ratio'], 2),
         "sl": round(sl, 4),
         "tp1": round(market_entry * 1.05, 4),
         "tp2": round(market_entry * 1.10, 4),
@@ -501,13 +496,11 @@ def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float
 
     return {
         "timeframe": "H1",
-        "status": "H1 BULLISH ENGULFING SIDEWAY MA20",
-        "setup_desc": f"Tích lũy quanh MA20 H1 -> Nến xanh áp đảo tuyệt đối nến đỏ trước đó (+{green_body_pct:.1f}%)",
+        "status": "BUY SIGNAL H1",
         "score": 93,
         "close_price": close_now,
         "market_entry": round(market_entry, 4),
         "ema20": round(ema20_now, 4),
-        "vol_ratio": round(last_candle['vol_ratio'], 2),
         "sl": round(sl, 4),
         "tp1": round(market_entry * 1.05, 4),
         "tp2": round(market_entry * 1.10, 4),
@@ -516,17 +509,15 @@ def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float
     }
 
 # ==============================================================================
-# 7. HỆ THỐNG GỬI TELEGRAM & CẬP NHẬT TRẠNG THÁI ACTIVE
+# 7. HỆ THỐNG GỬI TELEGRAM BẢO BẬT BẢN QUYỀN (ẨN MỌI BỘ LỌC)
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
 
+    # Tin nhắn thu gọn tuyệt đối: Che đậy hoàn toàn lý do/bộ lọc/tên setup
     msg = f"""🚨 <b>BYBIT SCANNER ({sig['timeframe']})</b>
 
 <b>Coin:</b> #{sig['symbol']} (24h Change: {sig['price24hPcnt']}%)
-<b>Trạng thái Setup:</b> <code>{sig['status']}</code>
-🔔 <b>Lần thông báo:</b> <b>Call lần {sig['call_count']}/3</b>
-⭐ <b>Điểm tín hiệu:</b> <b>{sig['score']}/100</b>
 
 ⚡️ <b>GIÁ VÀO MARKET NGAY:</b> <code>{sig['market_entry']:.4f}</code>
 📉 <b>Đường MA 20 ({sig['timeframe']}):</b> <code>{sig['ema20']:.4f}</code>
@@ -536,12 +527,6 @@ def send_telegram_alert(sig: dict) -> bool:
 • <b>TP1 (+5%):</b> <code>{sig['tp1']:.4f}</code>
 • <b>TP2 (+10%):</b> <code>{sig['tp2']:.4f}</code>
 • <b>TP3 (+20%):</b> <code>{sig['tp3']:.4f}</code>
-
-📊 <b>Turnover 24h:</b> ${sig['turnover24h']/1e6:.2f}M USD | <b>Vol Ratio:</b> {sig['vol_ratio']}x
-📈 <b>OI Change:</b> {sig['oi_info']} | <b>Funding:</b> {sig['funding']:.4f}%
-
-💡 <b>Mô tả tín hiệu:</b>
-• {sig['setup_desc']}
 
 🔗 <a href="https://www.bybit.com/trade/usdt/{sig['symbol']}">Biểu đồ Bybit {sig['symbol']}</a>"""
 
@@ -625,8 +610,6 @@ def run_scanner_loop():
                         analysis_h1_early['symbol'] = sym
                         analysis_h1_early['price24hPcnt'] = t['price24hPcnt']
                         analysis_h1_early['turnover24h'] = t['turnover24h']
-                        analysis_h1_early['funding'] = t['fundingRate']
-                        analysis_h1_early['oi_info'] = f"{get_open_interest_change(sym, '60'):+}%/1h"
                         scanned_signals.append(analysis_h1_early)
 
                     analysis_h1_engulfing = analyze_h1_engulfing_sideway_ma20(df_h1, realtime_price)
@@ -634,8 +617,6 @@ def run_scanner_loop():
                         analysis_h1_engulfing['symbol'] = sym
                         analysis_h1_engulfing['price24hPcnt'] = t['price24hPcnt']
                         analysis_h1_engulfing['turnover24h'] = t['turnover24h']
-                        analysis_h1_engulfing['funding'] = t['fundingRate']
-                        analysis_h1_engulfing['oi_info'] = f"{get_open_interest_change(sym, '60'):+}%/1h"
                         scanned_signals.append(analysis_h1_engulfing)
 
                 # 2. Quét H4 Breakout
@@ -647,8 +628,6 @@ def run_scanner_loop():
                         analysis_h4_pure['symbol'] = sym
                         analysis_h4_pure['price24hPcnt'] = t['price24hPcnt']
                         analysis_h4_pure['turnover24h'] = t['turnover24h']
-                        analysis_h4_pure['funding'] = t['fundingRate']
-                        analysis_h4_pure['oi_info'] = f"{oi_change:+}%/4h"
                         scanned_signals.append(analysis_h4_pure)
 
             scanned_signals.sort(key=lambda x: x['score'], reverse=True)

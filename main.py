@@ -87,20 +87,6 @@ def init_db():
         """)
         conn.commit()
 
-def update_top_gainers_frequency(symbols_in_top: list):
-    now_ts = int(time.time())
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        for sym in symbols_in_top:
-            cursor.execute("""
-                INSERT INTO top_gainers_tracker (symbol, appear_count, last_seen)
-                VALUES (?, 1, ?)
-                ON CONFLICT(symbol) DO UPDATE SET
-                    appear_count = appear_count + 1,
-                    last_seen = ?
-            """, (sym, now_ts, now_ts))
-        conn.commit()
-
 def is_symbol_currently_active(symbol: str) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
@@ -147,12 +133,13 @@ def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
 
 def save_active_trade(sig: dict):
     now_ts = int(time.time())
+    setup_name_to_save = sig.get('internal_setup_name', sig['status'])
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO active_trades (symbol, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, status, setup_name, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?, ?, ?)
-        """, (sig['symbol'], sig['market_entry'], sig['sl'], sig['tp1'], sig['tp2'], sig['tp3'], sig['status'], now_ts, now_ts))
+        """, (sig['symbol'], sig['market_entry'], sig['sl'], sig['tp1'], sig['tp2'], sig['tp3'], setup_name_to_save, now_ts, now_ts))
         conn.commit()
 
 # ==============================================================================
@@ -193,7 +180,7 @@ def get_setup_statistics_report() -> str:
         loss = data['loss']
         winrate = (win / total * 100) if total > 0 else 0.0
 
-        msg += f"\n\n⚙️ <b>Danh mục tín hiệu {setup}:</b>"
+        msg += f"\n\n⚙️ <b>Tín hiệu {setup}:</b>"
         msg += f"\n• Tổng số lệnh: <b>{total}</b>"
         msg += f"\n• Thắng (TP): ✅ <b>{win}</b> | Thua (SL): 🛑 <b>{loss}</b>"
         msg += f"\n• Tỷ lệ thắng (Winrate): 🔥 <b>{winrate:.1f}%</b>"
@@ -380,7 +367,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # 6. ENGINE PHÁT HIỆN SETUP (H1 & H4)
 # ==============================================================================
 
-# 🔴 SETUP H1 AA+ SỚM
+# 🔴 SETUP H1 (1): AA+ SỚM
 def analyze_h1_early_accumulation_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
     if df_h1.empty or len(df_h1) < 25: return None
 
@@ -412,6 +399,7 @@ def analyze_h1_early_accumulation_ma20(df_h1: pd.DataFrame, realtime_price: floa
     return {
         "timeframe": "H1",
         "status": "BUY SIGNAL H1",
+        "internal_setup_name": "H1 EARLY ACCUMULATION (SETUP AA+)",
         "score": 99,
         "close_price": close_now,
         "market_entry": round(market_entry, 4),
@@ -423,37 +411,43 @@ def analyze_h1_early_accumulation_ma20(df_h1: pd.DataFrame, realtime_price: floa
         "timestamp": last_candle['timestamp']
     }
 
-# 🔴 SETUP H4 PURE BREAKOUT
-def analyze_h4_pure_ma20_breakout(df_h4: pd.DataFrame, realtime_price: float) -> dict:
-    if df_h4.empty or len(df_h4) < 25: return None
+# 🔴 SETUP H1 (2): COMPRESSION MA20 (SETUP A- MỚI THÊM)
+def analyze_h1_compression_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
+    """ SETUP A-: NÉN GIÁ SÁT MA20 H1 TÍCH LŨY DỒN VOL VÀ BỨT PHÁ BẮT ĐẦU SÓNG """
+    if df_h1.empty or len(df_h1) < 25: return None
 
-    last_candle = df_h4.iloc[-1]
-    prev_candles = df_h4.iloc[-6:-1]
+    last_candle = df_h1.iloc[-1]
+    prev_4_candles = df_h1.iloc[-5:-1]
 
     close_now = realtime_price if realtime_price > 0 else last_candle['close']
     open_now = last_candle['open']
-    low_now = min(last_candle['low'], close_now)
     ema20_now = last_candle['ema20']
 
-    under_ma20_count = sum(1 for _, row in prev_candles.iterrows() if row['close'] < row['ema20'])
-    is_prev_under_ma20 = under_ma20_count >= 3
+    # 1. Đoạn 4 nến trước đó nén chặt quanh MA20 (chênh lệch đỉnh/đáy so với MA20 <= 1.2%)
+    is_compressed = all((abs(r['high'] - r['ema20']) / r['ema20']) * 100 <= 1.2 and 
+                        (abs(r['low'] - r['ema20']) / r['ema20']) * 100 <= 1.2 for _, r in prev_4_candles.iterrows())
 
+    # 2. Cây nến hiện tại bứt phá nén, đóng nến xanh nằm trên MA20
+    is_green_now = close_now > open_now
     is_close_above_ma20 = close_now > ema20_now
-    is_green_candle = close_now > open_now
     candle_body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
+    
+    # Biên độ nến kích hoạt nén nhẹ vừa phải (0.8% - 2.0%)
+    is_trigger_breakout = 0.8 <= candle_body_pct <= 2.0
 
-    if not (is_prev_under_ma20 and is_close_above_ma20 and is_green_candle and candle_body_pct >= 1.5):
+    if not (is_compressed and is_green_now and is_close_above_ma20 and is_trigger_breakout):
         return None
 
     market_entry = close_now
-    sl = low_now * 0.997
+    sl = min(r['low'] for _, r in prev_4_candles.iterrows()) * 0.997
     if ((market_entry - sl) / market_entry) * 100 < 2.0:
         sl = market_entry * 0.98
 
     return {
-        "timeframe": "H4",
-        "status": "BUY SIGNAL H4",
-        "score": 96,
+        "timeframe": "H1",
+        "status": "BUY SIGNAL H1",
+        "internal_setup_name": "H1 COMPRESSION MA20 (SETUP A-)",
+        "score": 95,
         "close_price": close_now,
         "market_entry": round(market_entry, 4),
         "ema20": round(ema20_now, 4),
@@ -464,7 +458,7 @@ def analyze_h4_pure_ma20_breakout(df_h4: pd.DataFrame, realtime_price: float) ->
         "timestamp": last_candle['timestamp']
     }
 
-# 🔴 SETUP H1 ENGULFING SIDEWAY
+# 🔴 SETUP H1 (3): ENGULFING SIDEWAY MA20
 def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
     if df_h1.empty or len(df_h1) < 25: return None
 
@@ -497,7 +491,50 @@ def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float
     return {
         "timeframe": "H1",
         "status": "BUY SIGNAL H1",
+        "internal_setup_name": "H1 ENGULFING SIDEWAY",
         "score": 93,
+        "close_price": close_now,
+        "market_entry": round(market_entry, 4),
+        "ema20": round(ema20_now, 4),
+        "sl": round(sl, 4),
+        "tp1": round(market_entry * 1.05, 4),
+        "tp2": round(market_entry * 1.10, 4),
+        "tp3": round(market_entry * 1.20, 4),
+        "timestamp": last_candle['timestamp']
+    }
+
+# 🔴 SETUP H4 (1): PURE BREAKOUT MA20
+def analyze_h4_pure_ma20_breakout(df_h4: pd.DataFrame, realtime_price: float) -> dict:
+    if df_h4.empty or len(df_h4) < 25: return None
+
+    last_candle = df_h4.iloc[-1]
+    prev_candles = df_h4.iloc[-6:-1]
+
+    close_now = realtime_price if realtime_price > 0 else last_candle['close']
+    open_now = last_candle['open']
+    low_now = min(last_candle['low'], close_now)
+    ema20_now = last_candle['ema20']
+
+    under_ma20_count = sum(1 for _, row in prev_candles.iterrows() if row['close'] < row['ema20'])
+    is_prev_under_ma20 = under_ma20_count >= 3
+
+    is_close_above_ma20 = close_now > ema20_now
+    is_green_candle = close_now > open_now
+    candle_body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
+
+    if not (is_prev_under_ma20 and is_close_above_ma20 and is_green_candle and candle_body_pct >= 1.5):
+        return None
+
+    market_entry = close_now
+    sl = low_now * 0.997
+    if ((market_entry - sl) / market_entry) * 100 < 2.0:
+        sl = market_entry * 0.98
+
+    return {
+        "timeframe": "H4",
+        "status": "BUY SIGNAL H4",
+        "internal_setup_name": "H4 PURE BREAKOUT",
+        "score": 96,
         "close_price": close_now,
         "market_entry": round(market_entry, 4),
         "ema20": round(ema20_now, 4),
@@ -514,7 +551,6 @@ def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
 
-    # Tin nhắn thu gọn tuyệt đối: Che đậy hoàn toàn lý do/bộ lọc/tên setup
     msg = f"""🚨 <b>BYBIT SCANNER ({sig['timeframe']})</b>
 
 <b>Coin:</b> #{sig['symbol']} (24h Change: {sig['price24hPcnt']}%)
@@ -601,16 +637,24 @@ def run_scanner_loop():
                 sym = t['symbol']
                 realtime_price = t['lastPrice']
 
-                # 1. Quét H1 Early Accumulation (AA+)
+                # 1. Quét H1 (AA+, Compression A-, Engulfing)
                 df_h1 = get_closed_klines_df(sym, "60", limit=40)
                 if not df_h1.empty:
                     df_h1 = add_indicators(df_h1)
+                    
                     analysis_h1_early = analyze_h1_early_accumulation_ma20(df_h1, realtime_price)
                     if analysis_h1_early:
                         analysis_h1_early['symbol'] = sym
                         analysis_h1_early['price24hPcnt'] = t['price24hPcnt']
                         analysis_h1_early['turnover24h'] = t['turnover24h']
                         scanned_signals.append(analysis_h1_early)
+
+                    analysis_h1_comp = analyze_h1_compression_ma20(df_h1, realtime_price)
+                    if analysis_h1_comp:
+                        analysis_h1_comp['symbol'] = sym
+                        analysis_h1_comp['price24hPcnt'] = t['price24hPcnt']
+                        analysis_h1_comp['turnover24h'] = t['turnover24h']
+                        scanned_signals.append(analysis_h1_comp)
 
                     analysis_h1_engulfing = analyze_h1_engulfing_sideway_ma20(df_h1, realtime_price)
                     if analysis_h1_engulfing:

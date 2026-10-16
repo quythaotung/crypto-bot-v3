@@ -14,26 +14,26 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Fast Alert Scanner Active 24/7!"
+    return "Bybit High-Winrate Signal Engine Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 # ==============================================================================
-# 2. CẤU HÌNH BÁO KÈO TỰ DO (TỐI ƯU ĐỂ CANH BÁO NHẠY - TỰ LỌC TAY)
+# 2. CẤU HÌNH BÁO KÈO LỌC CHẮC (CHỈ BÁO SETUP AA+ VÀ A+)
 # ==============================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
-MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "1000000")) # Hạ xuống $1M USD
-MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.30"))
-MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "250"))      # Quét rộng 250 Altcoins
-SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "120")) # Quét 2 phút/lần
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "300"))      # Cooldown chỉ 5 phút
+MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "2000000")) # Chỉ lấy coin thanh khoản cao ($2M+)
+MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.20"))
+MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "120"))
+SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300")) # Quét 5 phút/lần
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "7200"))     # Cooldown 2 tiếng/coin
 
-MAX_ALERTS_PER_CYCLE = 10                                              # Đẩy tối đa 10 kèo/chu kỳ
-MAX_ACTIVE_TRADES = 999                                                # KHÔNG GIỚI HẠN SLOT ACTIVE
+MAX_ALERTS_PER_CYCLE = 2                                               # Tối đa 2 kèo chất nhất/chu kỳ
+MAX_ACTIVE_TRADES = 3                                                  # Tối đa 3 kèo active cùng lúc
 
 DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
@@ -80,6 +80,18 @@ def init_db():
 
         conn.commit()
 
+def is_symbol_currently_active(symbol: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM active_trades WHERE symbol = ? AND status = 'OPEN'", (symbol,))
+        return cursor.fetchone() is not None
+
+def get_active_trades_count() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM active_trades WHERE status = 'OPEN'")
+        return cursor.fetchone()[0]
+
 def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
     now_ts = int(time.time())
     with sqlite3.connect(DB_PATH) as conn:
@@ -101,7 +113,7 @@ def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
             prev_call_count, last_sent_at = row
             time_passed = now_ts - last_sent_at
 
-            if time_passed < COOLDOWN_SECONDS:
+            if prev_call_count >= 2 or time_passed < COOLDOWN_SECONDS:
                 return False, prev_call_count
 
             new_call_count = prev_call_count + 1
@@ -188,7 +200,7 @@ def get_24h_summary_report() -> str:
             FROM active_trades 
             WHERE status = 'OPEN' 
             ORDER BY created_at DESC
-        """, ())
+        """)
         open_trades = cursor.fetchall()
 
     msg = "📊 <b>BÁO CÁO TỔNG HỢP KẾT QUẢ CRYPTO (24H)</b>\n"
@@ -330,31 +342,83 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 6. ENGINE PHÁT HIỆN SETUP (H1 & H4)
+# 6. ENGINE BẮT ĐÚNG 2 SETUP TỈ LỆ WIN NỔI BẬT (AA+ VÀ A+)
 # ==============================================================================
 
-# 🔴 SETUP H1 (1): AA+ SỚM
-def analyze_h1_early_accumulation_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
+# 🔥 1. SETUP ĐIỂM VÀO AA+ GOLDEN CONVERGENCE (D1 TEST + H4 RECOVERY)
+def analyze_golden_convergence_aa(symbol: str, realtime_price: float) -> dict:
+    df_d1 = get_closed_klines_df(symbol, "D", limit=30)
+    df_h4 = get_closed_klines_df(symbol, "240", limit=30)
+    
+    if df_d1.empty or df_h4.empty or len(df_d1) < 22 or len(df_h4) < 22:
+        return None
+        
+    df_d1 = add_indicators(df_d1)
+    df_h4 = add_indicators(df_h4)
+    
+    last_d1 = df_d1.iloc[-1]
+    last_h4 = df_h4.iloc[-1]
+    prev_h4 = df_h4.iloc[-2]
+    
+    close_now = realtime_price if realtime_price > 0 else last_h4['close']
+    ema20_d1 = last_d1['ema20']
+    ema20_h4 = last_h4['ema20']
+    
+    # Giá D1 nhúng râu test sát EMA20 D1 (<= 2.0%) VÀ H4 vừa bứt phá đóng vượt lại lên EMA20 H4
+    is_d1_testing = (last_d1['low'] <= ema20_d1 * 1.02) and (close_now >= ema20_d1 * 0.985)
+    is_h4_recovery = (prev_h4['close'] < prev_h4['ema20']) and (close_now > ema20_h4)
+    is_strong_vol = last_h4['vol_ratio'] >= 1.5
+
+    if not (is_d1_testing and is_h4_recovery and is_strong_vol):
+        return None
+
+    market_entry = close_now
+    sl = min(last_h4['low'], last_d1['low']) * 0.997
+    if ((market_entry - sl) / market_entry) * 100 < 2.0:
+        sl = market_entry * 0.98
+
+    return {
+        "timeframe": "D1+H4",
+        "status": "BUY SIGNAL AA+",
+        "internal_setup_name": "GOLDEN CONVERGENCE (D1 TEST + H4 RECOVERY)",
+        "score": 100,
+        "close_price": close_now,
+        "market_entry": round(market_entry, 4),
+        "ema20": round(ema20_h4, 4),
+        "sl": round(sl, 4),
+        "tp1": round(market_entry * 1.05, 4),
+        "tp2": round(market_entry * 1.10, 4),
+        "tp3": round(market_entry * 1.20, 4),
+        "timestamp": last_h4['timestamp']
+    }
+
+# 🔥 2. SETUP A+ H1 EARLY ACCUMULATION (TÍCH LŨY CHẶT SÁT EMA20 H1)
+def analyze_h1_early_accumulation_a_plus(df_h1: pd.DataFrame, realtime_price: float) -> dict:
     if df_h1.empty or len(df_h1) < 25: return None
 
     last_candle = df_h1.iloc[-1]
     close_now = realtime_price if realtime_price > 0 else last_candle['close']
-    low_now = min(last_candle['low'], close_now)
     open_now = last_candle['open']
     ema20_now = last_candle['ema20']
 
+    # Chuỗi nến trước nằm dưới MA20
     prev_under_candles = df_h1.iloc[-12:-4]
     under_ma20_count = sum(1 for _, row in prev_under_candles.iterrows() if row['close'] < row['ema20'])
-    is_prev_under_ma20 = under_ma20_count >= 4
+    is_prev_under_ma20 = under_ma20_count >= 5
 
+    # 3-4 nến gần nhất đứng vững trên EMA20
     recent_3_candles = df_h1.iloc[-3:]
     is_hold_above_ma20 = all(r['close'] >= r['ema20'] for _, r in recent_3_candles.iterrows()) and (close_now >= ema20_now)
 
+    # Khống chế nằm sát nền (cách MA20 <= 1.2%) và chưa tăng dốc (thân nến <= 1.8%)
     dist_from_ma20_pct = ((close_now - ema20_now) / ema20_now) * 100
-    is_still_at_base = (0.0 <= dist_from_ma20_pct <= 1.8)
+    is_still_at_base = (0.0 <= dist_from_ma20_pct <= 1.2)
     candle_body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
+    
+    # Volume có sự gia tăng nhẹ chuẩn bị nổ
+    is_vol_confirm = last_candle['vol_ratio'] >= 1.3
 
-    if not (is_prev_under_ma20 and is_hold_above_ma20 and is_still_at_base and candle_body_pct <= 2.2):
+    if not (is_prev_under_ma20 and is_hold_above_ma20 and is_still_at_base and candle_body_pct <= 1.8 and is_vol_confirm):
         return None
 
     market_entry = close_now
@@ -364,139 +428,9 @@ def analyze_h1_early_accumulation_ma20(df_h1: pd.DataFrame, realtime_price: floa
 
     return {
         "timeframe": "H1",
-        "status": "BUY SIGNAL H1",
-        "internal_setup_name": "H1 EARLY ACCUMULATION (SETUP AA+)",
-        "score": 99,
-        "close_price": close_now,
-        "market_entry": round(market_entry, 4),
-        "ema20": round(ema20_now, 4),
-        "sl": round(sl, 4),
-        "tp1": round(market_entry * 1.05, 4),
-        "tp2": round(market_entry * 1.10, 4),
-        "tp3": round(market_entry * 1.20, 4),
-        "timestamp": last_candle['timestamp']
-    }
-
-# 🔴 SETUP H1 (2): COMPRESSION MA20 (SETUP A-)
-def analyze_h1_compression_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
-    if df_h1.empty or len(df_h1) < 25: return None
-
-    last_candle = df_h1.iloc[-1]
-    prev_4_candles = df_h1.iloc[-5:-1]
-
-    close_now = realtime_price if realtime_price > 0 else last_candle['close']
-    open_now = last_candle['open']
-    ema20_now = last_candle['ema20']
-
-    is_compressed = all((abs(r['high'] - r['ema20']) / r['ema20']) * 100 <= 1.2 and 
-                        (abs(r['low'] - r['ema20']) / r['ema20']) * 100 <= 1.2 for _, r in prev_4_candles.iterrows())
-
-    is_green_now = close_now > open_now
-    is_close_above_ma20 = close_now > ema20_now
-    candle_body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
-    
-    is_trigger_breakout = 0.8 <= candle_body_pct <= 2.0
-
-    if not (is_compressed and is_green_now and is_close_above_ma20 and is_trigger_breakout):
-        return None
-
-    market_entry = close_now
-    sl = min(r['low'] for _, r in prev_4_candles.iterrows()) * 0.997
-    if ((market_entry - sl) / market_entry) * 100 < 2.0:
-        sl = market_entry * 0.98
-
-    return {
-        "timeframe": "H1",
-        "status": "BUY SIGNAL H1",
-        "internal_setup_name": "H1 COMPRESSION MA20 (SETUP A-)",
-        "score": 95,
-        "close_price": close_now,
-        "market_entry": round(market_entry, 4),
-        "ema20": round(ema20_now, 4),
-        "sl": round(sl, 4),
-        "tp1": round(market_entry * 1.05, 4),
-        "tp2": round(market_entry * 1.10, 4),
-        "tp3": round(market_entry * 1.20, 4),
-        "timestamp": last_candle['timestamp']
-    }
-
-# 🔴 SETUP H1 (3): ENGULFING SIDEWAY MA20
-def analyze_h1_engulfing_sideway_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
-    if df_h1.empty or len(df_h1) < 25: return None
-
-    last_candle = df_h1.iloc[-1]
-    prev_candle = df_h1.iloc[-2]
-    prev_candles_sideway = df_h1.iloc[-8:-2]
-
-    close_now = realtime_price if realtime_price > 0 else last_candle['close']
-    open_now = last_candle['open']
-    low_now = min(last_candle['low'], close_now)
-    ema20_now = last_candle['ema20']
-
-    sideway_diff_pct = [(abs(r['close'] - r['ema20']) / r['ema20']) * 100 for _, r in prev_candles_sideway.iterrows()]
-    is_sideway_ma20 = (sum(sideway_diff_pct) / len(sideway_diff_pct)) <= 2.5
-
-    is_prev_red = prev_candle['close'] < prev_candle['open']
-    is_green_now = close_now > open_now
-    is_close_above_ma20 = close_now > ema20_now
-    is_engulfing = (close_now > prev_candle['open']) and (close_now > prev_candle['high'])
-    green_body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
-
-    if not (is_sideway_ma20 and is_prev_red and is_green_now and is_close_above_ma20 and is_engulfing and green_body_pct >= 1.8):
-        return None
-
-    market_entry = close_now
-    sl = min(low_now, prev_candle['low']) * 0.997
-    if ((market_entry - sl) / market_entry) * 100 < 2.0:
-        sl = market_entry * 0.98
-
-    return {
-        "timeframe": "H1",
-        "status": "BUY SIGNAL H1",
-        "internal_setup_name": "H1 ENGULFING SIDEWAY",
-        "score": 93,
-        "close_price": close_now,
-        "market_entry": round(market_entry, 4),
-        "ema20": round(ema20_now, 4),
-        "sl": round(sl, 4),
-        "tp1": round(market_entry * 1.05, 4),
-        "tp2": round(market_entry * 1.10, 4),
-        "tp3": round(market_entry * 1.20, 4),
-        "timestamp": last_candle['timestamp']
-    }
-
-# 🔴 SETUP H4 (1): PURE BREAKOUT MA20
-def analyze_h4_pure_ma20_breakout(df_h4: pd.DataFrame, realtime_price: float) -> dict:
-    if df_h4.empty or len(df_h4) < 25: return None
-
-    last_candle = df_h4.iloc[-1]
-    prev_candles = df_h4.iloc[-6:-1]
-
-    close_now = realtime_price if realtime_price > 0 else last_candle['close']
-    open_now = last_candle['open']
-    low_now = min(last_candle['low'], close_now)
-    ema20_now = last_candle['ema20']
-
-    under_ma20_count = sum(1 for _, row in prev_candles.iterrows() if row['close'] < row['ema20'])
-    is_prev_under_ma20 = under_ma20_count >= 3
-
-    is_close_above_ma20 = close_now > ema20_now
-    is_green_candle = close_now > open_now
-    candle_body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
-
-    if not (is_prev_under_ma20 and is_close_above_ma20 and is_green_candle and candle_body_pct >= 1.5):
-        return None
-
-    market_entry = close_now
-    sl = low_now * 0.997
-    if ((market_entry - sl) / market_entry) * 100 < 2.0:
-        sl = market_entry * 0.98
-
-    return {
-        "timeframe": "H4",
-        "status": "BUY SIGNAL H4",
-        "internal_setup_name": "H4 PURE BREAKOUT",
-        "score": 96,
+        "status": "BUY SIGNAL A+",
+        "internal_setup_name": "H1 EARLY ACCUMULATION (SETUP A+)",
+        "score": 98,
         "close_price": close_now,
         "market_entry": round(market_entry, 4),
         "ema20": round(ema20_now, 4),
@@ -508,12 +442,12 @@ def analyze_h4_pure_ma20_breakout(df_h4: pd.DataFrame, realtime_price: float) ->
     }
 
 # ==============================================================================
-# 7. HỆ THỐNG GỬI TELEGRAM
+# 7. HỆ THỐNG GỬI TELEGRAM BẢO BẬT BẢN QUYỀN
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
 
-    msg = f"""🚨 <b>BYBIT SCANNER ({sig['timeframe']})</b>
+    msg = f"""🚨 <b>BYBIT VIP SCANNER ({sig['timeframe']})</b>
 
 <b>Coin:</b> #{sig['symbol']} (24h Change: {sig['price24hPcnt']}%)
 
@@ -585,56 +519,36 @@ def run_scanner_loop():
     init_db()
     Thread(target=listen_telegram_commands, daemon=True).start()
 
-    print("⚡️ Bắt đầu Auto Fast Alert Engine...", flush=True)
+    print("⚡️ Bắt đầu VIP High Winrate Scanner Engine...", flush=True)
     while True:
         try:
             tickers = get_bybit_crypto_tickers()
             tickers_map = {t['symbol']: t['lastPrice'] for t in tickers}
             track_and_update_active_trades(tickers_map)
 
-            print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins...", flush=True)
+            print(f"\n🔍 [VIP SCANNER] Đang lọc {len(tickers)} Altcoins thanh khoản cao...", flush=True)
 
             scanned_signals = []
             for t in tickers[:MAX_SYMBOLS_SCAN]:
                 sym = t['symbol']
                 realtime_price = t['lastPrice']
 
-                # 1. Quét H1 (AA+, Compression A-, Engulfing)
+                # 1. Bắt Setup AA+ Golden Convergence (D1 + H4)
+                aa_sig = analyze_golden_convergence_aa(sym, realtime_price)
+                if aa_sig:
+                    aa_sig['symbol'] = sym
+                    aa_sig['price24hPcnt'] = t['price24hPcnt']
+                    scanned_signals.append(aa_sig)
+
+                # 2. Bắt Setup A+ Early Accumulation (H1)
                 df_h1 = get_closed_klines_df(sym, "60", limit=40)
                 if not df_h1.empty:
                     df_h1 = add_indicators(df_h1)
-                    
-                    analysis_h1_early = analyze_h1_early_accumulation_ma20(df_h1, realtime_price)
-                    if analysis_h1_early:
-                        analysis_h1_early['symbol'] = sym
-                        analysis_h1_early['price24hPcnt'] = t['price24hPcnt']
-                        analysis_h1_early['turnover24h'] = t['turnover24h']
-                        scanned_signals.append(analysis_h1_early)
-
-                    analysis_h1_comp = analyze_h1_compression_ma20(df_h1, realtime_price)
-                    if analysis_h1_comp:
-                        analysis_h1_comp['symbol'] = sym
-                        analysis_h1_comp['price24hPcnt'] = t['price24hPcnt']
-                        analysis_h1_comp['turnover24h'] = t['turnover24h']
-                        scanned_signals.append(analysis_h1_comp)
-
-                    analysis_h1_engulfing = analyze_h1_engulfing_sideway_ma20(df_h1, realtime_price)
-                    if analysis_h1_engulfing:
-                        analysis_h1_engulfing['symbol'] = sym
-                        analysis_h1_engulfing['price24hPcnt'] = t['price24hPcnt']
-                        analysis_h1_engulfing['turnover24h'] = t['turnover24h']
-                        scanned_signals.append(analysis_h1_engulfing)
-
-                # 2. Quét H4 Breakout
-                df_h4 = get_closed_klines_df(sym, "240", limit=40)
-                if not df_h4.empty:
-                    df_h4 = add_indicators(df_h4)
-                    analysis_h4_pure = analyze_h4_pure_ma20_breakout(df_h4, realtime_price)
-                    if analysis_h4_pure:
-                        analysis_h4_pure['symbol'] = sym
-                        analysis_h4_pure['price24hPcnt'] = t['price24hPcnt']
-                        analysis_h4_pure['turnover24h'] = t['turnover24h']
-                        scanned_signals.append(analysis_h4_pure)
+                    a_plus_sig = analyze_h1_early_accumulation_a_plus(df_h1, realtime_price)
+                    if a_plus_sig:
+                        a_plus_sig['symbol'] = sym
+                        a_plus_sig['price24hPcnt'] = t['price24hPcnt']
+                        scanned_signals.append(a_plus_sig)
 
             scanned_signals.sort(key=lambda x: x['score'], reverse=True)
             top_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
@@ -642,13 +556,17 @@ def run_scanner_loop():
             sent_count = 0
             if top_signals:
                 for sig in top_signals:
+                    if get_active_trades_count() >= MAX_ACTIVE_TRADES and not is_symbol_currently_active(sig['symbol']):
+                        print(f"⚠️ [SLOT FULL] Đã đủ {MAX_ACTIVE_TRADES} kèo chuẩn active, tạm dừng nhận kèo mới.", flush=True)
+                        break
+
                     should_send, call_count = process_signal_dedup(sig['symbol'], sig['status'], sig['score'])
                     if should_send:
                         sig['call_count'] = call_count
                         if send_telegram_alert(sig):
                             save_active_trade(sig)
                             sent_count += 1
-                            print(f"✅ [ALERT TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Entry: {sig['market_entry']}", flush=True)
+                            print(f"✅ [VIP ALERT TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Entry: {sig['market_entry']}", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)

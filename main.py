@@ -14,26 +14,26 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Crypto Signal Engine Active 24/7!"
+    return "Bybit Fast Alert Scanner Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 # ==============================================================================
-# 2. CẤU HÌNH BIẾN MÔI TRƯỜNG & ĐIỀU KIỆN
+# 2. CẤU HÌNH BÁO KÈO TỰ DO (TỐI ƯU ĐỂ CANH BÁO NHẠY - TỰ LỌC TAY)
 # ==============================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
-MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))
-MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.20"))
-MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "100"))
-SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "3600"))
+MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "1000000")) # Hạ xuống $1M USD
+MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.30"))
+MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "250"))      # Quét rộng 250 Altcoins
+SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "120")) # Quét 2 phút/lần
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "300"))      # Cooldown chỉ 5 phút
 
-MAX_ALERTS_PER_CYCLE = 3
-MAX_ACTIVE_TRADES = 5
+MAX_ALERTS_PER_CYCLE = 10                                              # Đẩy tối đa 10 kèo/chu kỳ
+MAX_ACTIVE_TRADES = 999                                                # KHÔNG GIỚI HẠN SLOT ACTIVE
 
 DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
@@ -78,26 +78,7 @@ def init_db():
         if 'setup_name' not in columns:
             cursor.execute("ALTER TABLE active_trades ADD COLUMN setup_name TEXT DEFAULT 'UNKNOWN'")
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS top_gainers_tracker (
-                symbol TEXT PRIMARY KEY,
-                appear_count INTEGER DEFAULT 1,
-                last_seen INTEGER NOT NULL
-            )
-        """)
         conn.commit()
-
-def is_symbol_currently_active(symbol: str) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM active_trades WHERE symbol = ? AND status = 'OPEN'", (symbol,))
-        return cursor.fetchone() is not None
-
-def get_active_trades_count() -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM active_trades WHERE status = 'OPEN'")
-        return cursor.fetchone()[0]
 
 def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
     now_ts = int(time.time())
@@ -120,7 +101,7 @@ def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
             prev_call_count, last_sent_at = row
             time_passed = now_ts - last_sent_at
 
-            if prev_call_count >= 3 or time_passed < COOLDOWN_SECONDS:
+            if time_passed < COOLDOWN_SECONDS:
                 return False, prev_call_count
 
             new_call_count = prev_call_count + 1
@@ -207,7 +188,7 @@ def get_24h_summary_report() -> str:
             FROM active_trades 
             WHERE status = 'OPEN' 
             ORDER BY created_at DESC
-        """)
+        """, ())
         open_trades = cursor.fetchall()
 
     msg = "📊 <b>BÁO CÁO TỔNG HỢP KẾT QUẢ CRYPTO (24H)</b>\n"
@@ -338,21 +319,6 @@ def get_closed_klines_df(symbol: str, interval: str, limit: int = 60) -> pd.Data
         pass
     return pd.DataFrame()
 
-def get_open_interest_change(symbol: str, interval: str = "60") -> float:
-    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval}&limit=3"
-    try:
-        res = requests.get(url, timeout=4).json()
-        if res.get("retCode") == 0 and res.get("result", {}).get("list"):
-            oi_list = res["result"]["list"]
-            if len(oi_list) >= 2:
-                curr_oi = safe_float(oi_list[0].get("openInterest", 0))
-                prev_oi = safe_float(oi_list[1].get("openInterest", 0))
-                if prev_oi > 0:
-                    return round(((curr_oi - prev_oi) / prev_oi) * 100, 2)
-    except Exception:
-        pass
-    return 0.0
-
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 25: return df
     closes, vols = df['close'], df['volume']
@@ -411,9 +377,8 @@ def analyze_h1_early_accumulation_ma20(df_h1: pd.DataFrame, realtime_price: floa
         "timestamp": last_candle['timestamp']
     }
 
-# 🔴 SETUP H1 (2): COMPRESSION MA20 (SETUP A- MỚI THÊM)
+# 🔴 SETUP H1 (2): COMPRESSION MA20 (SETUP A-)
 def analyze_h1_compression_ma20(df_h1: pd.DataFrame, realtime_price: float) -> dict:
-    """ SETUP A-: NÉN GIÁ SÁT MA20 H1 TÍCH LŨY DỒN VOL VÀ BỨT PHÁ BẮT ĐẦU SÓNG """
     if df_h1.empty or len(df_h1) < 25: return None
 
     last_candle = df_h1.iloc[-1]
@@ -423,16 +388,13 @@ def analyze_h1_compression_ma20(df_h1: pd.DataFrame, realtime_price: float) -> d
     open_now = last_candle['open']
     ema20_now = last_candle['ema20']
 
-    # 1. Đoạn 4 nến trước đó nén chặt quanh MA20 (chênh lệch đỉnh/đáy so với MA20 <= 1.2%)
     is_compressed = all((abs(r['high'] - r['ema20']) / r['ema20']) * 100 <= 1.2 and 
                         (abs(r['low'] - r['ema20']) / r['ema20']) * 100 <= 1.2 for _, r in prev_4_candles.iterrows())
 
-    # 2. Cây nến hiện tại bứt phá nén, đóng nến xanh nằm trên MA20
     is_green_now = close_now > open_now
     is_close_above_ma20 = close_now > ema20_now
     candle_body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
     
-    # Biên độ nến kích hoạt nén nhẹ vừa phải (0.8% - 2.0%)
     is_trigger_breakout = 0.8 <= candle_body_pct <= 2.0
 
     if not (is_compressed and is_green_now and is_close_above_ma20 and is_trigger_breakout):
@@ -546,7 +508,7 @@ def analyze_h4_pure_ma20_breakout(df_h4: pd.DataFrame, realtime_price: float) ->
     }
 
 # ==============================================================================
-# 7. HỆ THỐNG GỬI TELEGRAM BẢO BẬT BẢN QUYỀN (ẨN MỌI BỘ LỌC)
+# 7. HỆ THỐNG GỬI TELEGRAM
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
@@ -623,7 +585,7 @@ def run_scanner_loop():
     init_db()
     Thread(target=listen_telegram_commands, daemon=True).start()
 
-    print("⚡️ Bắt đầu Scanner Engine...", flush=True)
+    print("⚡️ Bắt đầu Auto Fast Alert Engine...", flush=True)
     while True:
         try:
             tickers = get_bybit_crypto_tickers()
@@ -680,16 +642,13 @@ def run_scanner_loop():
             sent_count = 0
             if top_signals:
                 for sig in top_signals:
-                    if get_active_trades_count() >= MAX_ACTIVE_TRADES and not is_symbol_currently_active(sig['symbol']):
-                        break
-
                     should_send, call_count = process_signal_dedup(sig['symbol'], sig['status'], sig['score'])
                     if should_send:
                         sig['call_count'] = call_count
                         if send_telegram_alert(sig):
                             save_active_trade(sig)
                             sent_count += 1
-                            print(f"✅ [TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Entry: {sig['market_entry']}", flush=True)
+                            print(f"✅ [ALERT TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Entry: {sig['market_entry']}", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)

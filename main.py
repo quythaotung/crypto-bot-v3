@@ -8,13 +8,13 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# 1. KHỞI TẠO FLASK KEEP-ALIVE SERVER (DÙNG CHO RENDER 24/7)
+# 1. KHỞI TẠO FLASK KEEP-ALIVE SERVER
 # ==============================================================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit H1 Strong Momentum Breakout Engine Active 24/7!"
+    return "Bybit H1 High-Quality LONG Engine Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -27,12 +27,12 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
 MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))
-MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.20"))
+MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.25"))
 MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "150"))
-SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "180")) # 3 phút/lần
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "3600"))
+SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300")) # 5 phút/lần
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "7200")) # Cooldown 2h cho 1 coin
 
-MAX_ALERTS_PER_CYCLE = 3
+MAX_ALERTS_PER_CYCLE = 2
 MAX_ACTIVE_TRADES = 5
 
 DB_PATH = "signals_history.db"
@@ -77,7 +77,6 @@ def init_db():
         columns = [col[1] for col in cursor.fetchall()]
         if 'setup_name' not in columns:
             cursor.execute("ALTER TABLE active_trades ADD COLUMN setup_name TEXT DEFAULT 'UNKNOWN'")
-
         conn.commit()
 
 def is_symbol_currently_active(symbol: str) -> bool:
@@ -126,134 +125,16 @@ def process_signal_dedup(symbol: str, status: str, score: int) -> tuple:
 
 def save_active_trade(sig: dict):
     now_ts = int(time.time())
-    setup_name_to_save = sig.get('internal_setup_name', sig['status'])
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO active_trades (symbol, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, status, setup_name, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?, ?, ?)
-        """, (sig['symbol'], sig['market_entry'], sig['sl'], sig['tp1'], sig['tp2'], sig['tp3'], setup_name_to_save, now_ts, now_ts))
+        """, (sig['symbol'], sig['market_entry'], sig['sl'], sig['tp1'], sig['tp2'], sig['tp2'], sig['internal_setup_name'], now_ts, now_ts))
         conn.commit()
 
 # ==============================================================================
-# 4. BÁO CÁO TELEGRAM LOGIC
-# ==============================================================================
-def get_setup_statistics_report() -> str:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT setup_name, status, COUNT(*) 
-            FROM active_trades 
-            WHERE status IN ('CLOSED_TP1', 'CLOSED_TP2', 'CLOSED_TP3', 'CLOSED_SL')
-            GROUP BY setup_name, status
-        """)
-        rows = cursor.fetchall()
-
-    if not rows:
-        return "📊 <b>THỐNG KÊ HIỆU SUẤT TRADING</b>\n\n🔎 Chưa có dữ liệu lịch sử kèo đã đóng."
-
-    stats = {}
-    for setup_name, status, count in rows:
-        if setup_name not in stats:
-            stats[setup_name] = {'win': 0, 'loss': 0, 'total': 0}
-        
-        if status in ['CLOSED_TP1', 'CLOSED_TP2', 'CLOSED_TP3']:
-            stats[setup_name]['win'] += count
-        elif status == 'CLOSED_SL':
-            stats[setup_name]['loss'] += count
-        
-        stats[setup_name]['total'] += count
-
-    msg = "📊 <b>THỐNG KÊ HIỆU SUẤT LÃI/LỖ TỔNG HỢP</b>\n"
-    msg += "===================================="
-
-    for setup, data in stats.items():
-        total = data['total']
-        win = data['win']
-        loss = data['loss']
-        winrate = (win / total * 100) if total > 0 else 0.0
-
-        msg += f"\n\n⚙️ <b>Tín hiệu {setup}:</b>"
-        msg += f"\n• Tổng số lệnh: <b>{total}</b>"
-        msg += f"\n• Thắng (TP): ✅ <b>{win}</b> | Thua (SL): 🛑 <b>{loss}</b>"
-        msg += f"\n• Tỷ lệ thắng (Winrate): 🔥 <b>{winrate:.1f}%</b>"
-
-    msg += "\n\n<i>💡 Nhắn /tonghop để xem chi tiết danh sách kèo 24h.</i>"
-    return msg
-
-def get_24h_summary_report() -> str:
-    now_ts = int(time.time())
-    cutoff_24h = now_ts - (24 * 3600)
-
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT symbol, entry, sl, tp1, tp2, tp3, status, updated_at 
-            FROM active_trades 
-            WHERE status IN ('CLOSED_TP1', 'CLOSED_TP2', 'CLOSED_TP3', 'CLOSED_SL') AND updated_at >= ?
-            ORDER BY updated_at DESC
-        """, (cutoff_24h,))
-        closed_trades = cursor.fetchall()
-
-        cursor.execute("""
-            SELECT symbol, entry, sl, tp1, tp2, tp3, tp1_hit 
-            FROM active_trades 
-            WHERE status = 'OPEN' 
-            ORDER BY created_at DESC
-        """)
-        open_trades = cursor.fetchall()
-
-    msg = "📊 <b>BÁO CÁO TỔNG HỢP KẾT QUẢ CRYPTO (24H)</b>\n"
-    msg += "===================================="
-
-    if not closed_trades and not open_trades:
-        return msg + "\n\n🔎 Chưa có dữ liệu giao dịch trong 24h qua."
-
-    if closed_trades:
-        msg += "\n\n🎯 <b>KÈO ĐÃ CHỐT KẾT QUẢ (24H QUA):</b>"
-        for idx, t in enumerate(closed_trades, 1):
-            sym, entry, sl, tp1, tp2, tp3, status, updated_at = t
-            tag = "🚀🚀 <b>[ĐÃ TP3]</b>" if status == 'CLOSED_TP3' else "🚀 <b>[ĐÃ TP2]</b>" if status == 'CLOSED_TP2' else "✅ <b>[ĐÃ TP1]</b>" if status == 'CLOSED_TP1' else "🛑 <b>[ĐÃ SL]</b>"
-            msg += f"\n{idx}. #{sym} {tag} | Entry: <code>{entry:.4f}</code>"
-
-    if open_trades:
-        msg += "\n\n⏳ <b>KÈO ĐANG THEO DÕI (ACTIVE):</b>"
-        for idx, t in enumerate(open_trades, 1):
-            sym, entry, sl, tp1, tp2, tp3, tp1_hit = t
-            st = "✅ (Đã cắn TP1 -> Dời SL về Entry)" if tp1_hit == 1 else "⏳ (Đang chạy)"
-            msg += f"\n{idx}. #{sym} {st} | Entry: <code>{entry:.4f}</code> | SL: <code>{sl:.4f}</code>"
-
-    msg += "\n\n<i>💡 Nhắn /thongke để xem tỷ lệ Winrate tổng hợp.</i>"
-    return msg
-
-def listen_telegram_commands():
-    if not BOT_TOKEN: return
-    last_update_id = 0
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-
-    while True:
-        try:
-            params = {"offset": last_update_id + 1, "timeout": 10}
-            res = requests.get(url, params=params, timeout=12).json()
-
-            if res.get("ok") and res.get("result"):
-                for update in res["result"]:
-                    last_update_id = update["update_id"]
-                    message = update.get("message", {})
-                    text = message.get("text", "").strip().lower()
-                    chat_id = str(message.get("chat", {}).get("id", ""))
-                    target_chat = chat_id if chat_id else CHAT_ID
-
-                    if text in ["/tonghop", "tonghop"]:
-                        send_direct_message(get_24h_summary_report(), target_chat_id=target_chat)
-                    elif text in ["/thongke", "thongke", "/setup_stats"]:
-                        send_direct_message(get_setup_statistics_report(), target_chat_id=target_chat)
-        except Exception:
-            pass
-        time.sleep(2)
-
-# ==============================================================================
-# 5. LẤY TICKERS BYBIT & KLINE DATA
+# 4. LẤY TICKERS BYBIT & KLINE DATA
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -285,8 +166,7 @@ def get_bybit_crypto_tickers():
                 last_price = safe_float(t.get("lastPrice", 0))
                 bid = safe_float(t.get("bid1Price", 0))
                 ask = safe_float(t.get("ask1Price", 0))
-                price_change_pct = safe_float(t.get("price24hPcnt", 0)) * 100
-
+                
                 spread_pct = ((ask - bid) / bid * 100) if (bid > 0 and ask > 0) else 0.0
 
                 if sym.endswith("USDT") and not sym.startswith(("USDC", "BUSD", "DAI", "EUR", "GBP")):
@@ -300,14 +180,13 @@ def get_bybit_crypto_tickers():
                     if not is_non_crypto and turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT:
                         valid.append({
                             "symbol": sym,
-                            "price24hPcnt": round(price_change_pct, 2),
                             "turnover24h": turnover,
                             "lastPrice": last_price,
                         })
 
             return sorted(valid, key=lambda x: x["turnover24h"], reverse=True)
     except Exception as e:
-        print(f"[ERROR] Lỗi lấy Tickers Crypto: {e}", flush=True)
+        print(f"[ERROR] Lỗi lấy Tickers: {e}", flush=True)
     return []
 
 def get_closed_klines_df(symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
@@ -320,178 +199,198 @@ def get_closed_klines_df(symbol: str, interval: str, limit: int = 100) -> pd.Dat
             closed_raw = raw_list[1:]
             df = pd.DataFrame(closed_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
             df = df.iloc[::-1].reset_index(drop=True)
-            for col in ['open', 'high', 'low', 'close', 'volume', 'turnover']:
+            for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = df[col].astype(float)
-            df['timestamp'] = df['timestamp'].astype(int)
             return df
     except Exception:
         pass
     return pd.DataFrame()
+
+def get_open_interest_change(symbol: str, interval: str = "60") -> float:
+    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval}&limit=3"
+    try:
+        res = requests.get(url, timeout=4).json()
+        if res.get("retCode") == 0 and res.get("result", {}).get("list"):
+            oi_list = res["result"]["list"]
+            if len(oi_list) >= 2:
+                curr_oi = safe_float(oi_list[0].get("openInterest", 0))
+                prev_oi = safe_float(oi_list[1].get("openInterest", 0))
+                if prev_oi > 0:
+                    return round(((curr_oi - prev_oi) / prev_oi) * 100, 2)
+    except Exception:
+        pass
+    return 0.0
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 30: return df
     closes, vols = df['close'], df['volume']
 
     df['ema20'] = closes.ewm(span=20, adjust=False).mean()
-    df['ema89'] = closes.ewm(span=89, adjust=False).mean() # Đường Trend chính
+    df['ema89'] = closes.ewm(span=89, adjust=False).mean()
     df['vol_ma20'] = vols.rolling(20).mean()
     df['vol_ratio'] = vols / df['vol_ma20'].replace(0, np.nan)
-
     return df
 
 # ==============================================================================
-# 6. ENGINE PHÁT HIỆN SETUP BREAKOUT LỰC MẠNH KHUNG H1
+# 5. ENGINE PHÁT HIỆN SETUP H1 HIGH-QUALITY
 # ==============================================================================
-def analyze_h1_strong_momentum_breakout(df_h1: pd.DataFrame, realtime_price: float) -> dict:
-    if df_h1.empty or len(df_h1) < 40: return None
+def analyze_h1_strict_long(df_h1: pd.DataFrame, df_h4: pd.DataFrame, realtime_price: float, oi_change: float) -> dict:
+    if df_h1.empty or len(df_h1) < 40 or df_h4.empty: return None
 
     last_candle = df_h1.iloc[-1]
-    prev_candles = df_h1.iloc[-8:-1]
-
+    prev_candle = df_h1.iloc[-2]
+    
     close_now = realtime_price if realtime_price > 0 else last_candle['close']
     open_now = last_candle['open']
+    high_now = max(last_candle['high'], close_now)
     low_now = min(last_candle['low'], close_now)
+    
     ema20_now = last_candle['ema20']
+    ema20_prev = prev_candle['ema20']
     ema89_now = last_candle['ema89']
 
-    # 1. ĐIỀU KIỆN UY TIÊN TREND TĂNG: Giá hiện tại phải nằm trên Trend EMA89
-    is_uptrend_trend = close_now >= ema89_now
+    # 1. Điều kiện 1: Trước đó nằm dưới MA20
+    prev_under_klines = df_h1.iloc[-7:-1]
+    under_ma20_count = sum(1 for _, row in prev_under_klines.iterrows() if row['close'] < row['ema20'])
+    if under_ma20_count < 4: return None
 
-    # 2. ĐIỀU KIỆN TÍCH LŨY DƯỚI MA20: Ít nhất 4/7 nến trước đó đóng dưới MA20
-    under_ma20_count = sum(1 for _, row in prev_candles.iterrows() if row['close'] < row['ema20'])
-    is_prev_under_ma20 = under_ma20_count >= 4
+    # 2. Điều kiện 2: Breakout rõ ràng & MA20 hướng lên
+    if close_now <= ema20_now or close_now <= open_now: return None
+    if ema20_now <= ema20_prev: return None # MA20 phải đang hướng lên hoặc bẻ ngang lên
 
-    # 3. ĐIỀU KIỆN VƯỢT ĐÓNG TRÊN MA20 VỚI LỰC BÙNG NỔ
-    is_close_above_ma20 = close_now > ema20_now
-    is_green_candle = close_now > open_now
+    # 3. Điều kiện 3: Đủ lực tăng (Body & Volume & Rejection)
+    body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
+    upper_shadow_pct = ((high_now - close_now) / close_now) * 100
     
-    # Nến xanh thân dài >= 1.5% (Xác nhận lực đẩy)
-    candle_body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
-    is_strong_body = candle_body_pct >= 1.5
+    if body_pct < 1.0: return None # Thân nến phải tăng mạnh (>= 1.0%)
+    if upper_shadow_pct > body_pct * 0.7: return None # Bị từ chối (râu trên dài) -> BỎ
+    
+    vol_ratio = last_candle['vol_ratio']
+    if vol_ratio < 1.2: return None # Volume yếu -> BỎ
 
-    # Vol bùng nổ mạnh mẽ >= 1.5x so với Vol MA20
-    is_strong_volume = last_candle['vol_ratio'] >= 1.5
+    # 4. Điều kiện Trend H1/H4
+    if close_now < ema89_now: return None # Trend H1 phải Bullish
+    h4_last = df_h4.iloc[-1]
+    h4_trend = "Bullish ✅" if h4_last['close'] > h4_last['ema89'] else "Neutral ⚠️"
 
-    if not (is_uptrend_trend and is_prev_under_ma20 and is_close_above_ma20 and is_green_candle and is_strong_body and is_strong_volume):
-        return None
+    # 5. Lọc FOMO (Giá đi quá xa MA20)
+    dist_from_ma20_pct = ((close_now - ema20_now) / ema20_now) * 100
+    if dist_from_ma20_pct > 2.5: return None # Cách MA20 quá 2.5% -> Chờ retest, KHÔNG báo đuổi.
 
-    # 4. TÍNH STOP LOSS VÀ TAKE PROFIT THEO TỶ LỆ KỸ THUẬT VÙNG THANH KHOẢN (LIQUIDITY)
+    # 6. Xác định Vùng Thanh Khoản (Liquidity) làm SL & TP
     market_entry = close_now
     
-    # SL đặt dưới vùng đáy thanh khoản gần nhất
-    liquidity_low = min(prev_candles['low'].min(), low_now)
-    sl = liquidity_low * 0.997 # Dưới đáy râu nến tích lũy
+    # Tìm Swing Low gần nhất (Đáy tạo bởi nhịp tích lũy trước đó)
+    recent_lows = df_h1['low'].iloc[-15:-1]
+    swing_low = recent_lows.min()
+    sl = swing_low * 0.995 # SL dưới swing low kèm buffer 0.5%
     
-    risk_distance = market_entry - sl
-    if (risk_distance / market_entry) * 100 < 1.8: # Bảo vệ tối thiểu
-        sl = market_entry * 0.982
-        risk_distance = market_entry - sl
+    risk_pct = ((market_entry - sl) / market_entry) * 100
+    if risk_pct < 1.0: # Nếu risk quá hẹp, nới SL ra tối thiểu 1.0% để tránh râu
+        sl = market_entry * 0.99
+        risk_pct = 1.0
+    
+    # Tìm Swing High gần nhất phía trên làm Liquidity TP1
+    historical_highs = df_h1['high'].iloc[-50:-1]
+    valid_highs = historical_highs[historical_highs > market_entry]
+    
+    if valid_highs.empty:
+        # Nếu đang phá ATH cục bộ, TP1 mặc định R:R 1.5, TP2 2.5
+        tp1 = market_entry + (market_entry - sl) * 1.5
+        tp2 = market_entry + (market_entry - sl) * 2.5
+        dist_tp1 = ((tp1 - market_entry) / market_entry) * 100
+        rr = 1.5
+    else:
+        # Lấy đỉnh gần nhất làm vùng thanh khoản mục tiêu
+        tp1_struct = valid_highs.iloc[::-1].idxmax() # Vị trí đỉnh gần nhất
+        tp1 = df_h1['high'].loc[tp1_struct]
+        
+        # Tìm đỉnh tiếp theo cao hơn làm TP2
+        higher_highs = historical_highs[historical_highs > tp1]
+        tp2 = higher_highs.max() if not higher_highs.empty else tp1 * 1.03
+        
+        dist_tp1 = ((tp1 - market_entry) / market_entry) * 100
+        rr = dist_tp1 / risk_pct
+        
+        # Nếu cản (TP1) quá gần, R:R < 1.5 -> Setup xấu, BỎ QUA
+        if rr < 1.5: return None
 
-    # Mốc TP thiết lập theo R:R kỹ thuật chuẩn (1:1.5 | 1:2.5 | 1:4)
-    tp1 = market_entry + (risk_distance * 1.5)
-    tp2 = market_entry + (risk_distance * 2.5)
-    tp3 = market_entry + (risk_distance * 4.0)
+    # 7. CHẤM ĐIỂM XẾP HẠNG (SCORE)
+    score = 80
+    if vol_ratio >= 1.8: score += 5
+    if h4_trend == "Bullish ✅": score += 5
+    if rr >= 2.0: score += 5
+    if oi_change > 2.0: score += 3 # OI tăng mạnh hỗ trợ giá
+    if body_pct >= 1.8: score += 2
+    
+    score = min(score, 100)
+    
+    # CHỈ BÁO KHI SCORE >= 85 (Ưu tiên chất lượng)
+    if score < 85: return None
+    
+    tag = "🔥 STRONG LONG" if score >= 90 else "🟢 LONG"
 
     return {
         "timeframe": "H1",
-        "status": "BUY SIGNAL H1",
-        "internal_setup_name": "H1 STRONG MOMENTUM BREAKOUT",
-        "score": 99,
-        "close_price": close_now,
+        "tag": tag,
+        "status": "LONG",
+        "internal_setup_name": "H1 QUALITY LONG",
+        "score": score,
         "market_entry": round(market_entry, 4),
-        "ema20": round(ema20_now, 4),
         "sl": round(sl, 4),
         "tp1": round(tp1, 4),
         "tp2": round(tp2, 4),
-        "tp3": round(tp3, 4),
+        "rr": round(rr, 2),
+        "dist_tp1": round(dist_tp1, 2),
+        "vol_ratio": round(vol_ratio, 2),
+        "trend_h4": h4_trend,
         "timestamp": last_candle['timestamp']
     }
 
 # ==============================================================================
-# 7. HỆ THỐNG GỬI TELEGRAM BẢO BẬT BẢN QUYỀN
+# 6. GỬI TELEGRAM & QUẢN LÝ DATABASE
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
 
-    msg = f"""🚨 <b>BYBIT SCANNER ({sig['timeframe']})</b>
+    msg = f"""{sig['tag']} — #{sig['symbol']}
 
-<b>Coin:</b> #{sig['symbol']} (24h Change: {sig['price24hPcnt']}%)
+<b>Entry:</b> <code>{sig['market_entry']:.4f}</code>
+<b>SL:</b> <code>{sig['sl']:.4f}</code>
+<b>TP1:</b> <code>{sig['tp1']:.4f}</code>
+<b>TP2:</b> <code>{sig['tp2']:.4f}</code>
+<b>RR:</b> {sig['rr']}
 
-⚡️ <b>GIÁ VÀO MARKET NGAY:</b> <code>{sig['market_entry']:.4f}</code>
-📉 <b>Đường MA 20 ({sig['timeframe']}):</b> <code>{sig['ema20']:.4f}</code>
-🛡 <b>Stop Loss (Vùng Đáy Thanh Khoản):</b> <code>{sig['sl']:.4f}</code>
+MA20: Break + Confirm ✅
+Momentum: Strong ✅
+Volume: {sig['vol_ratio']}x
+Trend H1: Bullish ✅
+Trend H4: {sig['trend_h4']}
+Liquidity: Cách đỉnh {sig['dist_tp1']}%
+Score: <b>{sig['score']}/100</b>
 
-🎯 <b>Take Profit Target (Theo R:R Kỹ Thuật):</b>
-• <b>TP1 (R:R 1:1.5):</b> <code>{sig['tp1']:.4f}</code>
-• <b>TP2 (R:R 1:2.5):</b> <code>{sig['tp2']:.4f}</code>
-• <b>TP3 (R:R 1:4.0):</b> <code>{sig['tp3']:.4f}</code>
-
-🔗 <a href="https://www.bybit.com/trade/usdt/{sig['symbol']}">Biểu đồ Bybit {sig['symbol']}</a>"""
+💡 <b>Lý do:</b>
+Giá trước đó nằm dưới MA20 → H1 đóng vượt MA20 → xuất hiện lực tăng mạnh → cấu trúc tăng được xác nhận → phía trên còn thanh khoản để chạy."""
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
         res = requests.post(url, json=payload, timeout=8)
         return res.status_code == 200
-    except Exception as e:
-        print(f"[ERROR] Lỗi gửi Telegram: {e}", flush=True)
+    except Exception:
         return False
 
-def send_direct_message(text: str, target_chat_id: str = None):
-    dest = target_chat_id if target_chat_id else CHAT_ID
-    if not BOT_TOKEN or not dest: return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": dest, "text": text, "parse_mode": "HTML"}, timeout=8)
-    except Exception:
-        pass
-
-def track_and_update_active_trades(tickers_map: dict):
-    now_ts = int(time.time())
-    status_changed = False
-
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, symbol, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit FROM active_trades WHERE status = 'OPEN'")
-        trades = cursor.fetchall()
-
-        for t in trades:
-            trade_id, sym, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit = t
-            if sym not in tickers_map: continue
-            curr_price = tickers_map[sym]
-
-            if tp1_hit == 0 and curr_price >= tp1:
-                cursor.execute("UPDATE active_trades SET tp1_hit = 1, sl = ?, updated_at = ? WHERE id = ?", (entry, now_ts, trade_id))
-                conn.commit()
-                status_changed = True
-            elif curr_price >= tp3:
-                cursor.execute("UPDATE active_trades SET status = 'CLOSED_TP3', updated_at = ? WHERE id = ?", (now_ts, trade_id))
-                cursor.execute("DELETE FROM sent_signals WHERE symbol = ?", (sym,))
-                conn.commit()
-                status_changed = True
-            elif curr_price <= sl:
-                cursor.execute("UPDATE active_trades SET status = 'CLOSED_SL', updated_at = ? WHERE id = ?", (now_ts, trade_id))
-                cursor.execute("DELETE FROM sent_signals WHERE symbol = ?", (sym,))
-                conn.commit()
-                status_changed = True
-
-    if status_changed:
-        send_direct_message(get_24h_summary_report())
-
 # ==============================================================================
-# 8. AUTOMATIC SCANNER LOOP
+# 7. VÒNG LẶP SCANNER
 # ==============================================================================
 def run_scanner_loop():
     init_db()
-    Thread(target=listen_telegram_commands, daemon=True).start()
+    Thread(target=run_flask, daemon=True).start()
 
-    print("⚡️ Bắt đầu H1 Strong Momentum Scanner Engine...", flush=True)
+    print("⚡️ Bắt đầu H1 High-Quality Scanner Engine...", flush=True)
     while True:
         try:
             tickers = get_bybit_crypto_tickers()
-            tickers_map = {t['symbol']: t['lastPrice'] for t in tickers}
-            track_and_update_active_trades(tickers_map)
-
             print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins...", flush=True)
 
             scanned_signals = []
@@ -499,17 +398,21 @@ def run_scanner_loop():
                 sym = t['symbol']
                 realtime_price = t['lastPrice']
 
-                # Quét Setup H1 Strong Momentum Breakout
                 df_h1 = get_closed_klines_df(sym, "60", limit=60)
-                if not df_h1.empty:
+                df_h4 = get_closed_klines_df(sym, "240", limit=40)
+                
+                if not df_h1.empty and not df_h4.empty:
                     df_h1 = add_indicators(df_h1)
+                    df_h4 = add_indicators(df_h4)
                     
-                    sig = analyze_h1_strong_momentum_breakout(df_h1, realtime_price)
+                    oi_change = get_open_interest_change(sym, "60")
+                    
+                    sig = analyze_h1_strict_long(df_h1, df_h4, realtime_price, oi_change)
                     if sig:
                         sig['symbol'] = sym
-                        sig['price24hPcnt'] = t['price24hPcnt']
                         scanned_signals.append(sig)
 
+            # Lọc ưu tiên Score cao nhất
             scanned_signals.sort(key=lambda x: x['score'], reverse=True)
             top_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
 
@@ -525,7 +428,7 @@ def run_scanner_loop():
                         if send_telegram_alert(sig):
                             save_active_trade(sig)
                             sent_count += 1
-                            print(f"✅ [MOMENTUM ALERT TOP {sent_count}] #{sig['symbol']} Status: {sig['status']} | Entry: {sig['market_entry']}", flush=True)
+                            print(f"✅ [{sig['tag']}] #{sig['symbol']} | Entry: {sig['market_entry']} | Score: {sig['score']}", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)
@@ -533,5 +436,4 @@ def run_scanner_loop():
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
-    Thread(target=run_flask, daemon=True).start()
     run_scanner_loop()

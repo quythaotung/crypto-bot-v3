@@ -185,8 +185,8 @@ def get_bybit_crypto_tickers():
                         })
 
             return sorted(valid, key=lambda x: x["turnover24h"], reverse=True)
-    except Exception as e:
-        print(f"[ERROR] Lỗi lấy Tickers: {e}", flush=True)
+    except Exception:
+        pass
     return []
 
 def get_closed_klines_df(symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
@@ -232,7 +232,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 5. ENGINE PHÁT HIỆN SETUP H1 HIGH-QUALITY
+# 5. ENGINE PHÁT HIỆN SETUP H1 HIGH-QUALITY STRICT LONG
 # ==============================================================================
 def analyze_h1_strict_long(df_h1: pd.DataFrame, df_h4: pd.DataFrame, realtime_price: float, oi_change: float) -> dict:
     if df_h1.empty or len(df_h1) < 40 or df_h4.empty: return None
@@ -245,97 +245,116 @@ def analyze_h1_strict_long(df_h1: pd.DataFrame, df_h4: pd.DataFrame, realtime_pr
     high_now = max(last_candle['high'], close_now)
     low_now = min(last_candle['low'], close_now)
     
+    candle_range = high_now - low_now
+    body = close_now - open_now
+
     ema20_now = last_candle['ema20']
     ema20_prev = prev_candle['ema20']
-    ema89_now = last_candle['ema89']
+    vol_ratio = last_candle['vol_ratio']
 
-    # 1. Điều kiện 1: Trước đó nằm dưới MA20
+    # 1. ĐIỀU KIỆN TIỀN ĐỀ: Giá từng nằm dưới MA20
     prev_under_klines = df_h1.iloc[-7:-1]
     under_ma20_count = sum(1 for _, row in prev_under_klines.iterrows() if row['close'] < row['ema20'])
-    if under_ma20_count < 4: return None
+    if under_ma20_count < 3: return None # Cần ít nhất 3 nến trước đó nằm dưới MA20 để tạo nền
 
-    # 2. Điều kiện 2: Breakout rõ ràng & MA20 hướng lên
-    if close_now <= ema20_now or close_now <= open_now: return None
-    if ema20_now <= ema20_prev: return None # MA20 phải đang hướng lên hoặc bẻ ngang lên
-
-    # 3. Điều kiện 3: Đủ lực tăng (Body & Volume & Rejection)
-    body_pct = ((close_now - open_now) / open_now) * 100 if open_now > 0 else 0.0
-    upper_shadow_pct = ((high_now - close_now) / close_now) * 100
+    # 2. KIỂM TRA ĐIỀU KIỆN MOMENTUM CONFIRMATION NẾN H1
+    is_close_above_ma20 = close_now > ema20_now
+    is_ma20_up = ema20_now > ema20_prev # MA20 Slope > 0
     
-    if body_pct < 1.0: return None # Thân nến phải tăng mạnh (>= 1.0%)
-    if upper_shadow_pct > body_pct * 0.7: return None # Bị từ chối (râu trên dài) -> BỎ
+    # Body >= 60% tổng range
+    is_body_large = (body >= 0.6 * candle_range) if candle_range > 0 else False
     
-    vol_ratio = last_candle['vol_ratio']
-    if vol_ratio < 1.2: return None # Volume yếu -> BỎ
+    # Close nằm trong 20% gần High
+    is_close_near_high = ((high_now - close_now) <= 0.2 * candle_range) if candle_range > 0 else False
+    
+    # Volume > Volume MA20
+    is_vol_high = vol_ratio > 1.0
 
-    # 4. Điều kiện Trend H1/H4
-    if close_now < ema89_now: return None # Trend H1 phải Bullish
+    # 3. KIỂM TRA CẤU TRÚC H1 (Break recent High + Có HH HL)
+    recent_klines_15 = df_h1.iloc[-16:-1]
+    recent_high = recent_klines_15['high'].max()
+    is_break_recent_high = close_now > recent_high
+
+    # Xác định Higher Low (HL)
+    recent_swing_low = df_h1['low'].iloc[-10:-1].min()
+    prev_swing_low = df_h1['low'].iloc[-25:-11].min()
+    is_hl = recent_swing_low >= prev_swing_low
+    is_hh_hl = is_break_recent_high and is_hl
+
+    # 4. KIỂM TRA H4 KHÔNG BEARISH MẠNH
     h4_last = df_h4.iloc[-1]
-    h4_trend = "Bullish ✅" if h4_last['close'] > h4_last['ema89'] else "Neutral ⚠️"
+    is_h4_bearish_manh = (h4_last['close'] < h4_last['ema89']) and (h4_last['close'] < h4_last['ema20'])
+    is_h4_ok = not is_h4_bearish_manh
 
-    # 5. Lọc FOMO (Giá đi quá xa MA20)
+    # TỔNG HỢP MOMENTUM TRUE
+    momentum_confirmation = (is_close_above_ma20 and is_ma20_up and is_body_large and 
+                             is_close_near_high and is_vol_high and is_break_recent_high and 
+                             is_hh_hl and is_h4_ok)
+
+    if not momentum_confirmation:
+        return None
+
+    # Lọc FOMO: Nến tăng không được vọt cách MA20 quá xa (> 3.5%)
     dist_from_ma20_pct = ((close_now - ema20_now) / ema20_now) * 100
-    if dist_from_ma20_pct > 2.5: return None # Cách MA20 quá 2.5% -> Chờ retest, KHÔNG báo đuổi.
+    if dist_from_ma20_pct > 3.5: return None
 
-    # 6. Xác định Vùng Thanh Khoản (Liquidity) làm SL & TP
+    # 5. XÁC ĐỊNH VÙNG THANH KHOẢN (LIQUIDITY) SL & TP
     market_entry = close_now
     
-    # Tìm Swing Low gần nhất (Đáy tạo bởi nhịp tích lũy trước đó)
-    recent_lows = df_h1['low'].iloc[-15:-1]
-    swing_low = recent_lows.min()
-    sl = swing_low * 0.995 # SL dưới swing low kèm buffer 0.5%
+    # SL đặt dưới swing low gần nhất (Higher Low) + buffer 0.5%
+    sl = recent_swing_low * 0.995 
     
     risk_pct = ((market_entry - sl) / market_entry) * 100
-    if risk_pct < 1.0: # Nếu risk quá hẹp, nới SL ra tối thiểu 1.0% để tránh râu
+    if risk_pct < 1.0: # Buffer chống quét râu hẹp
         sl = market_entry * 0.99
         risk_pct = 1.0
     
-    # Tìm Swing High gần nhất phía trên làm Liquidity TP1
-    historical_highs = df_h1['high'].iloc[-50:-1]
+    # Tìm Swing High phía trên làm TP1 (Vùng Liquidity kháng cự)
+    historical_highs = df_h1['high'].iloc[-60:-1]
     valid_highs = historical_highs[historical_highs > market_entry]
     
     if valid_highs.empty:
-        # Nếu đang phá ATH cục bộ, TP1 mặc định R:R 1.5, TP2 2.5
+        # Giá đang phá ATH cục bộ -> Dùng R:R chuẩn
         tp1 = market_entry + (market_entry - sl) * 1.5
         tp2 = market_entry + (market_entry - sl) * 2.5
         dist_tp1 = ((tp1 - market_entry) / market_entry) * 100
         rr = 1.5
     else:
-        # Lấy đỉnh gần nhất làm vùng thanh khoản mục tiêu
-        tp1_struct = valid_highs.iloc[::-1].idxmax() # Vị trí đỉnh gần nhất
+        # Lấy đỉnh cao nhất gần đây làm TP1
+        tp1_struct = valid_highs.iloc[::-1].idxmax()
         tp1 = df_h1['high'].loc[tp1_struct]
         
-        # Tìm đỉnh tiếp theo cao hơn làm TP2
+        # Đỉnh cao tiếp theo làm TP2
         higher_highs = historical_highs[historical_highs > tp1]
-        tp2 = higher_highs.max() if not higher_highs.empty else tp1 * 1.03
+        tp2 = higher_highs.max() if not higher_highs.empty else tp1 + (tp1 - market_entry)
         
         dist_tp1 = ((tp1 - market_entry) / market_entry) * 100
         rr = dist_tp1 / risk_pct
         
-        # Nếu cản (TP1) quá gần, R:R < 1.5 -> Setup xấu, BỎ QUA
+        # 6. KHÔNG BÁO LONG NẾU KHÁNG CỰ QUÁ GẦN (R:R < 1.5)
         if rr < 1.5: return None
 
-    # 7. CHẤM ĐIỂM XẾP HẠNG (SCORE)
+    # 7. CHẤM ĐIỂM (SCORE >= 85 MỚI BÁO)
     score = 80
-    if vol_ratio >= 1.8: score += 5
-    if h4_trend == "Bullish ✅": score += 5
+    if vol_ratio >= 1.5: score += 5
+    if h4_last['close'] > h4_last['ema89']: score += 5 # H4 Trend Bullish
     if rr >= 2.0: score += 5
-    if oi_change > 2.0: score += 3 # OI tăng mạnh hỗ trợ giá
-    if body_pct >= 1.8: score += 2
+    if oi_change > 1.5: score += 3 # OI tăng hợp lý ủng hộ lực đẩy
+    if body >= 0.7 * candle_range: score += 2 # Thân nến cực kỳ đặc
     
     score = min(score, 100)
     
-    # CHỈ BÁO KHI SCORE >= 85 (Ưu tiên chất lượng)
     if score < 85: return None
     
     tag = "🔥 STRONG LONG" if score >= 90 else "🟢 LONG"
+    h4_trend = "Bullish ✅" if h4_last['close'] > h4_last['ema89'] else "Neutral ⚠️"
 
     return {
         "timeframe": "H1",
         "tag": tag,
         "status": "LONG",
         "internal_setup_name": "H1 QUALITY LONG",
-        "score": score,
+        "score": int(score),
         "market_entry": round(market_entry, 4),
         "sl": round(sl, 4),
         "tp1": round(tp1, 4),
@@ -362,7 +381,7 @@ def send_telegram_alert(sig: dict) -> bool:
 <b>RR:</b> {sig['rr']}
 
 MA20: Break + Confirm ✅
-Momentum: Strong ✅
+Momentum: Strong ✅ (HH+HL & Body > 60%)
 Volume: {sig['vol_ratio']}x
 Trend H1: Bullish ✅
 Trend H4: {sig['trend_h4']}

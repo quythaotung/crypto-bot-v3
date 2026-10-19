@@ -29,8 +29,8 @@ CHAT_ID = os.environ.get("CHAT_ID", "")
 MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))
 MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.25"))
 MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "150"))
-SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300")) # 5 phút/lần
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "7200")) # Cooldown 2h cho 1 coin
+SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "7200"))
 
 MAX_ALERTS_PER_CYCLE = 2
 MAX_ACTIVE_TRADES = 5
@@ -235,7 +235,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # 5. ENGINE PHÁT HIỆN SETUP H1 HIGH-QUALITY STRICT LONG
 # ==============================================================================
 def analyze_h1_strict_long(df_h1: pd.DataFrame, df_h4: pd.DataFrame, realtime_price: float, oi_change: float) -> dict:
-    if df_h1.empty or len(df_h1) < 40 or df_h4.empty: return None
+    if df_h1.empty or len(df_h1) < 40 or df_h4.empty or len(df_h4) < 35: return None
+
+    # Thêm bước kiểm tra an toàn cột chỉ báo
+    if 'ema89' not in df_h1.columns or 'ema89' not in df_h4.columns:
+        return None
 
     last_candle = df_h1.iloc[-1]
     prev_candle = df_h1.iloc[-2]
@@ -255,27 +259,21 @@ def analyze_h1_strict_long(df_h1: pd.DataFrame, df_h4: pd.DataFrame, realtime_pr
     # 1. ĐIỀU KIỆN TIỀN ĐỀ: Giá từng nằm dưới MA20
     prev_under_klines = df_h1.iloc[-7:-1]
     under_ma20_count = sum(1 for _, row in prev_under_klines.iterrows() if row['close'] < row['ema20'])
-    if under_ma20_count < 3: return None # Cần ít nhất 3 nến trước đó nằm dưới MA20 để tạo nền
+    if under_ma20_count < 3: return None
 
     # 2. KIỂM TRA ĐIỀU KIỆN MOMENTUM CONFIRMATION NẾN H1
     is_close_above_ma20 = close_now > ema20_now
-    is_ma20_up = ema20_now > ema20_prev # MA20 Slope > 0
+    is_ma20_up = ema20_now > ema20_prev
     
-    # Body >= 60% tổng range
     is_body_large = (body >= 0.6 * candle_range) if candle_range > 0 else False
-    
-    # Close nằm trong 20% gần High
     is_close_near_high = ((high_now - close_now) <= 0.2 * candle_range) if candle_range > 0 else False
-    
-    # Volume > Volume MA20
     is_vol_high = vol_ratio > 1.0
 
-    # 3. KIỂM TRA CẤU TRÚC H1 (Break recent High + Có HH HL)
+    # 3. KIỂM TRA CẤU TRÚC H1
     recent_klines_15 = df_h1.iloc[-16:-1]
     recent_high = recent_klines_15['high'].max()
     is_break_recent_high = close_now > recent_high
 
-    # Xác định Higher Low (HL)
     recent_swing_low = df_h1['low'].iloc[-10:-1].min()
     prev_swing_low = df_h1['low'].iloc[-25:-11].min()
     is_hl = recent_swing_low >= prev_swing_low
@@ -286,7 +284,6 @@ def analyze_h1_strict_long(df_h1: pd.DataFrame, df_h4: pd.DataFrame, realtime_pr
     is_h4_bearish_manh = (h4_last['close'] < h4_last['ema89']) and (h4_last['close'] < h4_last['ema20'])
     is_h4_ok = not is_h4_bearish_manh
 
-    # TỔNG HỢP MOMENTUM TRUE
     momentum_confirmation = (is_close_above_ma20 and is_ma20_up and is_body_large and 
                              is_close_near_high and is_vol_high and is_break_recent_high and 
                              is_hh_hl and is_h4_ok)
@@ -294,53 +291,45 @@ def analyze_h1_strict_long(df_h1: pd.DataFrame, df_h4: pd.DataFrame, realtime_pr
     if not momentum_confirmation:
         return None
 
-    # Lọc FOMO: Nến tăng không được vọt cách MA20 quá xa (> 3.5%)
     dist_from_ma20_pct = ((close_now - ema20_now) / ema20_now) * 100
     if dist_from_ma20_pct > 3.5: return None
 
     # 5. XÁC ĐỊNH VÙNG THANH KHOẢN (LIQUIDITY) SL & TP
     market_entry = close_now
-    
-    # SL đặt dưới swing low gần nhất (Higher Low) + buffer 0.5%
     sl = recent_swing_low * 0.995 
     
     risk_pct = ((market_entry - sl) / market_entry) * 100
-    if risk_pct < 1.0: # Buffer chống quét râu hẹp
+    if risk_pct < 1.0:
         sl = market_entry * 0.99
         risk_pct = 1.0
     
-    # Tìm Swing High phía trên làm TP1 (Vùng Liquidity kháng cự)
     historical_highs = df_h1['high'].iloc[-60:-1]
     valid_highs = historical_highs[historical_highs > market_entry]
     
     if valid_highs.empty:
-        # Giá đang phá ATH cục bộ -> Dùng R:R chuẩn
         tp1 = market_entry + (market_entry - sl) * 1.5
         tp2 = market_entry + (market_entry - sl) * 2.5
         dist_tp1 = ((tp1 - market_entry) / market_entry) * 100
         rr = 1.5
     else:
-        # Lấy đỉnh cao nhất gần đây làm TP1
         tp1_struct = valid_highs.iloc[::-1].idxmax()
         tp1 = df_h1['high'].loc[tp1_struct]
         
-        # Đỉnh cao tiếp theo làm TP2
         higher_highs = historical_highs[historical_highs > tp1]
         tp2 = higher_highs.max() if not higher_highs.empty else tp1 + (tp1 - market_entry)
         
         dist_tp1 = ((tp1 - market_entry) / market_entry) * 100
         rr = dist_tp1 / risk_pct
         
-        # 6. KHÔNG BÁO LONG NẾU KHÁNG CỰ QUÁ GẦN (R:R < 1.5)
         if rr < 1.5: return None
 
-    # 7. CHẤM ĐIỂM (SCORE >= 85 MỚI BÁO)
+    # 6. CHẤM ĐIỂM (SCORE >= 85 MỚI BÁO)
     score = 80
     if vol_ratio >= 1.5: score += 5
-    if h4_last['close'] > h4_last['ema89']: score += 5 # H4 Trend Bullish
+    if h4_last['close'] > h4_last['ema89']: score += 5
     if rr >= 2.0: score += 5
-    if oi_change > 1.5: score += 3 # OI tăng hợp lý ủng hộ lực đẩy
-    if body >= 0.7 * candle_range: score += 2 # Thân nến cực kỳ đặc
+    if oi_change > 1.5: score += 3
+    if body >= 0.7 * candle_range: score += 2
     
     score = min(score, 100)
     
@@ -417,8 +406,9 @@ def run_scanner_loop():
                 sym = t['symbol']
                 realtime_price = t['lastPrice']
 
+                # Lấy limit H4 lớn hơn để đảm bảo luôn đủ >= 35 nến cho chỉ báo
                 df_h1 = get_closed_klines_df(sym, "60", limit=60)
-                df_h4 = get_closed_klines_df(sym, "240", limit=40)
+                df_h4 = get_closed_klines_df(sym, "240", limit=60)
                 
                 if not df_h1.empty and not df_h4.empty:
                     df_h1 = add_indicators(df_h1)
@@ -431,7 +421,6 @@ def run_scanner_loop():
                         sig['symbol'] = sym
                         scanned_signals.append(sig)
 
-            # Lọc ưu tiên Score cao nhất
             scanned_signals.sort(key=lambda x: x['score'], reverse=True)
             top_signals = scanned_signals[:MAX_ALERTS_PER_CYCLE]
 

@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit H1 Breakout Momentum & Pullback Engine Active 24/7!"
+    return "Bybit H1 Immediate Breakout & Pullback Engine Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -178,7 +178,7 @@ def get_closed_klines_df(symbol: str, interval: str, limit: int = 100) -> pd.Dat
             raw_list = res["result"]["list"]
             if len(raw_list) < 3: return pd.DataFrame()
             
-            closed_raw = raw_list[1:] # Bỏ qua nến realtime đang chạy, lấy nến ĐÃ ĐÓNG
+            closed_raw = raw_list[1:] # Bỏ qua nến realtime đang chạy
             df = pd.DataFrame(closed_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
             df = df.iloc[::-1].reset_index(drop=True)
             for col in ['open', 'high', 'low', 'close', 'volume']:
@@ -187,21 +187,6 @@ def get_closed_klines_df(symbol: str, interval: str, limit: int = 100) -> pd.Dat
     except Exception:
         pass
     return pd.DataFrame()
-
-def get_open_interest_change(symbol: str, interval: str = "60") -> float:
-    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval}&limit=3"
-    try:
-        res = requests.get(url, timeout=4).json()
-        if res.get("retCode") == 0 and res.get("result", {}).get("list"):
-            oi_list = res["result"]["list"]
-            if len(oi_list) >= 2:
-                curr_oi = safe_float(oi_list[0].get("openInterest", 0))
-                prev_oi = safe_float(oi_list[1].get("openInterest", 0))
-                if prev_oi > 0:
-                    return round(((curr_oi - prev_oi) / prev_oi) * 100, 2)
-    except Exception:
-        pass
-    return 0.0
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 30: return df
@@ -214,9 +199,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 5. ENGINE QUÉT SETUP 1 (BREAKOUT MOMENTUM) & SETUP 2 (PULLBACK MA20)
+# 5. ENGINE QUÉT SETUP 1 (NGAY LẬP TỨC 1 CÂY NẾN XANH CẮT MA20) & SETUP 2 (PULLBACK)
 # ==============================================================================
-def analyze_h1_setups(df_h1: pd.DataFrame, df_h4: pd.DataFrame, oi_change: float) -> dict:
+def analyze_h1_setups(df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> dict:
     if df_h1.empty or len(df_h1) < 40 or df_h4.empty or len(df_h4) < 35: return None
     if 'ema89' not in df_h1.columns or 'ema89' not in df_h4.columns: return None
 
@@ -243,35 +228,18 @@ def analyze_h1_setups(df_h1: pd.DataFrame, df_h4: pd.DataFrame, oi_change: float
     setup_type = None
 
     # ==========================================================================
-    # 🌟 SETUP 1: H1 BREAKOUT MOMENTUM (VÀO LONG NGAY KHI NẾN BREAKOUT ĐÓNG)
+    # 🌟 SETUP 1: CHỈ CẦN 1 CÂY NẾN XANH ĐÓNG QUA MA20 LÀ BÁO LUÔN
     # ==========================================================================
-    # 1. Điều kiện nền: Giá trước breakout nằm dưới/dao động quanh MA20
-    prev_under_klines = df_h1.iloc[-8:-1]
-    under_ma20_count = sum(1 for _, row in prev_under_klines.iterrows() if row['close'] < row['ema20'])
-    
-    # 2. Cây nến breakout đã đóng: Close > MA20, Slope không âm, break swing high gần nhất
-    recent_klines_15 = df_h1.iloc[-16:-1]
-    recent_high = recent_klines_15['high'].max()
-    
-    is_s1_base = (under_ma20_count >= 3)
-    is_s1_breakout = (close_p > ema20_now) and (ema20_now >= ema20_prev) and (close_p > recent_high)
-    
-    # 3. Momentum nến: Body >= 60% range, Close nằm trong 20% gần High, Volume >= 1.2x MA20, râu trên không quá dài
-    upper_shadow = high_p - max(open_p, close_p)
-    is_body_good = (body >= 0.6 * candle_range) if candle_range > 0 else False
-    is_close_near_high = ((high_p - close_p) <= 0.2 * candle_range) if candle_range > 0 else False
-    is_vol_good = vol_ratio >= 1.2
-    is_shadow_ok = upper_shadow <= 0.3 * candle_range if candle_range > 0 else True
-    
-    # Không để giá cách xa MA20 quá mức (tránh đu đỉnh quá đà)
-    dist_from_ema20 = ((close_p - ema20_now) / ema20_now) * 100
-    is_not_too_far = dist_from_ema20 <= 4.0
+    # Nến trước đó đóng dưới MA20, nến hiện tại đóng trên MA20 và là nến xanh có lực
+    is_prev_below = prev_candle['close'] < prev_candle['ema20']
+    is_current_closed_above = (close_p > ema20_now) and (close_p > open_p) # Nến xanh đóng trên MA20
+    is_s1_momentum = (body >= 0.4 * candle_range) and (vol_ratio >= 1.0) # Có lực và volume đạt mức ổn định
 
-    if is_s1_base and is_s1_breakout and is_body_good and is_close_near_high and is_vol_good and is_shadow_ok and is_not_too_far:
+    if is_prev_below and is_current_closed_above and is_s1_momentum:
         setup_type = "SETUP_1_BREAKOUT"
 
     # ==========================================================================
-    # 🌟 SETUP 2: H1 PULLBACK MA20 (GIỮ NGUYÊN ỔN ĐỊNH)
+    # 🌟 SETUP 2: H1 PULLBACK MA20 (GIỮ NGUYÊN)
     # ==========================================================================
     is_h1_uptrend = (close_p > last_candle['ema89']) and (ema20_now > ema20_prev)
     lower_shadow = min(open_p, close_p) - low_p
@@ -288,16 +256,16 @@ def analyze_h1_setups(df_h1: pd.DataFrame, df_h4: pd.DataFrame, oi_change: float
     # ================= QUẢN TRỊ SL & TP THEO CẤU TRÚC THANH KHOẢN =================
     market_entry = close_p
     
-    # SL dựa trên Swing Low hoặc Higher Low gần nhất + buffer nhỏ
+    # SL đặt dưới swing low gần nhất + buffer nhỏ
     recent_swing_low = df_h1['low'].iloc[-12:-1].min()
-    sl = min(recent_swing_low, low_p) * 0.995 # Buffer 0.5% chống quét râu
+    sl = min(recent_swing_low, low_p) * 0.995 
     
     risk_pct = ((market_entry - sl) / market_entry) * 100
     if risk_pct < 0.8:
         sl = market_entry * 0.985
         risk_pct = ((market_entry - sl) / market_entry) * 100
 
-    # Tìm TP1 (vùng liquidity / swing high / resistance H1 gần nhất phía trên)
+    # Tìm TP1 dựa trên vùng kháng cự liquidity phía trên
     historical_highs = df_h1['high'].iloc[-60:-1]
     valid_highs = historical_highs[historical_highs > market_entry]
 
@@ -316,28 +284,15 @@ def analyze_h1_setups(df_h1: pd.DataFrame, df_h4: pd.DataFrame, oi_change: float
         dist_tp1 = ((tp1 - market_entry) / market_entry) * 100
         rr = dist_tp1 / risk_pct
         
-        # Bắt buộc RR tối thiểu >= 1:1.5 (Ưu tiên >= 1:2)
         if rr < 1.5: return None
 
-    # ================= CHẤM ĐIỂM SCORE (100 ĐIỂM) =================
-    score = 75
-    if setup_type == "SETUP_1_BREAKOUT":
-        score += 10
-        if vol_ratio >= 1.5: score += 5
-        if ema20_now > ema20_prev: score += 3
-        if is_body_good: score += 2
-        if oi_change > 1.0: score += 3
-    else:
-        score += 5
-        if vol_ratio >= 1.2: score += 5
-        if rr >= 2.0: score += 5
-
+    # Chấm điểm Score
+    score = 85
+    if setup_type == "SETUP_1_BREAKOUT": score += 5
+    if vol_ratio >= 1.3: score += 5
     if h4_last['close'] > h4_last['ema89']: score += 5
-    if not valid_highs.empty: score += 2
 
     score = min(score, 100)
-    
-    # Chỉ gửi Telegram khi Score >= 85/100
     if score < 85: return None
 
     tag = "🔥 H1 BREAKOUT LONG" if setup_type == "SETUP_1_BREAKOUT" else "🟢 H1 PULLBACK LONG"
@@ -361,7 +316,7 @@ def analyze_h1_setups(df_h1: pd.DataFrame, df_h4: pd.DataFrame, oi_change: float
     }
 
 # ==============================================================================
-# 6. GỬI TELEGRAM ĐỊNH DẠNG CHUẨN YÊU CẦU
+# 6. GỬI TELEGRAM ĐỊNH DẠNG CHUẨN
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
@@ -376,16 +331,14 @@ TP2: <code>{sig['tp2']:.4f}</code>
 RR: 1:{sig['rr']}
 Score: <b>{sig['score']}/100</b>
 
-MA20 Break: ✅
-Swing High Break: ✅
-Momentum: STRONG
+MA20 Break: ✅ (Cây nến đầu tiên đóng qua)
 Volume: {sig['vol_ratio']}x MA20
 MA20 Slope: ↑
 H4 Trend: {sig['trend_h4']}
 Liquidity phía trên: Có ({sig['dist_tp1']}%)
 
 Lý do:
-"Giá tích lũy dưới MA20 → H1 đóng cửa breakout MA20 mạnh → phá swing high → volume xác nhận → momentum tăng → còn liquidity phía trên." """
+"Giá vừa cắt qua MA20 → H1 đóng cửa xác nhận cây nến xanh đầu tiên → volume xác nhận → phía trên còn khoảng trống thanh khoản để chạy." """
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -402,11 +355,11 @@ def run_scanner_loop():
     init_db()
     Thread(target=run_flask, daemon=True).start()
 
-    print("⚡️ Bắt đầu H1 Breakout Momentum & Pullback Engine...", flush=True)
+    print("⚡️ Bắt đầu H1 Immediate Breakout Scanner Engine...", flush=True)
     while True:
         try:
             tickers = get_bybit_crypto_tickers()
-            print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins (Chỉ xét nến H1 đã đóng)...", flush=True)
+            print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins (Xét nến H1 đóng qua MA20)...", flush=True)
 
             scanned_signals = []
             for t in tickers[:MAX_SYMBOLS_SCAN]:
@@ -419,9 +372,7 @@ def run_scanner_loop():
                     df_h1 = add_indicators(df_h1)
                     df_h4 = add_indicators(df_h4)
                     
-                    oi_change = get_open_interest_change(sym, "60")
-                    
-                    sig = analyze_h1_setups(df_h1, df_h4, oi_change)
+                    sig = analyze_h1_setups(df_h1, df_h4)
                     if sig:
                         sig['symbol'] = sym
                         scanned_signals.append(sig)

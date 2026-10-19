@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit H1 Strict Closed-Candle LONG Engine Active 24/7!"
+    return "Bybit H1 Dual-Setup Quality Scanner Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -134,7 +134,7 @@ def save_active_trade(sig: dict):
         conn.commit()
 
 # ==============================================================================
-# 4. LẤY TICKERS & KLINE DATA (CHỈ LẤY NẾN ĐÃ ĐÓNG HOÀN TOÀN)
+# 4. LẤY TICKERS & KLINE DATA (CHỈ XÉT NẾN H1 ĐÃ ĐÓNG HOÀN TOÀN)
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -171,7 +171,6 @@ def get_bybit_crypto_tickers():
     return []
 
 def get_closed_klines_df(symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
-    # limit+1 để cắt bỏ nến đang chạy (realtime), chỉ giữ lại các nến ĐÃ ĐÓNG HOÀN TOÀN
     url = f"{BASE_URL}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit+1}"
     try:
         res = requests.get(url, timeout=5).json()
@@ -179,9 +178,7 @@ def get_closed_klines_df(symbol: str, interval: str, limit: int = 100) -> pd.Dat
             raw_list = res["result"]["list"]
             if len(raw_list) < 3: return pd.DataFrame()
             
-            # RAW_LIST[0] LÀ NẾN ĐANG CHẠY (REALTIME) -> LOẠI BỎ NGAY LẬP TỨC
-            closed_raw = raw_list[1:] 
-            
+            closed_raw = raw_list[1:] # Bỏ qua nến realtime đang chạy
             df = pd.DataFrame(closed_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
             df = df.iloc[::-1].reset_index(drop=True)
             for col in ['open', 'high', 'low', 'close', 'volume']:
@@ -190,21 +187,6 @@ def get_closed_klines_df(symbol: str, interval: str, limit: int = 100) -> pd.Dat
     except Exception:
         pass
     return pd.DataFrame()
-
-def get_open_interest_change(symbol: str, interval: str = "60") -> float:
-    url = f"{BASE_URL}/v5/market/open-interest?category=linear&symbol={symbol}&intervalTime={interval}&limit=3"
-    try:
-        res = requests.get(url, timeout=4).json()
-        if res.get("retCode") == 0 and res.get("result", {}).get("list"):
-            oi_list = res["result"]["list"]
-            if len(oi_list) >= 2:
-                curr_oi = safe_float(oi_list[0].get("openInterest", 0))
-                prev_oi = safe_float(oi_list[1].get("openInterest", 0))
-                if prev_oi > 0:
-                    return round(((curr_oi - prev_oi) / prev_oi) * 100, 2)
-    except Exception:
-        pass
-    return 0.0
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 30: return df
@@ -217,13 +199,12 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 5. ENGINE PHÁT HIỆN SETUP H1 STRICT CLOSED CANDLE LONG (11 TIÊU CHÍ)
+# 5. ENGINE QUÉT 2 SETUP H1 CHẤT LƯỢNG CAO
 # ==============================================================================
-def analyze_h1_strict_closed_long(df_h1: pd.DataFrame, df_h4: pd.DataFrame, oi_change: float) -> dict:
+def analyze_h1_dual_setups(df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> dict:
     if df_h1.empty or len(df_h1) < 40 or df_h4.empty or len(df_h4) < 35: return None
     if 'ema89' not in df_h1.columns or 'ema89' not in df_h4.columns: return None
 
-    # Lấy cây nến H1 MỚI NHẤT ĐÃ ĐÓNG CỬA HOÀN TOÀN
     last_candle = df_h1.iloc[-1]
     prev_candle = df_h1.iloc[-2]
     
@@ -239,47 +220,55 @@ def analyze_h1_strict_closed_long(df_h1: pd.DataFrame, df_h4: pd.DataFrame, oi_c
     ema20_prev = prev_candle['ema20']
     vol_ratio = last_candle['vol_ratio']
 
-    # 1. Giá từng nằm dưới MA20 trong các nến trước đó
-    prev_under_klines = df_h1.iloc[-8:-1]
-    under_ma20_count = sum(1 for _, row in prev_under_klines.iterrows() if row['close'] < row['ema20'])
-    if under_ma20_count < 3: return None
-
-    # 2. H1 đã đóng nến TRÊN MA20
-    if close_p <= ema20_now: return None
-
-    # 3. MA20 có slope dương (hướng lên)
-    if ema20_now <= ema20_prev: return None
-
-    # 4. Break swing high gần nhất
-    recent_klines_15 = df_h1.iloc[-16:-2] # Bỏ qua nến hiện tại
-    recent_high = recent_klines_15['high'].max()
-    if close_p <= recent_high: return None
-
-    # 5. Nến breakout có momentum mạnh (Body tốt, Close sát High, Vol > MA20)
-    is_body_good = (body >= 0.6 * candle_range) if candle_range > 0 else False
-    is_close_near_high = ((high_p - close_p) <= 0.2 * candle_range) if candle_range > 0 else False
-    is_vol_good = vol_ratio > 1.0
-    if not (is_body_good and is_close_near_high and is_vol_good): return None
-
-    # 6. Kiểm tra H1/H4 Trend (H4 không bearish mạnh)
+    # Kiểm tra H4 không bearish mạnh
     h4_last = df_h4.iloc[-1]
     is_h4_bearish_manh = (h4_last['close'] < h4_last['ema89']) and (h4_last['close'] < h4_last['ema20'])
     if is_h4_bearish_manh: return None
 
-    # 7. Kiểm tra khoảng cách đến kháng cự/liquidity phía trên (Tránh mua ngay cản)
-    market_entry = close_p
-    historical_highs = df_h1['high'].iloc[-60:-2]
-    valid_highs = historical_highs[historical_highs > market_entry]
+    setup_type = None
 
-    # 8. Tính SL dưới swing low / Higher Low + buffer
+    # --- SETUP 1: BREAKOUT MOMENTUM (Giá dưới MA20 -> Đóng nến vượt MA20 mạnh mẽ) ---
+    prev_under_klines = df_h1.iloc[-8:-1]
+    under_ma20_count = sum(1 for _, row in prev_under_klines.iterrows() if row['close'] < row['ema20'])
+    
+    is_s1_breakout = (under_ma20_count >= 3) and (close_p > ema20_now) and (ema20_now > ema20_prev)
+    is_s1_momentum = (body >= 0.6 * candle_range) and ((high_p - close_p) <= 0.2 * candle_range) and (vol_ratio > 1.0)
+    
+    if is_s1_breakout and is_s1_momentum:
+        setup_type = "SETUP_1_BREAKOUT"
+
+    # --- SETUP 2: PULLBACK MA20 (Sóng tăng hồi về MA20 + Rút râu giữ trên MA20) ---
+    # Kiểm tra xu hướng H1 trước đó đang tăng (giá nằm trên EMA89 và MA20 dốc lên)
+    is_h1_uptrend = (close_p > last_candle['ema89']) and (ema20_now > ema20_prev)
+    
+    # Kiểm tra nến hiện tại nhúng râu chạm/gần sát MA20 nhưng đóng cửa nằm trên MA20 và rút râu dưới rõ ràng
+    lower_shadow = min(open_p, close_p) - low_p
+    is_touched_ma20 = (low_p <= ema20_now * 1.008) and (close_p >= ema20_now)
+    is_rejection_tail = (lower_shadow >= 0.3 * candle_range) and (close_p > open_p) # Nến xanh rút râu
+    is_s2_vol = vol_ratio >= 0.9
+
+    if not setup_type and is_h1_uptrend and is_touched_ma20 and is_rejection_tail and is_s2_vol:
+        setup_type = "SETUP_2_PULLBACK"
+
+    if not setup_type:
+        return None
+
+    # ================= QUẢN TRỊ SL & TP THEO KỸ THUẬT THANH KHOẢN =================
+    market_entry = close_p
+    
+    # Tìm Swing Low gần nhất để đặt SL
     recent_swing_low = df_h1['low'].iloc[-12:-1].min()
-    sl = recent_swing_low * 0.995 # Buffer 0.5% chống quét râu
+    sl = min(recent_swing_low, low_p) * 0.995 # Buffer 0.5% chống quét râu
+    
     risk_pct = ((market_entry - sl) / market_entry) * 100
     if risk_pct < 1.0:
         sl = market_entry * 0.99
         risk_pct = 1.0
 
-    # 9. Tính TP theo liquidity H1 (Không dùng TP % cố định)
+    # Tìm kháng cự liquidity phía trên làm TP1
+    historical_highs = df_h1['high'].iloc[-60:-2]
+    valid_highs = historical_highs[historical_highs > market_entry]
+
     if valid_highs.empty:
         tp1 = market_entry + (market_entry - sl) * 1.5
         tp2 = market_entry + (market_entry - sl) * 2.5
@@ -295,28 +284,27 @@ def analyze_h1_strict_closed_long(df_h1: pd.DataFrame, df_h4: pd.DataFrame, oi_c
         dist_tp1 = ((tp1 - market_entry) / market_entry) * 100
         rr = dist_tp1 / risk_pct
         
-        # 10. Tính RR → RR thấp (< 1.5) thì loại
+        # Nếu RR quá thấp (< 1.5) thì loại bỏ
         if rr < 1.5: return None
 
-    # 11. Chấm Score → Chỉ gửi Telegram khi đạt ngưỡng >= 85
-    score = 80
+    # Chấm điểm Score (>= 85 mới báo)
+    score = 85
+    if setup_type == "SETUP_1_BREAKOUT": score += 5
     if vol_ratio >= 1.5: score += 5
     if h4_last['close'] > h4_last['ema89']: score += 5
-    if rr >= 2.0: score += 5
-    if oi_change > 1.5: score += 3
-    if body >= 0.7 * candle_range: score += 2
+    if rr >= 2.0: score += 3
     
     score = min(score, 100)
     if score < 85: return None
-    
-    tag = "🔥 STRONG LONG" if score >= 90 else "🟢 LONG"
-    h4_trend = "Bullish ✅" if h4_last['close'] > h4_last['ema89'] else "Neutral ⚠️"
+
+    tag = "🔥 STRONG LONG (BREAKOUT)" if setup_type == "SETUP_1_BREAKOUT" else "🟢 LONG (MA20 PULLBACK)"
+    setup_name = "H1 BREAKOUT MOMENTUM" if setup_type == "SETUP_1_BREAKOUT" else "H1 PULLBACK MA20"
 
     return {
         "timeframe": "H1",
         "tag": tag,
         "status": "LONG",
-        "internal_setup_name": "H1 CLOSED CANDLE QUALITY LONG",
+        "internal_setup_name": setup_name,
         "score": int(score),
         "market_entry": round(market_entry, 4),
         "sl": round(sl, 4),
@@ -325,7 +313,6 @@ def analyze_h1_strict_closed_long(df_h1: pd.DataFrame, df_h4: pd.DataFrame, oi_c
         "rr": round(rr, 2),
         "dist_tp1": round(dist_tp1, 2),
         "vol_ratio": round(vol_ratio, 2),
-        "trend_h4": h4_trend,
         "timestamp": last_candle['timestamp']
     }
 
@@ -337,22 +324,20 @@ def send_telegram_alert(sig: dict) -> bool:
 
     msg = f"""{sig['tag']} — #{sig['symbol']}
 
+<b>Setup:</b> {sig['internal_setup_name']}
 <b>Entry:</b> <code>{sig['market_entry']:.4f}</code>
 <b>SL:</b> <code>{sig['sl']:.4f}</code>
 <b>TP1:</b> <code>{sig['tp1']:.4f}</code>
 <b>TP2:</b> <code>{sig['tp2']:.4f}</code>
 <b>RR:</b> {sig['rr']}
 
-MA20: Break + Confirm ✅ (Nến H1 đã đóng)
-Momentum: Strong ✅ (Body > 60% & Close sát High)
+MA20: Xác nhận nến đóng ✅
 Volume: {sig['vol_ratio']}x
-Trend H1: Bullish ✅
-Trend H4: {sig['trend_h4']}
 Liquidity: Cách đỉnh {sig['dist_tp1']}%
 Score: <b>{sig['score']}/100</b>
 
-💡 <b>Lý do:</b>
-Giá trước đó nằm dưới MA20 → H1 đóng vượt MA20 → xuất hiện lực tăng mạnh → cấu trúc tăng được xác nhận → phía trên còn thanh khoản để chạy."""
+💡 <b>Lý do kích hoạt:</b>
+Thỏa mãn điều kiện dòng tiền bùng nổ hoặc hồi phục giữ vững MA20 với thanh khoản xác nhận, cấu trúc thanh khoản phía trên còn rộng để tiếp diễn đà tăng."""
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -369,17 +354,16 @@ def run_scanner_loop():
     init_db()
     Thread(target=run_flask, daemon=True).start()
 
-    print("⚡️ Bắt đầu H1 Closed-Candle Quality Scanner Engine...", flush=True)
+    print("⚡️ Bắt đầu H1 Dual-Setup Scanner Engine...", flush=True)
     while True:
         try:
             tickers = get_bybit_crypto_tickers()
-            print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins (Chỉ xét nến H1 đã đóng)...", flush=True)
+            print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins (Xét 2 Setup H1)...", flush=True)
 
             scanned_signals = []
             for t in tickers[:MAX_SYMBOLS_SCAN]:
                 sym = t['symbol']
 
-                # Lấy dữ liệu nến ĐÃ ĐÓNG HOÀN TOÀN
                 df_h1 = get_closed_klines_df(sym, "60", limit=60)
                 df_h4 = get_closed_klines_df(sym, "240", limit=60)
                 
@@ -387,9 +371,7 @@ def run_scanner_loop():
                     df_h1 = add_indicators(df_h1)
                     df_h4 = add_indicators(df_h4)
                     
-                    oi_change = get_open_interest_change(sym, "60")
-                    
-                    sig = analyze_h1_strict_closed_long(df_h1, df_h4, oi_change)
+                    sig = analyze_h1_dual_setups(df_h1, df_h4)
                     if sig:
                         sig['symbol'] = sym
                         scanned_signals.append(sig)
@@ -409,7 +391,7 @@ def run_scanner_loop():
                         if send_telegram_alert(sig):
                             save_active_trade(sig)
                             sent_count += 1
-                            print(f"✅ [{sig['tag']}] #{sig['symbol']} | Entry: {sig['market_entry']} | Score: {sig['score']}", flush=True)
+                            print(f"✅ [{sig['tag']}] #{sig['symbol']} | Setup: {sig['internal_setup_name']} | Entry: {sig['market_entry']}", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)

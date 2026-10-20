@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit H4 EMA200 + H1 EMA21 Reversal Scanner Active 24/7!"
+    return "Bybit Dual-Setup (EMA21 Reversal & H4 EMA200 Wick) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -36,7 +36,7 @@ DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 3. SQLITE DATABASE (CHỐNG GỬI TRÙNG KÈO)
+# 3. SQLITE DATABASE (CHỐNG GỬI TRÙNG KÈO ĐỘC LẬP THEO SETUP)
 # ==============================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -60,7 +60,7 @@ def init_db():
                 tp1 REAL NOT NULL,
                 tp2 REAL NOT NULL,
                 status TEXT DEFAULT 'OPEN',
-                setup_name TEXT DEFAULT 'H4_EMA200_H1_EMA21_REVERSAL',
+                setup_name TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             )
         """)
@@ -166,7 +166,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['ema21'] = closes.ewm(span=21, adjust=False).mean()
     df['ema200'] = closes.ewm(span=200, adjust=False).mean()
     
-    # Tính ATR(14) cho bộ lọc giá cách xa EMA21
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
@@ -175,14 +174,14 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 5. NHẬN DIỆN MÔ HÌNH NẾN ĐẢO CHIỀU TĂNG HƠP LỆ (BULLISH CANDLESTICKS)
+# 5. CÁC HÀM PHÂN TÍCH NHẬN DIỆN NẾN VÀ SETUP
 # ==============================================================================
 def check_bullish_reversal_pattern(df_h1: pd.DataFrame) -> tuple:
     if len(df_h1) < 4: return False, "Không đủ dữ liệu nến"
 
-    c1 = df_h1.iloc[-1] # Nến vừa đóng cửa
-    c2 = df_h1.iloc[-2] # Nến trước đó
-    c3 = df_h1.iloc[-3] # Nến 2 bước trước
+    c1 = df_h1.iloc[-1]
+    c2 = df_h1.iloc[-2]
+    c3 = df_h1.iloc[-3]
 
     c1_o, c1_c, c1_h, c1_l = c1['open'], c1['close'], c1['high'], c1['low']
     c1_range = c1_h - c1_l
@@ -206,7 +205,7 @@ def check_bullish_reversal_pattern(df_h1: pd.DataFrame) -> tuple:
     if (c1_lower_shadow >= 2.0 * c1_body) and (c1_upper_shadow <= 0.25 * c1_range) and (c1_c >= (c1_h - 0.3 * c1_range)):
         return True, "Bullish Pin Bar"
 
-    # 4. Morning Star (Mô hình 3 nến)
+    # 4. Morning Star
     c2_body = abs(c2['close'] - c2['open'])
     c3_bear = c3['close'] < c3['open']
     if c3_bear and (c2_body <= 0.3 * (c3['high'] - c3['low'])) and is_c1_bull and (c1_c >= (c3['open'] + c3['close']) / 2):
@@ -214,25 +213,20 @@ def check_bullish_reversal_pattern(df_h1: pd.DataFrame) -> tuple:
 
     return False, "Không có mô hình nến đảo chiều tăng hợp lệ"
 
-# ==============================================================================
-# 6. ENGINE PHÁT HIỆN SETUP DUY NHẤT: H4 EMA200 + H1 EMA21 REVERSAL
-# ==============================================================================
-def analyze_single_setup(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tuple:
+# --- SETUP 1: H4 EMA200 + H1 EMA21 REVERSAL ---
+def analyze_setup_1(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tuple:
     if df_h1.empty or len(df_h1) < 200 or df_h4.empty or len(df_h4) < 200:
-        return None, "Thiếu dữ liệu nến H1 hoặc H4 (<200 nến)"
+        return None, "Thiếu dữ liệu nến H1/H4"
 
     last_h1 = df_h1.iloc[-1]
     last_h4 = df_h4.iloc[-1]
 
-    # 1. Điều kiện xu hướng H4: Nến H4 đóng NẰM TRÊN EMA200 H4
     if last_h4['close'] <= last_h4['ema200']:
-        return None, f"H4 Close ({last_h4['close']}) nằm dưới EMA200 H4 ({last_h4['ema200']:.4f})"
+        return None, f"H4 Close <= EMA200 H4"
 
-    # 2. Điều kiện vị trí giá H1: Nến H1 đóng NẰM TRÊN EMA21 H1
     if last_h1['close'] <= last_h1['ema21']:
-        return None, f"H1 Close ({last_h1['close']}) nằm dưới EMA21 H1 ({last_h1['ema21']:.4f})"
+        return None, f"H1 Close <= EMA21 H1"
 
-    # Lọc giá chưa tăng quá xa EMA21 (Cách EMA21 <= 1.5% HOẶC <= 1.5 * ATR14)
     dist_pct = ((last_h1['close'] - last_h1['ema21']) / last_h1['ema21']) * 100
     atr_limit = (1.5 * last_h1['atr14'] / last_h1['close']) * 100 if last_h1['atr14'] > 0 else 1.5
     max_dist_allowed = max(1.5, atr_limit)
@@ -240,21 +234,16 @@ def analyze_single_setup(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) 
     if dist_pct > max_dist_allowed:
         return None, f"Giá đã tăng quá xa EMA21 ({dist_pct:.2f}% > {max_dist_allowed:.2f}%)"
 
-    # Lọc giá phải vừa chạm/hồi về gần EMA21 trong 1-5 nến vừa qua
     recent_klines = df_h1.iloc[-6:-1]
     touched_ema21 = any(row['low'] <= row['ema21'] * 1.008 for _, row in recent_klines.iterrows())
     if not touched_ema21:
-        return None, "Chưa có nhịp hồi gần/chạm EMA21 H1 trước đó"
+        return None, "Chưa có nhịp hồi gần/chạm EMA21 H1"
 
-    # 3. Điều kiện Mô hình Nến đảo chiều tăng hợp lệ
     has_pattern, pattern_name = check_bullish_reversal_pattern(df_h1)
     if not has_pattern:
         return None, pattern_name
 
-    # 4. XÁC ĐỊNH ENTRY, STOP LOSS VÀ TAKE PROFIT KỸ THUẬT
     entry = last_h1['close']
-    
-    # SL đặt dưới đáy nhịp hồi gần nhất hoặc đáy nến xác nhận + buffer 0.3%
     pullback_low = min(df_h1['low'].iloc[-6:-1].min(), last_h1['low'])
     sl = pullback_low * 0.997
     
@@ -263,7 +252,6 @@ def analyze_single_setup(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) 
         sl = entry * 0.985
         risk_pct = ((entry - sl) / entry) * 100
 
-    # TP dựa trên kháng cự / swing high gần nhất phía trên
     historical_highs = df_h1['high'].iloc[-60:-1]
     valid_highs = historical_highs[historical_highs > entry]
 
@@ -278,14 +266,13 @@ def analyze_single_setup(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) 
         tp2 = higher_highs.max() if not higher_highs.empty else tp1 + (tp1 - entry)
         rr = ((tp1 - entry) / entry) * 100 / risk_pct
 
-    # Lọc tỷ lệ Risk:Reward tối thiểu >= 1:1.5
     if rr < 1.5:
-        return None, f"Tỷ lệ R:R quá thấp / Kháng cự quá gần (RR: {rr:.2f} < 1.5)"
+        return None, f"R:R quá thấp ({rr:.2f} < 1.5)"
 
     return {
         "symbol": symbol,
         "internal_setup_name": "H4_EMA200_H1_EMA21_REVERSAL",
-        "tag": "🎯 H4 EMA200 + H1 EMA21 REVERSAL LONG",
+        "tag": "🎯 SETUP 1: H4 EMA200 + H1 EMA21 REVERSAL LONG",
         "pattern_name": pattern_name,
         "candle_ts": int(last_h1['timestamp']),
         "market_entry": round(entry, 4),
@@ -294,17 +281,141 @@ def analyze_single_setup(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) 
         "tp2": round(tp2, 4),
         "rr": round(rr, 2),
         "dist_pct": round(dist_pct, 2)
-    }, f"ĐẠT TÍN HIỆU ({pattern_name})"
+    }, f"ĐẠT TÍN HIỆU SETUP 1 ({pattern_name})"
+
+
+# --- SETUP 2 (MỚI): H4 EMA200 WICK REVERSAL LONG ---
+def analyze_setup_2(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tuple:
+    if df_h1.empty or len(df_h1) < 200 or df_h4.empty or len(df_h4) < 200:
+        return None, "Thiếu dữ liệu nến H1/H4"
+
+    last_h4 = df_h4.iloc[-1]
+    prev_h4 = df_h4.iloc[-2]
+    last_h1 = df_h1.iloc[-1]
+    prev_h1 = df_h1.iloc[-2]
+
+    # 1. Nến H4 đã đóng có Close > EMA200 H4
+    h4_o, h4_c, h4_h, h4_l = last_h4['open'], last_h4['close'], last_h4['high'], last_h4['low']
+    h4_ema200 = last_h4['ema200']
+    
+    if h4_c <= h4_ema200:
+        return None, f"H4 Close ({h4_c}) nằm dưới EMA200 H4 ({h4_ema200:.4f})"
+
+    # 2. H4 Low chạm/tiến gần EMA200 H4 (Sai lệch 0.5 - 1.0%)
+    dist_low_ema200_pct = abs(h4_l - h4_ema200) / h4_ema200 * 100
+    if dist_low_ema200_pct > 1.0:
+        return None, f"H4 Low chưa tiến sát EMA200 (Khoảng cách {dist_low_ema200_pct:.2f}% > 1.0%)"
+
+    # 3. Cấu trúc râu H4: Râu dưới >= 2x Thân nến, Close nằm trong 25% trên của nến
+    h4_range = h4_h - h4_l
+    if h4_range == 0: return None, "Nến H4 không có biên độ"
+
+    h4_body = abs(h4_c - h4_o)
+    h4_lower_shadow = min(h4_o, h4_c) - h4_l
+
+    shadow_ratio = h4_lower_shadow / h4_body if h4_body > 0 else 999.0
+    if shadow_ratio < 2.0:
+        return None, f"Râu dưới H4 chưa đủ dài (Tỷ lệ Râu/Thân: {shadow_ratio:.2f}x < 2.0x)"
+
+    is_close_top25 = h4_c >= (h4_l + 0.75 * h4_range)
+    if not is_close_top25:
+        return None, "Close H4 không nằm trong 25% phía trên của nến"
+
+    # 4. Slope EMA200 H4 không dốc xuống mạnh
+    ema200_slope = (h4_ema200 - prev_h4['ema200']) / prev_h4['ema200'] * 100
+    if ema200_slope < -0.15:
+        return None, f"EMA200 H4 đang dốc xuống mạnh ({ema200_slope:.3f}%)"
+
+    # 5. H1 xác nhận sau H4 rút chân: Nến H1 đóng xanh HOẶC Break đỉnh nến tín hiệu / Engulfing
+    h1_confirm = False
+    confirm_reason = ""
+    
+    is_h1_green = last_h1['close'] > last_h1['open']
+    is_engulfing = (last_h1['close'] > last_h1['open']) and (prev_h1['close'] < prev_h1['open']) and (last_h1['close'] > prev_h1['open'])
+    is_break_wick_high = last_h1['close'] > h4_h
+
+    if is_break_wick_high:
+        h1_confirm = True
+        confirm_reason = "H1 Breakout vượt đỉnh nến rút râu H4"
+    elif is_engulfing:
+        h1_confirm = True
+        confirm_reason = "H1 xuất hiện Bullish Engulfing"
+    elif is_h1_green and (last_h1['close'] > prev_h1['high']):
+        h1_confirm = True
+        confirm_reason = "H1 đóng nến xanh phá vỡ đỉnh nến H1 trước"
+
+    if not h1_confirm:
+        return None, "Chưa có H1 nến xanh / Bullish Engulfing / Breakout xác nhận"
+
+    # 6. Entry, SL và TP cho SETUP 2
+    entry = last_h1['close']
+    
+    # SL đặt dưới đáy râu H4 + buffer 0.3%
+    sl = h4_l * 0.997
+    risk_pct = ((entry - sl) / entry) * 100
+
+    if risk_pct < 0.8:
+        sl = entry * 0.985
+        risk_pct = ((entry - sl) / entry) * 100
+
+    historical_highs = df_h1['high'].iloc[-60:-1]
+    valid_highs = historical_highs[historical_highs > entry]
+
+    if valid_highs.empty:
+        tp1 = entry + (entry - sl) * 1.5
+        tp2 = entry + (entry - sl) * 2.5
+        rr = 1.5
+    else:
+        tp1_idx = valid_highs.iloc[::-1].idxmax()
+        tp1 = df_h1['high'].loc[tp1_idx]
+        higher_highs = historical_highs[historical_highs > tp1]
+        tp2 = higher_highs.max() if not higher_highs.empty else tp1 + (tp1 - entry)
+        rr = ((tp1 - entry) / entry) * 100 / risk_pct
+
+    if rr < 1.5:
+        return None, f"R:R Setup 2 quá thấp ({rr:.2f} < 1.5)"
+
+    return {
+        "symbol": symbol,
+        "internal_setup_name": "H4_EMA200_WICK_REVERSAL",
+        "tag": "🔥 SETUP 2: H4 EMA200 WICK REVERSAL LONG",
+        "confirm_reason": confirm_reason,
+        "shadow_ratio": round(shadow_ratio, 2),
+        "dist_low_ema200": round(dist_low_ema200_pct, 2),
+        "candle_ts": int(last_h1['timestamp']),
+        "market_entry": round(entry, 4),
+        "sl": round(sl, 4),
+        "tp1": round(tp1, 4),
+        "tp2": round(tp2, 4),
+        "rr": round(rr, 2)
+    }, f"ĐẠT TÍN HIỆU SETUP 2 ({confirm_reason})"
 
 # ==============================================================================
-# 7. GỬI CẢNH BÁO TELEGRAM
+# 6. GỬI CẢNH BÁO TELEGRAM
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
         print("[TELEGRAM ERROR] Chưa cấu hình BOT_TOKEN hoặc CHAT_ID", flush=True)
         return False
 
-    msg = f"""{sig['tag']}
+    if sig['internal_setup_name'] == "H4_EMA200_WICK_REVERSAL":
+        msg = f"""{sig['tag']}
+
+Symbol: #{sig['symbol']}
+Entry: <code>{sig['market_entry']:.4f}</code>
+SL: <code>{sig['sl']:.4f}</code>
+TP1: <code>{sig['tp1']:.4f}</code>
+TP2: <code>{sig['tp2']:.4f}</code>
+RR: 1:{sig['rr']}
+
+Cấu trúc H4 Wick Reversal:
+- H4 Low cách EMA200: {sig['dist_low_ema200']}% ✅
+- Tỷ lệ Râu/Thân H4: {sig['shadow_ratio']}x (Close Top 25%) ✅
+- H1 Xác nhận: {sig['confirm_reason']} ✅
+
+💡 Lý do: Nến H4 rút râu dưới cực mạnh tại EMA200 H4, H1 xuất hiện nến xanh xác nhận đà đảo chiều tăng, tỷ lệ R:R đạt chuẩn."""
+    else:
+        msg = f"""{sig['tag']}
 
 Symbol: #{sig['symbol']}
 Mô hình nến: <b>{sig['pattern_name']}</b>
@@ -331,27 +442,22 @@ Cấu trúc kỹ thuật:
         return False
 
 # ==============================================================================
-# 8. VÒNG LẶP SCANNER TOÀN DIỆN VÀ THỐNG KÊ LOG
+# 7. VÒNG LẶP SCANNER TOÀN DIỆN VÀ THỐNG KÊ LOG
 # ==============================================================================
 def run_scanner_loop():
     init_db()
     Thread(target=run_flask, daemon=True).start()
 
-    print("⚡️ Bắt đầu H4 EMA200 + H1 EMA21 Reversal Scanner Engine...", flush=True)
+    print("⚡️ Bắt đầu Bybit Dual-Setup (EMA21 Reversal & H4 EMA200 Wick) Scanner...", flush=True)
     while True:
         try:
             tickers = get_bybit_crypto_tickers()
             
-            # Khởi tạo các biến đếm thống kê cho từng vòng quét
-            stat_total_data = 0
-            stat_pass_h4_ema200 = 0
-            stat_pass_h1_ema21 = 0
-            stat_pass_pattern = 0
-            stat_pass_rr = 0
-            stat_sent_success = 0
-            stat_sent_fail = 0
+            # Khởi tạo đếm thống kê riêng cho từng Setup
+            s1_data = s1_h4_pass = s1_h1_pass = s1_pattern = s1_rr = s1_sent = 0
+            s2_data = s2_h4_pass = s2_wick_pass = s2_h1_pass = s2_rr = s2_sent = 0
 
-            print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins (Duy nhất 1 Setup mới)...", flush=True)
+            print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins (2 Setup độc lập)...", flush=True)
 
             for t in tickers[:MAX_SYMBOLS_SCAN]:
                 sym = t['symbol']
@@ -362,55 +468,43 @@ def run_scanner_loop():
                 if df_h1.empty or df_h4.empty or len(df_h1) < 200 or len(df_h4) < 200:
                     continue
                 
-                stat_total_data += 1
                 df_h1 = add_indicators(df_h1)
                 df_h4 = add_indicators(df_h4)
 
-                # Kiểm tra từng phễu điều kiện để thống kê
-                if df_h4.iloc[-1]['close'] > df_h4.iloc[-1]['ema200']:
-                    stat_pass_h4_ema200 += 1
-                    
-                    if df_h1.iloc[-1]['close'] > df_h1.iloc[-1]['ema21']:
-                        stat_pass_h1_ema21 += 1
-                        
-                        has_pat, pat_name = check_bullish_reversal_pattern(df_h1)
-                        if has_pat:
-                            stat_pass_pattern += 1
-
-                # Chạy phân tích full setup
-                sig, reason = analyze_single_setup(sym, df_h1, df_h4)
-                
-                if sig:
-                    stat_pass_rr += 1
-                    
-                    # Kiểm tra giới hạn số lệnh đang mở
-                    if get_active_trades_count() >= MAX_ACTIVE_TRADES and not is_symbol_currently_active(sym):
-                        print(f"[{sym}] [BỎ QUA] Vượt quá giới hạn active trades ({MAX_ACTIVE_TRADES})", flush=True)
-                        continue
-
-                    # Chống gửi trùng theo symbol + setup + timestamp nến H1
-                    if not is_signal_already_sent(sym, sig['internal_setup_name'], sig['candle_ts']):
-                        if send_telegram_alert(sig):
-                            record_sent_signal(sym, sig['internal_setup_name'], sig['candle_ts'])
-                            save_active_trade(sig)
-                            stat_sent_success += 1
-                            print(f"✅ [GỬI TELEGRAM] #{sym} | Mô hình: {sig['pattern_name']} | Entry: {sig['market_entry']}", flush=True)
-                        else:
-                            stat_sent_fail += 1
-                    else:
-                        print(f"[{sym}] [TRÙNG LẶP] Tín hiệu đã gửi trước đó cho nến H1 này.", flush=True)
+                # --- ĐÁNH GIÁ SETUP 1 ---
+                s1_data += 1
+                sig1, reason1 = analyze_setup_1(sym, df_h1, df_h4)
+                if sig1:
+                    s1_rr += 1
+                    if get_active_trades_count() < MAX_ACTIVE_TRADES or is_symbol_currently_active(sym):
+                        if not is_signal_already_sent(sym, sig1['internal_setup_name'], sig1['candle_ts']):
+                            if send_telegram_alert(sig1):
+                                record_sent_signal(sym, sig1['internal_setup_name'], sig1['candle_ts'])
+                                save_active_trade(sig1)
+                                s1_sent += 1
+                                print(f"✅ [SETUP 1 SENT] #{sym} | {sig1['pattern_name']}", flush=True)
                 else:
-                    print(f"[{sym}] [LOẠI] {reason}", flush=True)
+                    print(f"[{sym}] [SETUP 1 REJECT] {reason1}", flush=True)
 
-            # In báo cáo thống kê đầy đủ sau mỗi vòng quét
-            print(f"\n📊 --- BÁO CÁO THỐNG KÊ VÒNG QUÉT ---", flush=True)
-            print(f"• Số coin đủ dữ liệu (>=200 nến): {stat_total_data}", flush=True)
-            print(f"• Đạt điều kiện H4 Close > EMA200: {stat_pass_h4_ema200}", flush=True)
-            print(f"• Đạt điều kiện H1 Close > EMA21:  {stat_pass_h1_ema21}", flush=True)
-            print(f"• Có mô hình nến đảo chiều tăng:  {stat_pass_pattern}", flush=True)
-            print(f"• Đạt bộ lọc R:R >= 1:1.5 (Full):   {stat_pass_rr}", flush=True)
-            print(f"• Gửi Telegram thành công:       {stat_sent_success}", flush=True)
-            print(f"• Gửi Telegram thất bại:         {stat_sent_fail}", flush=True)
+                # --- ĐÁNH GIÁ SETUP 2 (MỚI) ---
+                s2_data += 1
+                sig2, reason2 = analyze_setup_2(sym, df_h1, df_h4)
+                if sig2:
+                    s2_rr += 1
+                    if get_active_trades_count() < MAX_ACTIVE_TRADES or is_symbol_currently_active(sym):
+                        if not is_signal_already_sent(sym, sig2['internal_setup_name'], sig2['candle_ts']):
+                            if send_telegram_alert(sig2):
+                                record_sent_signal(sym, sig2['internal_setup_name'], sig2['candle_ts'])
+                                save_active_trade(sig2)
+                                s2_sent += 1
+                                print(f"✅ [SETUP 2 SENT] #{sym} | {sig2['confirm_reason']}", flush=True)
+                else:
+                    print(f"[{sym}] [SETUP 2 REJECT] {reason2}", flush=True)
+
+            # --- IN BÁO CÁO THỐNG KÊ LOG ---
+            print(f"\n📊 --- BÁO CÁO VÒNG QUÉT SCANNER ---", flush=True)
+            print(f"• SETUP 1 (H1 EMA21 Reversal): Quét {s1_data} coin | Đạt R:R: {s1_rr} | Gửi Tele: {s1_sent}", flush=True)
+            print(f"• SETUP 2 (H4 EMA200 Wick)    : Quét {s2_data} coin | Đạt R:R: {s2_rr} | Gửi Tele: {s2_sent}", flush=True)
             print(f"-----------------------------------------\n", flush=True)
 
         except Exception as e:

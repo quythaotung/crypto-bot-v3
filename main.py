@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Dual-Setup (EMA21 1-3% Range & Pure H4 Wick) Active 24/7!"
+    return "Bybit Dual-Setup (EMA21 & EMA200 1-3% Range) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -150,7 +150,7 @@ def get_closed_klines_df(symbol: str, interval: str, limit: int = 250) -> pd.Dat
             raw_list = res["result"]["list"]
             if len(raw_list) < 3: return pd.DataFrame()
             
-            closed_raw = raw_list[1:] # Bỏ nến realtime đang chạy [0]
+            closed_raw = raw_list[1:] # Bỏ nến realtime [0]
             df = pd.DataFrame(closed_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
             df = df.iloc[::-1].reset_index(drop=True)
             for col in ['open', 'high', 'low', 'close', 'volume', 'timestamp']:
@@ -174,7 +174,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 5. CÁC HÀM PHÂN TÍCH SETUP 1 (KHOẢNG CÁCH 1-3% EMA21) & SETUP 2
+# 5. CÁC HÀM PHÂN TÍCH SETUP 1 & SETUP 2 (RANGE KHOẢNG CÁCH 1% - 3%)
 # ==============================================================================
 def check_bullish_reversal_pattern(df_h1: pd.DataFrame) -> tuple:
     if len(df_h1) < 4: return False, "Không đủ dữ liệu nến"
@@ -213,7 +213,7 @@ def check_bullish_reversal_pattern(df_h1: pd.DataFrame) -> tuple:
 
     return False, "Không có mô hình nến đảo chiều tăng hợp lệ"
 
-# --- SETUP 1: H4 EMA200 + H1 EMA21 REVERSAL (ĐIỀU CHỈNH KHOẢNG CÁCH 1-3%) ---
+# --- SETUP 1: H4 EMA200 + H1 EMA21 REVERSAL (KHOẢNG CÁCH 1% - 3%) ---
 def analyze_setup_1(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tuple:
     if df_h1.empty or len(df_h1) < 200 or df_h4.empty or len(df_h4) < 200:
         return None, "Thiếu dữ liệu nến H1/H4"
@@ -227,13 +227,13 @@ def analyze_setup_1(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tu
     if last_h1['close'] <= last_h1['ema21']:
         return None, "H1 Close <= EMA21 H1"
 
-    # KIỂM TRA KHOẢNG CÁCH GIÁ ĐẾN EMA21 H1 TỪ 1% ĐẾN 3%
+    # KIỂM TRA KHOẢNG CÁCH GIÁ ĐẾN EMA21 H1 TRONG KHOẢNG 1.0% ĐẾN 3.0%
     dist_pct = ((last_h1['close'] - last_h1['ema21']) / last_h1['ema21']) * 100
 
     if dist_pct < 1.0:
-        return None, f"Giá sát EMA21 quá ({dist_pct:.2f}% < 1.0%)"
+        return None, f"Giá quá sát EMA21 H1 ({dist_pct:.2f}% < 1.0%)"
     if dist_pct > 3.0:
-        return None, f"Giá đã tăng quá xa EMA21 ({dist_pct:.2f}% > 3.0%)"
+        return None, f"Giá vượt ngưỡng 3% EMA21 H1 ({dist_pct:.2f}% > 3.0%)"
 
     recent_klines = df_h1.iloc[-6:-1]
     touched_ema21 = any(row['low'] <= row['ema21'] * 1.008 for _, row in recent_klines.iterrows())
@@ -285,7 +285,7 @@ def analyze_setup_1(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tu
     }, f"ĐẠT TÍN HIỆU SETUP 1 ({pattern_name} - Cách EMA21 {dist_pct:.2f}%)"
 
 
-# --- SETUP 2: CHỈ SỬ DỤNG DỮ LIỆU KHUNG H4 THUẦN TÚY ---
+# --- SETUP 2 (SỬA ĐỔI): H4 EMA200 WICK (KHOẢNG CÁCH NỐI RỘNG NẾN H4 0.5% - 3.0%) ---
 def analyze_setup_2_pure_h4(symbol: str, df_h4: pd.DataFrame) -> tuple:
     if df_h4.empty or len(df_h4) < 200:
         return None, "Thiếu dữ liệu nến H4 (<200 nến)"
@@ -300,9 +300,13 @@ def analyze_setup_2_pure_h4(symbol: str, df_h4: pd.DataFrame) -> tuple:
     if h4_c <= h4_ema200:
         return None, f"H4 Close ({h4_c}) <= EMA200 H4 ({h4_ema200:.4f})"
 
+    # KHOẢNG CÁCH NẾN H4 THẤP NHẤT (LOW) ĐẾN EMA200 TỪ 0.5% ĐẾN 3.0%
     dist_low_ema200_pct = abs(h4_l - h4_ema200) / h4_ema200 * 100
-    if dist_low_ema200_pct > 1.0:
-        return None, f"H4 Low chưa tiến sát EMA200 (Khoảng cách {dist_low_ema200_pct:.2f}% > 1.0%)"
+
+    if dist_low_ema200_pct < 0.2:
+        return None, f"H4 Low quá sát EMA200 ({dist_low_ema200_pct:.2f}% < 0.2%)"
+    if dist_low_ema200_pct > 3.0:
+        return None, f"H4 Low cách xa EMA200 vượt ngưỡng 3.0% ({dist_low_ema200_pct:.2f}% > 3.0%)"
 
     h4_range = h4_h - h4_l
     if h4_range == 0: return None, "Nến H4 không có biên độ"
@@ -361,7 +365,7 @@ def analyze_setup_2_pure_h4(symbol: str, df_h4: pd.DataFrame) -> tuple:
         "tp1": round(tp1, 4),
         "tp2": round(tp2, 4),
         "rr": round(rr, 2)
-    }, f"ĐẠT TÍN HIỆU SETUP 2 (Entry ngay Close H4: {entry})"
+    }, f"ĐẠT TÍN HIỆU SETUP 2 (Close H4: {entry} - Cách EMA200 {dist_low_ema200_pct:.2f}%)"
 
 # ==============================================================================
 # 6. GỬI CẢNH BÁO TELEGRAM
@@ -383,11 +387,11 @@ RR: 1:{sig['rr']}
 
 Thống kê chỉ số H4:
 - EMA200 H4: <code>{sig['h4_ema200']}</code>
-- Khoảng cách Low đến EMA200: {sig['dist_low_ema200']}% ✅
+- Khoảng cách Low đến EMA200: {sig['dist_low_ema200']}% ✅ (Trong vùng 0.5% - 3.0%)
 - Tỷ lệ Râu/Thân H4: {sig['shadow_ratio']}x ✅
 - Vị trí đóng cửa H4: Top {sig['close_pos_pct']}% biên độ ✅
 
-💡 Lý do: Nến H4 rút râu dưới cực mạnh ngay sát EMA200 H4. Đã phát tín hiệu LONG ngay khi nến H4 đóng cửa hoàn toàn, R:R đạt chuẩn."""
+💡 Lý do: Nến H4 rút râu dưới mạnh trong khoảng cách 1-3% so với EMA200 H4. Đã phát tín hiệu LONG ngay khi nến H4 đóng cửa hoàn toàn."""
     else:
         msg = f"""{sig['tag']}
 
@@ -401,7 +405,7 @@ RR: 1:{sig['rr']}
 
 Cấu trúc kỹ thuật:
 - H4 Trend: Close > EMA200 H4 ✅
-- H1 Position: Close > EMA21 H1 (Cách {sig['dist_pct']}%) ✅
+- H1 Position: Close > EMA21 H1 (Cách {sig['dist_pct']}%) ✅ (Trong vùng 1% - 3%)
 - Nến H1 xác nhận: {sig['pattern_name']} ✅
 
 💡 Lý do: Giá H4 thuộc xu hướng tăng trên EMA200, H1 hồi về EMA21 xuất hiện nến đảo chiều tăng hợp lệ, R:R đạt tiêu chuẩn."""
@@ -422,7 +426,7 @@ def run_scanner_loop():
     init_db()
     Thread(target=run_flask, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit Scanner (Setup 1: EMA21 1-3% Range & Setup 2: Pure H4 Wick)...", flush=True)
+    print("⚡️ Bắt đầu Bybit Scanner (Setup 1 & Setup 2: Biên độ khoảng cách 1-3%)...", flush=True)
     while True:
         try:
             tickers = get_bybit_crypto_tickers()
@@ -444,7 +448,7 @@ def run_scanner_loop():
                 df_h1 = add_indicators(df_h1)
                 df_h4 = add_indicators(df_h4)
 
-                # --- ĐÁNH GIÁ SETUP 1 (H4 EMA200 + H1 EMA21 1-3% RANGE) ---
+                # --- ĐÁNH GIÁ SETUP 1 (EMA21 1-3% RANGE) ---
                 s1_data += 1
                 sig1, reason1 = analyze_setup_1(sym, df_h1, df_h4)
                 if sig1:
@@ -459,7 +463,7 @@ def run_scanner_loop():
                 else:
                     print(f"[{sym}] [SETUP 1 REJECT] {reason1}", flush=True)
 
-                # --- ĐÁNH GIÁ SETUP 2 (PURE H4 WICK) ---
+                # --- ĐÁNH GIÁ SETUP 2 (EMA200 0.5-3.0% RANGE) ---
                 s2_data += 1
                 sig2, reason2 = analyze_setup_2_pure_h4(sym, df_h4)
                 if sig2:
@@ -470,14 +474,14 @@ def run_scanner_loop():
                                 record_sent_signal(sym, sig2['internal_setup_name'], sig2['candle_ts'])
                                 save_active_trade(sig2)
                                 s2_sent += 1
-                                print(f"✅ [SETUP 2 SENT] #{sym} | Entry Close H4: {sig2['market_entry']}", flush=True)
+                                print(f"✅ [SETUP 2 SENT] #{sym} | Close H4: {sig2['market_entry']} | Cách EMA200: {sig2['dist_low_ema200']}%", flush=True)
                 else:
                     print(f"[{sym}] [SETUP 2 REJECT] {reason2}", flush=True)
 
             # --- IN BÁO CÁO THỐNG KÊ LOG ---
             print(f"\n📊 --- BÁO CÁO VÒNG QUÉT SCANNER ---", flush=True)
             print(f"• SETUP 1 (EMA21 1-3% Range) : Quét {s1_data} coin | Đạt R:R: {s1_rr} | Gửi Tele: {s1_sent}", flush=True)
-            print(f"• SETUP 2 (Pure H4 Wick)     : Quét {s2_data} coin | Đạt R:R: {s2_rr} | Gửi Tele: {s2_sent}", flush=True)
+            print(f"• SETUP 2 (EMA200 1-3% Range): Quét {s2_data} coin | Đạt R:R: {s2_rr} | Gửi Tele: {s2_sent}", flush=True)
             print(f"-----------------------------------------\n", flush=True)
 
         except Exception as e:

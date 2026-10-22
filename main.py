@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Multi-Setup LONG Scanner (Extended Reversal Patterns) Active 24/7!"
+    return "Bybit Multi-Setup LONG Scanner (Anti-Dump Filter Active) 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -30,6 +30,9 @@ MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))
 MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.25"))
 MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "150"))
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
+
+# BỘ LỌC CHỐNG HỨNG DAO RƠI (ANTI-DUMP)
+MAX_DROP_24H_PCT = -10.0  # Loại coin giảm sâu hơn -10% trong 24h (xả tin tức/unlock)
 
 MAX_ACTIVE_TRADES = 5
 DB_PATH = "signals_history.db"
@@ -108,7 +111,7 @@ def save_active_trade(sig: dict):
         conn.commit()
 
 # ==============================================================================
-# 4. LẤY TICKERS BYBIT & KLINE DATA (CHỈ XÉT NẾN ĐÃ ĐÓNG HOÀN TOÀN)
+# 4. LẤY TICKERS BYBIT & KLINE DATA (CÓ LỌC CHỐNG DUMP 24H)
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -130,12 +133,14 @@ def get_bybit_crypto_tickers():
                 turnover = safe_float(t.get("turnover24h", 0))
                 bid = safe_float(t.get("bid1Price", 0))
                 ask = safe_float(t.get("ask1Price", 0))
+                price_change_pct = safe_float(t.get("price24hPcnt", 0)) * 100.0
                 spread_pct = ((ask - bid) / bid * 100) if (bid > 0 and ask > 0) else 0.0
 
                 if sym.endswith("USDT") and not sym.startswith(("USDC", "BUSD", "DAI", "EUR")):
                     base_coin = sym.replace("USDT", "")
-                    if base_coin not in non_crypto_exact and turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT:
-                        valid.append({"symbol": sym, "turnover24h": turnover})
+                    # LỌC ANTI-DUMP: Bỏ qua coin giảm quá -10% trong 24h
+                    if base_coin not in non_crypto_exact and turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT and price_change_pct >= MAX_DROP_24H_PCT:
+                        valid.append({"symbol": sym, "turnover24h": turnover, "priceChange24h": price_change_pct})
 
             return sorted(valid, key=lambda x: x["turnover24h"], reverse=True)
     except Exception as e:
@@ -174,7 +179,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==============================================================================
-# 5. CÁC HÀM PHÂN TÍCH NHẬN DIỆN SETUP & MỞ RỘNG MÔ HÌNH NẾN SETUP 1
+# 5. CÁC HÀM PHÂN TÍCH NHẬN DIỆN SETUP & SIẾT CHẶT MÔ HÌNH NẾN
 # ==============================================================================
 def check_extended_bullish_reversal_patterns(df_h1: pd.DataFrame) -> tuple:
     if len(df_h1) < 4: return False, "Không đủ dữ liệu nến H1"
@@ -191,6 +196,9 @@ def check_extended_bullish_reversal_patterns(df_h1: pd.DataFrame) -> tuple:
     c1_body = abs(c1_c - c1_o)
     c1_lower_shadow = min(c1_o, c1_c) - c1_l
     c1_upper_shadow = c1_h - max(c1_o, c1_c)
+
+    c2_range = c2_h - c2_l
+    c2_body = abs(c2_c - c2_o)
 
     if c1_range == 0 or c1_body <= 0.03 * c1_range:
         return False, "Nến Doji hẹp / không có biên độ"
@@ -210,38 +218,39 @@ def check_extended_bullish_reversal_patterns(df_h1: pd.DataFrame) -> tuple:
         return True, "Bullish Pin Bar"
 
     # 4. Morning Star
-    c2_body = abs(c2_c - c2_o)
+    c2_b_len = abs(c2_c - c2_o)
     c3_bear = c3_c < c3_o
-    if c3_bear and (c2_body <= 0.3 * (c3_h - c3_l)) and is_c1_bull and (c1_c >= (c3_o + c3_c) / 2):
+    if c3_bear and (c2_b_len <= 0.3 * (c3_h - c3_l)) and is_c1_bull and (c1_c >= (c3_o + c3_c) / 2):
         return True, "Morning Star"
 
-    # 5. [BỔ SUNG] Piercing Line (Nến xuyên thấu)
-    # Nến 2 giảm rõ ràng, Nến 1 mở cửa dưới/bằng giá thấp nhất hoặc Close nến 2, đóng cửa vượt quá 50% thân nến 2
+    # 5. Piercing Line (Nến xuyên thấu)
     c2_midpoint = (c2_o + c2_c) / 2.0
     if is_c2_bear and is_c1_bull and (c1_o <= c2_c * 1.002) and (c1_c > c2_midpoint) and (c1_c < c2_o):
         return True, "Piercing Line"
 
-    # 6. [BỔ SUNG] Tweezer Bottom (Đáy nhíp)
-    # 2 nến có giá thấp nhất (Low) gần bằng nhau trong sai số ATR (<= 0.15 * ATR14), nến 2 đóng tăng
-    atr_14 = c1['atr14'] if 'atr14' in c1 else (c1_range + (c2_h - c2_l)) / 2.0
+    # 6. Tweezer Bottom (ĐÃ SIẾT CHẶT ĐIỀU KIỆN CHỐNG CÂY XẢ DỐC)
+    atr_14 = c1['atr14'] if 'atr14' in c1 else (c1_range + c2_range) / 2.0
     low_diff = abs(c1_l - c2_l)
-    if is_c2_bear and is_c1_bull and (low_diff <= 0.15 * atr_14) and (c1_c > c1_o):
+    
+    # ĐIỀU KIỆN MỚI: Nến c2 không được là cây nến xả quá lớn (c2_body <= 1.8 * ATR14) VÀ nến c1 phải có râu dưới rõ ràng
+    is_not_huge_dump = c2_body <= 1.8 * atr_14
+    has_decent_shadow = c1_lower_shadow >= 0.3 * c1_range
+
+    if is_c2_bear and is_c1_bull and (low_diff <= 0.12 * atr_14) and (c1_c > c1_o) and is_not_huge_dump and has_decent_shadow:
         return True, "Tweezer Bottom"
 
-    # 7. [BỔ SUNG] Three White Soldiers (Ba lính trắng)
-    # 3 nến tăng liên tiếp (c1, c2, c3 đều xanh), thân nến đủ rõ, đóng cửa tạo giá cao hơn
+    # 7. Three White Soldiers (Ba lính trắng)
     is_c3_bull = c3_c > c3_o
     is_c2_bull = c2_c > c2_o
     if is_c3_bull and is_c2_bull and is_c1_bull:
         c3_body = c3_c - c3_o
-        c2_body = c2_c - c2_o
-        if (c3_body >= 0.4 * (c3_h - c3_l)) and (c2_body >= 0.4 * (c2_h - c2_l)) and (c1_body >= 0.4 * c1_range):
+        if (c3_body >= 0.4 * (c3_h - c3_l)) and (c2_body >= 0.4 * c2_range) and (c1_body >= 0.4 * c1_range):
             if (c1_c > c2_c) and (c2_c > c3_c) and (c1_o >= c2_o) and (c2_o >= c3_o):
                 return True, "Three White Soldiers"
 
     return False, "Không có mô hình nến đảo chiều tăng hợp lệ"
 
-# --- SETUP 1 (MỞ RỘNG MÔ HÌNH NẾN): H4 EMA200 + H1 EMA21 REVERSAL ---
+# --- SETUP 1: H4 EMA200 + H1 EMA21 REVERSAL ---
 def analyze_setup_1(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tuple:
     if df_h1.empty or len(df_h1) < 200 or df_h4.empty or len(df_h4) < 200:
         return None, "Thiếu dữ liệu nến H1/H4"
@@ -264,7 +273,6 @@ def analyze_setup_1(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tu
     if not touched_ema21:
         return None, "Chưa có nhịp hồi gần/chạm EMA21 H1"
 
-    # Gọi hàm nhận diện mở rộng 7 mô hình nến
     has_pattern, pattern_name = check_extended_bullish_reversal_patterns(df_h1)
     if not has_pattern:
         return None, pattern_name
@@ -306,7 +314,7 @@ def analyze_setup_1(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tu
         "dist_pct": round(dist_pct, 2)
     }, f"ĐẠT TÍN HIỆU SETUP 1 ({pattern_name})"
 
-# --- SETUP 2 (GIỮ NGUYÊN HOÀN TOÀN): H4 EMA200 WICK REVERSAL (PURE H4) ---
+# --- SETUP 2: H4 EMA200 WICK REVERSAL (PURE H4) ---
 def analyze_setup_2_pure_h4(symbol: str, df_h4: pd.DataFrame) -> tuple:
     if df_h4.empty or len(df_h4) < 200:
         return None, "Thiếu dữ liệu nến H4 (<200 nến)"
@@ -377,7 +385,7 @@ def analyze_setup_2_pure_h4(symbol: str, df_h4: pd.DataFrame) -> tuple:
         "rr": round(rr, 2)
     }, f"ĐẠT TÍN HIỆU SETUP 2 (Close H4: {entry})"
 
-# --- SETUP 3 (GIỮ NGUYÊN HOÀN TOÀN): EARLY_EMA21_PULLBACK_LONG ---
+# --- SETUP 3: EARLY_EMA21_PULLBACK_LONG ---
 def analyze_setup_3_early_pullback(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tuple:
     if df_h1.empty or len(df_h1) < 200 or df_h4.empty or len(df_h4) < 200:
         return None, "Thiếu dữ liệu nến H1/H4"
@@ -456,7 +464,7 @@ def analyze_setup_3_early_pullback(symbol: str, df_h1: pd.DataFrame, df_h4: pd.D
     }, f"ĐẠT TÍN HIỆU SETUP 3 ({pattern_name})"
 
 # ==============================================================================
-# 6. GỬI CẢNH BÁO TELEGRAM (HIỂN THỊ TÊN MÔ HÌNH NẾN CHI TIẾT)
+# 6. GỬI CẢNH BÁO TELEGRAM
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
@@ -526,7 +534,7 @@ def run_scanner_loop():
     init_db()
     Thread(target=run_flask, daemon=True).start()
 
-    print("⚡️ Bắt đầu Scanner 3 Setup (Mở rộng 7 Mô hình Nến Đảo Chiều H1)...", flush=True)
+    print("⚡️ Bắt đầu Bybit Scanner (3 Setup - Tích hợp Anti-Dump Filter)...", flush=True)
     while True:
         try:
             tickers = get_bybit_crypto_tickers()
@@ -535,7 +543,7 @@ def run_scanner_loop():
             s2_data = s2_rr = s2_sent = 0
             s3_data = s3_rr = s3_sent = 0
 
-            print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins (3 Setup độc lập)...", flush=True)
+            print(f"\n🔍 [SCANNER] Đang rà soát {len(tickers)} Altcoins đạt chuẩn Anti-Dump...", flush=True)
 
             for t in tickers[:MAX_SYMBOLS_SCAN]:
                 sym = t['symbol']
@@ -549,7 +557,7 @@ def run_scanner_loop():
                 df_h1 = add_indicators(df_h1)
                 df_h4 = add_indicators(df_h4)
 
-                # --- 1. ĐÁNH GIÁ SETUP 1 (MỞ RỘNG MÔ HÌNH NẾN) ---
+                # --- 1. ĐÁNH GIÁ SETUP 1 ---
                 s1_data += 1
                 sig1, reason1 = analyze_setup_1(sym, df_h1, df_h4)
                 if sig1:
@@ -596,9 +604,9 @@ def run_scanner_loop():
 
             # --- THỐNG KÊ LOG TÁCH BIỆT ---
             print(f"\n📊 --- BÁO CÁO VÒNG QUÉT SCANNER ---", flush=True)
-            print(f"• SETUP 1 (H1 EMA21 Extended Reversals) : Quét {s1_data} coin | Đạt R:R: {s1_rr} | Gửi Tele: {s1_sent}", flush=True)
-            print(f"• SETUP 2 (H4 EMA200 Pure Wick)        : Quét {s2_data} coin | Đạt R:R: {s2_rr} | Gửi Tele: {s2_sent}", flush=True)
-            print(f"• SETUP 3 (Early EMA21 Pullback)       : Quét {s3_data} coin | Đạt R:R: {s3_rr} | Gửi Tele: {s3_sent}", flush=True)
+            print(f"• SETUP 1 (H1 EMA21 Reversals)   : Quét {s1_data} coin | Đạt R:R: {s1_rr} | Gửi Tele: {s1_sent}", flush=True)
+            print(f"• SETUP 2 (H4 EMA200 Pure Wick)  : Quét {s2_data} coin | Đạt R:R: {s2_rr} | Gửi Tele: {s2_sent}", flush=True)
+            print(f"• SETUP 3 (Early EMA21 Pullback) : Quét {s3_data} coin | Đạt R:R: {s3_rr} | Gửi Tele: {s3_sent}", flush=True)
             print(f"-----------------------------------------\n", flush=True)
 
         except Exception as e:

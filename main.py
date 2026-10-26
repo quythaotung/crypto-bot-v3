@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Proprietary Signal Engine (Setup 4 Removed) Active 24/7!"
+    return "Bybit Proprietary Signal Engine (Dynamic SL/TP & Relative Strength) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -32,7 +32,7 @@ MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "150"))
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
 
 MAX_DROP_24H_PCT = -12.0
-MIN_QUALITY_SCORE = 80  # Chỉ báo tín hiệu từ 80/100 điểm trở lên
+MIN_QUALITY_SCORE = 80
 
 MAX_ACTIVE_TRADES = 5
 DB_PATH = "signals_history.db"
@@ -111,7 +111,7 @@ def save_active_trade(sig: dict):
         conn.commit()
 
 # ==============================================================================
-# 4. LẤY TICKERS BYBIT & KLINE DATA
+# 4. LẤY TICKERS & KLINE DATA
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -140,8 +140,8 @@ def get_bybit_crypto_tickers():
                     if base_coin not in non_crypto_exact and turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT and price_change_pct >= MAX_DROP_24H_PCT:
                         valid.append({"symbol": sym, "turnover24h": turnover, "priceChange24h": price_change_pct})
             return sorted(valid, key=lambda x: x["turnover24h"], reverse=True)
-    except Exception as e:
-        print(f"[API ERROR] Lỗi lấy Tickers Bybit: {e}", flush=True)
+    except Exception:
+        pass
     return []
 
 def get_closed_klines_df(symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
@@ -157,8 +157,8 @@ def get_closed_klines_df(symbol: str, interval: str, limit: int = 250) -> pd.Dat
             for col in ['open', 'high', 'low', 'close', 'volume', 'timestamp']:
                 df[col] = df[col].astype(float)
             return df
-    except Exception as e:
-        print(f"[API ERROR] Lỗi lấy Klines {symbol} ({interval}): {e}", flush=True)
+    except Exception:
+        pass
     return pd.DataFrame()
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -176,12 +176,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def check_extended_bullish_reversal_patterns(df_h1: pd.DataFrame) -> tuple:
     if len(df_h1) < 4: return False, 0
-
     c1, c2, c3 = df_h1.iloc[-1], df_h1.iloc[-2], df_h1.iloc[-3]
     c1_o, c1_c, c1_h, c1_l = c1['open'], c1['close'], c1['high'], c1['low']
     c2_o, c2_c, c2_h, c2_l = c2['open'], c2['close'], c2['high'], c2['low']
     c3_o, c3_c, c3_h, c3_l = c3['open'], c3['close'], c3['high'], c3['low']
-
     c1_range = c1_h - c1_l
     c1_body = abs(c1_c - c1_o)
     c1_lower_shadow = min(c1_o, c1_c) - c1_l
@@ -200,46 +198,34 @@ def check_extended_bullish_reversal_patterns(df_h1: pd.DataFrame) -> tuple:
     atr_14 = c1['atr14'] if 'atr14' in c1 else (c1_range + (c2_h - c2_l)) / 2.0
     if is_c2_bear and is_c1_bull and (abs(c1_l - c2_l) <= 0.12 * atr_14) and (c1_c > c1_o) and (c2_body <= 1.8 * atr_14) and (c1_lower_shadow >= 0.3 * c1_range): return True, 20
     if (c3_c > c3_o) and (c2_c > c2_o) and is_c1_bull and (c1_c > c2_c > c3_c) and (c1_body >= 0.4 * c1_range): return True, 23
-
     return False, 0
 
 # ==============================================================================
-# 5. CÁC THUẬT TOÁN ĐÁNH GIÁ (CHỈ CÒN ALGORITHMS 1, 2, 3, 5)
+# 5. CÁC THUẬT TOÁN ĐÁNH GIÁ (ALGO 1, 2, 3, 5 VÀ 6)
 # ==============================================================================
 def evaluate_algorithm_1(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tuple:
     if df_h1.empty or len(df_h1) < 200 or df_h4.empty or len(df_h4) < 200: return None
     last_h1, last_h4 = df_h1.iloc[-1], df_h4.iloc[-1]
-
     if last_h4['close'] <= last_h4['ema200'] or last_h1['close'] <= last_h1['ema21']: return None
     dist_pct = ((last_h1['close'] - last_h1['ema21']) / last_h1['ema21']) * 100
     if dist_pct < 1.0 or dist_pct > 3.0: return None
-
     if not any(row['low'] <= row['ema21'] * 1.008 for _, row in df_h1.iloc[-6:-1].iterrows()): return None
-
     has_pattern, pattern_weight = check_extended_bullish_reversal_patterns(df_h1)
     if not has_pattern: return None
-
     entry = last_h1['close']
     sl = min(df_h1['low'].iloc[-6:-1].min(), last_h1['low']) * 0.997
-    risk_pct = ((entry - sl) / entry) * 100
-    if risk_pct < 0.8: sl = entry * 0.985; risk_pct = 1.5
-
+    if ((entry - sl) / entry) * 100 < 0.8: sl = entry * 0.985
     tp1 = entry + (entry - sl) * 1.5; tp2 = entry + (entry - sl) * 2.5
-    rr = 1.5
-
-    score = min(60 + pattern_weight + int(min(rr * 5, 15)), 98)
-    return {"symbol": symbol, "internal_setup_name": "S1_ENGINE", "candle_ts": int(last_h1['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": round(rr, 2), "score": score}
+    score = min(60 + pattern_weight + int(min(1.5 * 5, 15)), 98)
+    return {"symbol": symbol, "internal_setup_name": "S1_ENGINE", "candle_ts": int(last_h1['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": 1.5, "score": score}
 
 def evaluate_algorithm_2(symbol: str, df_h4: pd.DataFrame) -> tuple:
     if df_h4.empty or len(df_h4) < 200: return None
     last_h4 = df_h4.iloc[-1]
-    h4_o, h4_c, h4_h, h4_l = last_h4['open'], last_h4['close'], last_h4['high'], last_h4['low']
-    h4_ema200 = last_h4['ema200']
-
+    h4_o, h4_c, h4_h, h4_l, h4_ema200 = last_h4['open'], last_h4['close'], last_h4['high'], last_h4['low'], last_h4['ema200']
     if h4_c <= h4_ema200: return None
     dist_low_pct = abs(h4_l - h4_ema200) / h4_ema200 * 100
     if dist_low_pct < 0.2 or dist_low_pct > 3.0: return None
-
     h4_range = h4_h - h4_l
     if h4_range == 0: return None
     h4_body = abs(h4_c - h4_o)
@@ -247,10 +233,8 @@ def evaluate_algorithm_2(symbol: str, df_h4: pd.DataFrame) -> tuple:
     if shadow_ratio < 2.0: return None
     close_pos = ((h4_c - h4_l) / h4_range) * 100
     if close_pos < 75.0: return None
-
     entry = h4_c; sl = h4_l * 0.997
     tp1 = entry + (entry - sl) * 1.5; tp2 = entry + (entry - sl) * 2.5
-
     score = min(70 + int(min(shadow_ratio * 4, 18)) + int((close_pos - 75) * 0.4), 99)
     return {"symbol": symbol, "internal_setup_name": "S2_ENGINE", "candle_ts": int(last_h4['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": 1.5, "score": score}
 
@@ -258,56 +242,109 @@ def evaluate_algorithm_3(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) 
     if df_h1.empty or len(df_h1) < 200 or df_h4.empty or len(df_h4) < 200: return None
     last_h1, prev_h1, last_h4 = df_h1.iloc[-1], df_h1.iloc[-2], df_h4.iloc[-1]
     if last_h4['close'] <= last_h4['ema200'] or last_h1['close'] <= last_h1['ema21'] or last_h1['ema21'] <= prev_h1['ema21']: return None
-
     if not any(((row['low'] - row['ema21']) / row['ema21']) * 100 <= 0.5 for _, row in df_h1.iloc[-24:-1].iterrows()): return None
-
     has_pattern, pattern_weight = check_extended_bullish_reversal_patterns(df_h1)
     if not has_pattern: return None
-
     dist_close_pct = ((last_h1['close'] - last_h1['ema21']) / last_h1['ema21']) * 100
     if dist_close_pct > 1.5 or (last_h1['atr14'] > 0 and (last_h1['close'] - last_h1['ema21']) > last_h1['atr14']): return None
-
     entry = last_h1['close']
     sl = min(df_h1['low'].iloc[-12:-1].min(), last_h1['low']) * 0.997
     tp1 = entry + (entry - sl) * 1.5; tp2 = entry + (entry - sl) * 2.5
-
     score = min(65 + pattern_weight + int((1.5 - dist_close_pct) * 8), 96)
     return {"symbol": symbol, "internal_setup_name": "S3_ENGINE", "candle_ts": int(last_h1['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": 1.5, "score": score}
 
 def evaluate_algorithm_5(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tuple:
     if df_h1.empty or len(df_h1) < 50 or df_h4.empty or len(df_h4) < 50: return None
-
-    c1 = df_h1.iloc[-1]
-    h4_ema200 = df_h4.iloc[-1]['ema200']
-
-    # BẮT BUỘC: GIÁ ĐÓNG CỬA PHẢI NẰM HOÀN TOÀN TRÊN HOẶC SÁT ĐƯỜNG H4 EMA200 (TỪ 0.0% ĐẾN +2.5%)
+    c1, h4_ema200 = df_h1.iloc[-1], df_h4.iloc[-1]['ema200']
     dist_to_h4_ema200 = ((c1['close'] - h4_ema200) / h4_ema200) * 100
     if dist_to_h4_ema200 < 0.0 or dist_to_h4_ema200 > 2.5: return None
-
     c1_range = c1['high'] - c1['low']
     if c1_range == 0: return None
-    c1_lower_shadow = min(c1['open'], c1['close']) - c1['low']
-    shadow_pct = c1_lower_shadow / c1_range
-
+    shadow_pct = (min(c1['open'], c1['close']) - c1['low']) / c1_range
     recent_low = df_h1['low'].iloc[-12:-1].min()
-    is_sweep_low = c1['low'] <= recent_low * 1.002
-
-    if shadow_pct < 0.30 and not is_sweep_low: return None
-
+    if shadow_pct < 0.30 and c1['low'] > recent_low * 1.002: return None
     avg_vol_20 = df_h1['volume'].iloc[-21:-1].mean()
     vol_ratio = c1['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
     if vol_ratio > 4.5: return None
-
-    entry = c1['close']
-    sl = min(c1['low'], recent_low) * 0.995
-    tp1 = entry + (entry - sl) * 2.0
-    tp2 = entry + (entry - sl) * 3.5
-
+    entry = c1['close']; sl = min(c1['low'], recent_low) * 0.995
+    tp1 = entry + (entry - sl) * 2.0; tp2 = entry + (entry - sl) * 3.5
     score = min(75 + int(shadow_pct * 25) + int(min(vol_ratio * 4, 10)), 99)
     return {"symbol": symbol, "internal_setup_name": "S5_ENGINE", "candle_ts": int(c1['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": 2.0, "score": score}
 
+# MỚI TỐI ƯU: ALGO 6 - SL/TP ĐỘNG DỰA VÀO ĐỘNG LỰC MARKET & KỸ THUẬT
+def evaluate_algorithm_6_leading_coin(symbol: str, df_h1: pd.DataFrame, df_btc_h1: pd.DataFrame) -> tuple:
+    if df_h1.empty or len(df_h1) < 50 or df_btc_h1.empty or len(df_btc_h1) < 50: return None
+    
+    c1, c6 = df_h1.iloc[-1], df_h1.iloc[-6]
+    btc_c1, btc_c6 = df_btc_h1.iloc[-1], df_btc_h1.iloc[-6]
+
+    if c1['close'] <= c1['ema21']: return None
+
+    sym_ret = (c1['close'] - c6['close']) / c6['close']
+    btc_ret = (btc_c1['close'] - btc_c6['close']) / btc_c6['close']
+    if sym_ret <= btc_ret or sym_ret <= 0: return None
+
+    dist_ema21 = ((c1['close'] - c1['ema21']) / c1['ema21']) * 100
+    if dist_ema21 > 4.5 or dist_ema21 < 0.5: return None
+
+    avg_vol_20 = df_h1['volume'].iloc[-21:-1].mean()
+    vol_ratio = c1['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
+    if vol_ratio < 1.5: return None 
+
+    entry = c1['close']
+    atr_14 = c1['atr14'] if pd.notna(c1['atr14']) and c1['atr14'] > 0 else (c1['high'] - c1['low'])
+    
+    # -------------------------------------------------------------
+    # 1. TÍNH STOP LOSS (SL) DỰA VÀO CẤU TRÚC VÀ ĐỆM RỦI RO ATR
+    # -------------------------------------------------------------
+    local_swing_low = df_h1['low'].iloc[-12:-1].min()
+    sl = min(c1['low'], local_swing_low) - (atr_14 * 0.3)
+    
+    risk = entry - sl
+    if risk <= 0: return None
+    
+    # Chống nhiễu: Nếu SL quá sát (< 1.2%), nới rỗng SL ra bằng ATR
+    if (risk / entry) * 100 < 1.2:
+        sl = entry - (atr_14 * 1.5)
+        risk = entry - sl
+
+    # -------------------------------------------------------------
+    # 2. HỆ SỐ LỰC ĐẨY THỊ TRƯỜNG (MARKET FORCE MULTIPLIER)
+    # -------------------------------------------------------------
+    rs_diff = sym_ret - btc_ret
+    market_force = 1.0 + (vol_ratio * 0.15) + (rs_diff * 10)
+    market_force = min(market_force, 2.5) # Capping
+
+    # -------------------------------------------------------------
+    # 3. TÍNH TAKE PROFIT (TP) DỰA VÀO KHÁNG CỰ & SÓNG MỞ RỘNG
+    # -------------------------------------------------------------
+    recent_resistance = df_h1['high'].iloc[-48:-1].max() # Đỉnh cao nhất 2 ngày qua
+    
+    # TP1: Vượt kháng cự cũ (Nhân hệ số bơm xăng nếu lực đẩy cực mạnh)
+    tp1_min = entry + risk * 1.5
+    tp1_base = max(recent_resistance, tp1_min)
+    tp1 = entry + (tp1_base - entry) * min(market_force, 1.3)
+    
+    # TP2: Sóng mở rộng Fibo 1.618 x Hệ số Lực đẩy
+    tp2 = entry + (tp1 - entry) * 1.618 * market_force
+
+    rr = round((tp1 - entry) / risk, 2)
+    
+    # Đánh giá Score
+    score = 75
+    rs_bonus = min(int(rs_diff * 1000), 15)
+    vol_bonus = min(int((vol_ratio - 1.5) * 4), 10)
+    score = min(score + rs_bonus + vol_bonus, 99)
+
+    return {
+        "symbol": symbol, "internal_setup_name": "S6_RELATIVE_STRENGTH", 
+        "candle_ts": int(c1['timestamp']), "market_entry": round(entry, 4), 
+        "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), 
+        "rr": rr, "score": score
+    }
+
 # ==============================================================================
-# 6. GỬI CẢNH BÁO TELEGRAM (ẨN NỘI DUNG PHƯƠNG PHÁP)
+# 6. GỬI CẢNH BÁO TELEGRAM
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
@@ -336,15 +373,21 @@ def send_telegram_alert(sig: dict) -> bool:
         return False
 
 # ==============================================================================
-# 7. VÒNG LẶP SCANNER QUÉT BẤT TẬN (ĐÁNH GIÁ 4 ALGORITHMS)
+# 7. VÒNG LẶP SCANNER BẤT TẬN
 # ==============================================================================
 def run_scanner_loop():
     init_db()
     Thread(target=run_flask, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit Scanner (Setup 4 Removed - Strict EMA - Score >= 80)...", flush=True)
+    print("⚡️ Bắt đầu Bybit Scanner (Đã Update Dynamic SL/TP - Score >= 80)...", flush=True)
     while True:
         try:
+            df_btc_h1 = get_closed_klines_df("BTCUSDT", "60", limit=220)
+            if df_btc_h1.empty or len(df_btc_h1) < 200:
+                print("⏳ Không tải được dữ liệu BTCUSDT, bỏ qua vòng quét này...")
+                time.sleep(10)
+                continue
+
             tickers = get_bybit_crypto_tickers()
             sent_count = 0
 
@@ -358,12 +401,12 @@ def run_scanner_loop():
                 df_h4 = add_indicators(df_h4)
 
                 candidates = []
-                # Đánh giá 4 thuật toán còn lại (1, 2, 3 và 5)
                 for eval_fn in [
                     lambda: evaluate_algorithm_1(sym, df_h1, df_h4),
                     lambda: evaluate_algorithm_2(sym, df_h4),
                     lambda: evaluate_algorithm_3(sym, df_h1, df_h4),
-                    lambda: evaluate_algorithm_5(sym, df_h1, df_h4)
+                    lambda: evaluate_algorithm_5(sym, df_h1, df_h4),
+                    lambda: evaluate_algorithm_6_leading_coin(sym, df_h1, df_btc_h1)
                 ]:
                     res = eval_fn()
                     if res and res['score'] >= MIN_QUALITY_SCORE:
@@ -379,7 +422,7 @@ def run_scanner_loop():
                                 sent_count += 1
                                 print(f"✅ [SIGNAL SENT] #{sym} | Score: {best_sig['score']}/100", flush=True)
 
-            print(f"\n📊 --- BÁO CÁO VÒNG QUÉT (4 ALGORITHMS) ---", flush=True)
+            print(f"\n📊 --- BÁO CÁO VÒNG QUÉT ---", flush=True)
             print(f"• Tín hiệu gửi thành công: {sent_count}", flush=True)
 
         except Exception as e:

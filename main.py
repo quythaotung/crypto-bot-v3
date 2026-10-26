@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Proprietary Signal Engine (Dynamic SL/TP & Relative Strength) Active 24/7!"
+    return "Bybit Top-Down Signal Engine (Dynamic SL/TP & Relative Strength) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -32,14 +32,14 @@ MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "150"))
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
 
 MAX_DROP_24H_PCT = -12.0
-MIN_QUALITY_SCORE = 80
+MIN_QUALITY_SCORE = 80 # Ngưỡng điểm kỹ thuật để gửi tín hiệu (80/100)
 
 MAX_ACTIVE_TRADES = 5
 DB_PATH = "signals_history.db"
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 3. SQLITE DATABASE
+# 3. SQLITE DATABASE (CHỐNG TRÙNG LẶP TÍN HIỆU)
 # ==============================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -111,7 +111,7 @@ def save_active_trade(sig: dict):
         conn.commit()
 
 # ==============================================================================
-# 4. LẤY TICKERS & KLINE DATA
+# 4. LẤY TICKERS & DỮ LIỆU KLINES TỪ BYBIT
 # ==============================================================================
 def safe_float(val, default=0.0):
     try:
@@ -212,10 +212,12 @@ def evaluate_algorithm_1(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) 
     if not any(row['low'] <= row['ema21'] * 1.008 for _, row in df_h1.iloc[-6:-1].iterrows()): return None
     has_pattern, pattern_weight = check_extended_bullish_reversal_patterns(df_h1)
     if not has_pattern: return None
+    
     entry = last_h1['close']
     sl = min(df_h1['low'].iloc[-6:-1].min(), last_h1['low']) * 0.997
     if ((entry - sl) / entry) * 100 < 0.8: sl = entry * 0.985
     tp1 = entry + (entry - sl) * 1.5; tp2 = entry + (entry - sl) * 2.5
+    
     score = min(60 + pattern_weight + int(min(1.5 * 5, 15)), 98)
     return {"symbol": symbol, "internal_setup_name": "S1_ENGINE", "candle_ts": int(last_h1['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": 1.5, "score": score}
 
@@ -233,8 +235,10 @@ def evaluate_algorithm_2(symbol: str, df_h4: pd.DataFrame) -> tuple:
     if shadow_ratio < 2.0: return None
     close_pos = ((h4_c - h4_l) / h4_range) * 100
     if close_pos < 75.0: return None
+    
     entry = h4_c; sl = h4_l * 0.997
     tp1 = entry + (entry - sl) * 1.5; tp2 = entry + (entry - sl) * 2.5
+    
     score = min(70 + int(min(shadow_ratio * 4, 18)) + int((close_pos - 75) * 0.4), 99)
     return {"symbol": symbol, "internal_setup_name": "S2_ENGINE", "candle_ts": int(last_h4['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": 1.5, "score": score}
 
@@ -247,9 +251,11 @@ def evaluate_algorithm_3(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) 
     if not has_pattern: return None
     dist_close_pct = ((last_h1['close'] - last_h1['ema21']) / last_h1['ema21']) * 100
     if dist_close_pct > 1.5 or (last_h1['atr14'] > 0 and (last_h1['close'] - last_h1['ema21']) > last_h1['atr14']): return None
+    
     entry = last_h1['close']
     sl = min(df_h1['low'].iloc[-12:-1].min(), last_h1['low']) * 0.997
     tp1 = entry + (entry - sl) * 1.5; tp2 = entry + (entry - sl) * 2.5
+    
     score = min(65 + pattern_weight + int((1.5 - dist_close_pct) * 8), 96)
     return {"symbol": symbol, "internal_setup_name": "S3_ENGINE", "candle_ts": int(last_h1['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": 1.5, "score": score}
 
@@ -266,12 +272,14 @@ def evaluate_algorithm_5(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) 
     avg_vol_20 = df_h1['volume'].iloc[-21:-1].mean()
     vol_ratio = c1['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
     if vol_ratio > 4.5: return None
+    
     entry = c1['close']; sl = min(c1['low'], recent_low) * 0.995
     tp1 = entry + (entry - sl) * 2.0; tp2 = entry + (entry - sl) * 3.5
+    
     score = min(75 + int(shadow_pct * 25) + int(min(vol_ratio * 4, 10)), 99)
     return {"symbol": symbol, "internal_setup_name": "S5_ENGINE", "candle_ts": int(c1['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": 2.0, "score": score}
 
-# MỚI TỐI ƯU: ALGO 6 - SL/TP ĐỘNG DỰA VÀO ĐỘNG LỰC MARKET & KỸ THUẬT
+# ALGO 6 - SL/TP ĐỘNG DỰA VÀO ĐỘNG LỰC THỊ TRƯỜNG & COIN KHỎE SO VỚI BTC
 def evaluate_algorithm_6_leading_coin(symbol: str, df_h1: pd.DataFrame, df_btc_h1: pd.DataFrame) -> tuple:
     if df_h1.empty or len(df_h1) < 50 or df_btc_h1.empty or len(df_btc_h1) < 50: return None
     
@@ -294,43 +302,31 @@ def evaluate_algorithm_6_leading_coin(symbol: str, df_h1: pd.DataFrame, df_btc_h
     entry = c1['close']
     atr_14 = c1['atr14'] if pd.notna(c1['atr14']) and c1['atr14'] > 0 else (c1['high'] - c1['low'])
     
-    # -------------------------------------------------------------
-    # 1. TÍNH STOP LOSS (SL) DỰA VÀO CẤU TRÚC VÀ ĐỆM RỦI RO ATR
-    # -------------------------------------------------------------
+    # Tính Stop Loss động dựa trên Cấu trúc 12H và ATR đệm
     local_swing_low = df_h1['low'].iloc[-12:-1].min()
     sl = min(c1['low'], local_swing_low) - (atr_14 * 0.3)
     
     risk = entry - sl
     if risk <= 0: return None
     
-    # Chống nhiễu: Nếu SL quá sát (< 1.2%), nới rỗng SL ra bằng ATR
     if (risk / entry) * 100 < 1.2:
         sl = entry - (atr_14 * 1.5)
         risk = entry - sl
 
-    # -------------------------------------------------------------
-    # 2. HỆ SỐ LỰC ĐẨY THỊ TRƯỜNG (MARKET FORCE MULTIPLIER)
-    # -------------------------------------------------------------
+    # Tính Lực Đẩy Market Force
     rs_diff = sym_ret - btc_ret
     market_force = 1.0 + (vol_ratio * 0.15) + (rs_diff * 10)
-    market_force = min(market_force, 2.5) # Capping
+    market_force = min(market_force, 2.5) 
 
-    # -------------------------------------------------------------
-    # 3. TÍNH TAKE PROFIT (TP) DỰA VÀO KHÁNG CỰ & SÓNG MỞ RỘNG
-    # -------------------------------------------------------------
-    recent_resistance = df_h1['high'].iloc[-48:-1].max() # Đỉnh cao nhất 2 ngày qua
-    
-    # TP1: Vượt kháng cự cũ (Nhân hệ số bơm xăng nếu lực đẩy cực mạnh)
+    # Tính Take Profit động theo lực mở rộng
+    recent_resistance = df_h1['high'].iloc[-48:-1].max() 
     tp1_min = entry + risk * 1.5
     tp1_base = max(recent_resistance, tp1_min)
     tp1 = entry + (tp1_base - entry) * min(market_force, 1.3)
     
-    # TP2: Sóng mở rộng Fibo 1.618 x Hệ số Lực đẩy
     tp2 = entry + (tp1 - entry) * 1.618 * market_force
-
     rr = round((tp1 - entry) / risk, 2)
     
-    # Đánh giá Score
     score = 75
     rs_bonus = min(int(rs_diff * 1000), 15)
     vol_bonus = min(int((vol_ratio - 1.5) * 4), 10)
@@ -344,7 +340,7 @@ def evaluate_algorithm_6_leading_coin(symbol: str, df_h1: pd.DataFrame, df_btc_h
     }
 
 # ==============================================================================
-# 6. GỬI CẢNH BÁO TELEGRAM
+# 6. GỬI CẢNH BÁO TELEGRAM (ẨN PHƯƠNG PHÁP, CHỈ HIỂN THỊ ĐIỂM SỐ UY TÍN)
 # ==============================================================================
 def send_telegram_alert(sig: dict) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
@@ -379,9 +375,10 @@ def run_scanner_loop():
     init_db()
     Thread(target=run_flask, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit Scanner (Đã Update Dynamic SL/TP - Score >= 80)...", flush=True)
+    print("⚡️ Bắt đầu Bybit Top-Down Scanner (5 Algorithms - Đã ẩn Setup 4)...", flush=True)
     while True:
         try:
+            # Lấy dữ liệu BTC để đo sức mạnh tương đối (RS)
             df_btc_h1 = get_closed_klines_df("BTCUSDT", "60", limit=220)
             if df_btc_h1.empty or len(df_btc_h1) < 200:
                 print("⏳ Không tải được dữ liệu BTCUSDT, bỏ qua vòng quét này...")
@@ -401,6 +398,7 @@ def run_scanner_loop():
                 df_h4 = add_indicators(df_h4)
 
                 candidates = []
+                # Đánh giá đồng loạt các Setup (1, 2, 3, 5, và 6)
                 for eval_fn in [
                     lambda: evaluate_algorithm_1(sym, df_h1, df_h4),
                     lambda: evaluate_algorithm_2(sym, df_h4),
@@ -412,6 +410,7 @@ def run_scanner_loop():
                     if res and res['score'] >= MIN_QUALITY_SCORE:
                         candidates.append(res)
 
+                # Chọn kèo có điểm số cao nhất của Coin đó để gửi đi
                 if candidates:
                     best_sig = max(candidates, key=lambda x: x['score'])
                     if get_active_trades_count() < MAX_ACTIVE_TRADES or is_symbol_currently_active(sym):
@@ -422,8 +421,8 @@ def run_scanner_loop():
                                 sent_count += 1
                                 print(f"✅ [SIGNAL SENT] #{sym} | Score: {best_sig['score']}/100", flush=True)
 
-            print(f"\n📊 --- BÁO CÁO VÒNG QUÉT ---", flush=True)
-            print(f"• Tín hiệu gửi thành công: {sent_count}", flush=True)
+            print(f"\n📊 --- BÁO CÁO VÒNG QUÉT TỰ ĐỘNG ---", flush=True)
+            print(f"• Tín hiệu lọc được và gửi thành công: {sent_count}", flush=True)
 
         except Exception as e:
             print(f"[ERROR] Scanner Loop Error: {e}", flush=True)

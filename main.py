@@ -8,38 +8,34 @@ from threading import Thread
 from flask import Flask
 
 # ==============================================================================
-# 1. KHỞI TẠO FLASK KEEP-ALIVE SERVER
+# 1. KHỞI TẠO FLASK SERVER (KEEP-ALIVE)
 # ==============================================================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bybit Top-Down Signal Engine (Dynamic SL/TP & Relative Strength) Active 24/7!"
+    return "Bybit Pro Quant Engine (ATR Normalized & BTC Regime) Active 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 # ==============================================================================
-# 2. CẤU HÌNH BIẾN MÔI TRƯỜNG & THÔNG SỐ SÀN
+# 2. CẤU HÌNH BIẾN MÔI TRƯỜNG & HỆ THỐNG
 # ==============================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
-MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))
-MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.25"))
-MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "150"))
+MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "20000000")) # Lọc thanh khoản > 20M USD
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
+MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "100"))
 
-MAX_DROP_24H_PCT = -12.0
-MIN_QUALITY_SCORE = 80 # Ngưỡng điểm kỹ thuật để gửi tín hiệu (80/100)
-
-MAX_ACTIVE_TRADES = 5
-DB_PATH = "signals_history.db"
+MAX_ACTIVE_TRADES = 3  # Giới hạn rủi ro: Tối đa 3 lệnh mở cùng lúc
+DB_PATH = "quant_signals.db"
 BASE_URL = "https://api.bybit.com"
 
 # ==============================================================================
-# 3. SQLITE DATABASE (CHỐNG TRÙNG LẶP TÍN HIỆU)
+# 3. SQLITE DATABASE (QUẢN LÝ LỆNH & WATCHLIST)
 # ==============================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -50,7 +46,6 @@ def init_db():
                 symbol TEXT NOT NULL,
                 setup_name TEXT NOT NULL,
                 candle_timestamp INTEGER NOT NULL,
-                last_sent_at INTEGER NOT NULL,
                 UNIQUE(symbol, setup_name, candle_timestamp)
             )
         """)
@@ -59,21 +54,22 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT UNIQUE NOT NULL,
                 entry REAL NOT NULL,
-                sl REAL NOT NULL,
-                tp1 REAL NOT NULL,
-                tp2 REAL NOT NULL,
-                status TEXT DEFAULT 'OPEN',
-                setup_name TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                status TEXT DEFAULT 'OPEN'
             )
         """)
         conn.commit()
 
-def is_symbol_currently_active(symbol: str) -> bool:
+def is_signal_sent(symbol: str, setup_name: str, candle_ts: int) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM active_trades WHERE symbol = ? AND status = 'OPEN'", (symbol,))
+        cursor.execute("SELECT 1 FROM sent_signals WHERE symbol = ? AND setup_name = ? AND candle_timestamp = ?", (symbol, setup_name, candle_ts))
         return cursor.fetchone() is not None
+
+def record_signal(symbol: str, setup_name: str, candle_ts: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO sent_signals (symbol, setup_name, candle_timestamp) VALUES (?, ?, ?)", (symbol, setup_name, candle_ts))
+        conn.commit()
 
 def get_active_trades_count() -> int:
     with sqlite3.connect(DB_PATH) as conn:
@@ -81,353 +77,277 @@ def get_active_trades_count() -> int:
         cursor.execute("SELECT COUNT(*) FROM active_trades WHERE status = 'OPEN'")
         return cursor.fetchone()[0]
 
-def is_signal_already_sent(symbol: str, setup_name: str, candle_ts: int) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT 1 FROM sent_signals WHERE symbol = ? AND setup_name = ? AND candle_timestamp = ?",
-            (symbol, setup_name, candle_ts)
-        )
-        return cursor.fetchone() is not None
-
-def record_sent_signal(symbol: str, setup_name: str, candle_ts: int):
-    now_ts = int(time.time())
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO sent_signals (symbol, setup_name, candle_timestamp, last_sent_at) VALUES (?, ?, ?, ?)",
-            (symbol, setup_name, candle_ts, now_ts)
-        )
-        conn.commit()
-
-def save_active_trade(sig: dict):
-    now_ts = int(time.time())
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT OR REPLACE INTO active_trades (symbol, entry, sl, tp1, tp2, status, setup_name, created_at)
-            VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?)
-        """, (sig['symbol'], sig['market_entry'], sig['sl'], sig['tp1'], sig['tp2'], sig['internal_setup_name'], now_ts))
-        conn.commit()
-
 # ==============================================================================
-# 4. LẤY TICKERS & DỮ LIỆU KLINES TỪ BYBIT
+# 4. TẢI DỮ LIỆU & TÍNH TOÁN KỸ THUẬT (ATR, ADX, RVOL)
 # ==============================================================================
-def safe_float(val, default=0.0):
-    try:
-        return float(val) if val is not None and val != '' else default
-    except (ValueError, TypeError):
-        return default
-
-def get_bybit_crypto_tickers():
+def get_tickers():
     url = f"{BASE_URL}/v5/market/tickers?category=linear"
     try:
         res = requests.get(url, timeout=8).json()
-        if res.get("retCode") == 0 and res.get("result", {}).get("list"):
+        if res.get("retCode") == 0:
             tickers = res["result"]["list"]
-            non_crypto_exact = ['SOXS', 'SOXL', 'TQQQ', 'SQQQ', 'UVXY', 'SPY', 'QQQ', 'DIA', 'IWM', 'TLT', 'US30', 'US100', 'US500', 'XAU', 'XAG', 'WTI', 'USOIL', '3L', '3S']
             valid = []
             for t in tickers:
                 sym = t.get("symbol", "")
-                turnover = safe_float(t.get("turnover24h", 0))
-                bid = safe_float(t.get("bid1Price", 0))
-                ask = safe_float(t.get("ask1Price", 0))
-                price_change_pct = safe_float(t.get("price24hPcnt", 0)) * 100.0
-                spread_pct = ((ask - bid) / bid * 100) if (bid > 0 and ask > 0) else 0.0
-
-                if sym.endswith("USDT") and not sym.startswith(("USDC", "BUSD", "DAI", "EUR")):
-                    base_coin = sym.replace("USDT", "")
-                    if base_coin not in non_crypto_exact and turnover >= MIN_TURNOVER_24H and spread_pct <= MAX_SPREAD_PCT and price_change_pct >= MAX_DROP_24H_PCT:
-                        valid.append({"symbol": sym, "turnover24h": turnover, "priceChange24h": price_change_pct})
-            return sorted(valid, key=lambda x: x["turnover24h"], reverse=True)
-    except Exception:
-        pass
+                turnover = float(t.get("turnover24h", 0))
+                price_chg = float(t.get("price24hPcnt", 0)) * 100
+                # Lọc: Turnover > 20M, chưa pump quá 20% trong 24h
+                if sym.endswith("USDT") and turnover >= MIN_TURNOVER_24H and price_chg <= 20.0:
+                    valid.append({"symbol": sym, "turnover": turnover})
+            return sorted(valid, key=lambda x: x["turnover"], reverse=True)
+    except: pass
     return []
 
-def get_closed_klines_df(symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
+def get_klines(symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
     url = f"{BASE_URL}/v5/market/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit+1}"
     try:
         res = requests.get(url, timeout=6).json()
         if res.get("retCode") == 0 and res.get("result", {}).get("list"):
-            raw_list = res["result"]["list"]
-            if len(raw_list) < 3: return pd.DataFrame()
-            closed_raw = raw_list[1:]
-            df = pd.DataFrame(closed_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-            df = df.iloc[::-1].reset_index(drop=True)
-            for col in ['open', 'high', 'low', 'close', 'volume', 'timestamp']:
-                df[col] = df[col].astype(float)
+            raw = res["result"]["list"][1:] # Bỏ nến hiện tại đang chạy
+            df = pd.DataFrame(raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+            df = df.iloc[::-1].reset_index(drop=True).astype(float)
             return df
-    except Exception:
-        pass
+    except: pass
     return pd.DataFrame()
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 200: return df
-    closes = df['close']
-    df['ema21'] = closes.ewm(span=21, adjust=False).mean()
-    df['ema200'] = closes.ewm(span=200, adjust=False).mean()
+    df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
     
+    # Tính ATR14
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr14'] = tr.rolling(14).mean()
+    
+    # Tính RVOL (Relative Volume 20)
+    df['vol_sma20'] = df['volume'].rolling(20).mean()
+    df['rvol'] = df['volume'] / df['vol_sma20']
+    
     return df
 
-def check_extended_bullish_reversal_patterns(df_h1: pd.DataFrame) -> tuple:
-    if len(df_h1) < 4: return False, 0
-    c1, c2, c3 = df_h1.iloc[-1], df_h1.iloc[-2], df_h1.iloc[-3]
-    c1_o, c1_c, c1_h, c1_l = c1['open'], c1['close'], c1['high'], c1['low']
-    c2_o, c2_c, c2_h, c2_l = c2['open'], c2['close'], c2['high'], c2['low']
-    c3_o, c3_c, c3_h, c3_l = c3['open'], c3['close'], c3['high'], c3['low']
-    c1_range = c1_h - c1_l
-    c1_body = abs(c1_c - c1_o)
-    c1_lower_shadow = min(c1_o, c1_c) - c1_l
-    c1_upper_shadow = c1_h - max(c1_o, c1_c)
-    c2_body = abs(c2_c - c2_o)
-
-    if c1_range == 0 or c1_body <= 0.03 * c1_range: return False, 0
-    is_c2_bear = c2_c < c2_o
-    is_c1_bull = c1_c > c1_o
-
-    if is_c2_bear and is_c1_bull and (c1_c > c2_o) and (c1_o < c2_c) and (c1_body >= 0.5 * c1_range): return True, 25
-    if (c1_lower_shadow >= 2.0 * c1_body) and (c1_body > 0.05 * c1_range) and (c1_c >= (c1_l + 0.5 * c1_range)): return True, 22
-    if (c1_lower_shadow >= 2.0 * c1_body) and (c1_upper_shadow <= 0.25 * c1_range) and (c1_c >= (c1_h - 0.3 * c1_range)): return True, 24
-    if (c3_c < c3_o) and (abs(c2_c - c2_o) <= 0.3 * (c3_h - c3_l)) and is_c1_bull and (c1_c >= (c3_o + c3_c) / 2): return True, 20
-    if is_c2_bear and is_c1_bull and (c1_o <= c2_c * 1.002) and (c1_c > (c2_o + c2_c)/2) and (c1_c < c2_o): return True, 18
-    atr_14 = c1['atr14'] if 'atr14' in c1 else (c1_range + (c2_h - c2_l)) / 2.0
-    if is_c2_bear and is_c1_bull and (abs(c1_l - c2_l) <= 0.12 * atr_14) and (c1_c > c1_o) and (c2_body <= 1.8 * atr_14) and (c1_lower_shadow >= 0.3 * c1_range): return True, 20
-    if (c3_c > c3_o) and (c2_c > c2_o) and is_c1_bull and (c1_c > c2_c > c3_c) and (c1_body >= 0.4 * c1_range): return True, 23
-    return False, 0
+# Lọc Market Regime theo BTC
+def get_btc_regime(df_btc_h1: pd.DataFrame) -> str:
+    if df_btc_h1.empty: return "SAFE"
+    last = df_btc_h1.iloc[-1]
+    # Nếu BTC nằm dưới EMA50 H1 -> Rủi ro cao (Phòng thủ)
+    if last['close'] < last['ema50']: return "DEFENSIVE"
+    return "SAFE"
 
 # ==============================================================================
-# 5. CÁC THUẬT TOÁN ĐÁNH GIÁ (ALGO 1, 2, 3, 5 VÀ 6)
+# 5. CÁC SETUP LỌC ĐỊNH LƯỢNG (QUANT ENGINES)
 # ==============================================================================
-def evaluate_algorithm_1(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tuple:
-    if df_h1.empty or len(df_h1) < 200 or df_h4.empty or len(df_h4) < 200: return None
-    last_h1, last_h4 = df_h1.iloc[-1], df_h4.iloc[-1]
-    if last_h4['close'] <= last_h4['ema200'] or last_h1['close'] <= last_h1['ema21']: return None
-    dist_pct = ((last_h1['close'] - last_h1['ema21']) / last_h1['ema21']) * 100
-    if dist_pct < 1.0 or dist_pct > 3.0: return None
-    if not any(row['low'] <= row['ema21'] * 1.008 for _, row in df_h1.iloc[-6:-1].iterrows()): return None
-    has_pattern, pattern_weight = check_extended_bullish_reversal_patterns(df_h1)
-    if not has_pattern: return None
-    
-    entry = last_h1['close']
-    sl = min(df_h1['low'].iloc[-6:-1].min(), last_h1['low']) * 0.997
-    if ((entry - sl) / entry) * 100 < 0.8: sl = entry * 0.985
-    tp1 = entry + (entry - sl) * 1.5; tp2 = entry + (entry - sl) * 2.5
-    
-    score = min(60 + pattern_weight + int(min(1.5 * 5, 15)), 98)
-    return {"symbol": symbol, "internal_setup_name": "S1_ENGINE", "candle_ts": int(last_h1['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": 1.5, "score": score}
 
-def evaluate_algorithm_2(symbol: str, df_h4: pd.DataFrame) -> tuple:
-    if df_h4.empty or len(df_h4) < 200: return None
-    last_h4 = df_h4.iloc[-1]
-    h4_o, h4_c, h4_h, h4_l, h4_ema200 = last_h4['open'], last_h4['close'], last_h4['high'], last_h4['low'], last_h4['ema200']
-    if h4_c <= h4_ema200: return None
-    dist_low_pct = abs(h4_l - h4_ema200) / h4_ema200 * 100
-    if dist_low_pct < 0.2 or dist_low_pct > 3.0: return None
-    h4_range = h4_h - h4_l
-    if h4_range == 0: return None
-    h4_body = abs(h4_c - h4_o)
-    shadow_ratio = (min(h4_o, h4_c) - h4_l) / h4_body if h4_body > 0 else 999.0
-    if shadow_ratio < 2.0: return None
-    close_pos = ((h4_c - h4_l) / h4_range) * 100
-    if close_pos < 75.0: return None
+# SETUP 1 & 3 GỘP: H1 PULLBACK THEO TREND H4 (CHUẨN HÓA ATR)
+def quant_setup_pullback(sym, df_h1, df_h4, btc_regime):
+    h4, h1 = df_h4.iloc[-1], df_h1.iloc[-1]
     
-    entry = h4_c; sl = h4_l * 0.997
-    tp1 = entry + (entry - sl) * 1.5; tp2 = entry + (entry - sl) * 2.5
+    # 1. Trend Filter (25đ)
+    trend_score = 0
+    if h4['close'] > h4['ema200'] and h4['ema50'] >= h4['ema200']: trend_score = 25
+    elif h4['close'] > h4['ema200']: trend_score = 15
+    if trend_score == 0: return None
     
-    score = min(70 + int(min(shadow_ratio * 4, 18)) + int((close_pos - 75) * 0.4), 99)
-    return {"symbol": symbol, "internal_setup_name": "S2_ENGINE", "candle_ts": int(last_h4['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": 1.5, "score": score}
-
-def evaluate_algorithm_3(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tuple:
-    if df_h1.empty or len(df_h1) < 200 or df_h4.empty or len(df_h4) < 200: return None
-    last_h1, prev_h1, last_h4 = df_h1.iloc[-1], df_h1.iloc[-2], df_h4.iloc[-1]
-    if last_h4['close'] <= last_h4['ema200'] or last_h1['close'] <= last_h1['ema21'] or last_h1['ema21'] <= prev_h1['ema21']: return None
-    if not any(((row['low'] - row['ema21']) / row['ema21']) * 100 <= 0.5 for _, row in df_h1.iloc[-24:-1].iterrows()): return None
-    has_pattern, pattern_weight = check_extended_bullish_reversal_patterns(df_h1)
-    if not has_pattern: return None
-    dist_close_pct = ((last_h1['close'] - last_h1['ema21']) / last_h1['ema21']) * 100
-    if dist_close_pct > 1.5 or (last_h1['atr14'] > 0 and (last_h1['close'] - last_h1['ema21']) > last_h1['atr14']): return None
+    # 2. Location Filter (25đ) - Cách EMA21 H1 bao nhiêu ATR?
+    dist_atr = abs(h1['close'] - h1['ema21']) / h1['atr14']
+    loc_score = 0
+    if dist_atr <= 0.5 and h1['close'] >= h1['ema21']: loc_score = 25
+    elif dist_atr <= 1.0 and h1['close'] >= h1['ema21']: loc_score = 15
+    elif dist_atr <= 1.5: loc_score = 5
+    if loc_score == 0: return None
     
-    entry = last_h1['close']
-    sl = min(df_h1['low'].iloc[-12:-1].min(), last_h1['low']) * 0.997
-    tp1 = entry + (entry - sl) * 1.5; tp2 = entry + (entry - sl) * 2.5
+    # 3. Confirmation / Candle (20đ)
+    body = abs(h1['close'] - h1['open'])
+    lower_wick = min(h1['close'], h1['open']) - h1['low']
+    conf_score = 0
+    if lower_wick >= 2 * body and h1['close'] > h1['open']: conf_score = 20 # Pinbar đẹp
+    elif h1['close'] > h1['open'] and h1['close'] > df_h1.iloc[-2]['high']: conf_score = 15 # Engulfing
     
-    score = min(65 + pattern_weight + int((1.5 - dist_close_pct) * 8), 96)
-    return {"symbol": symbol, "internal_setup_name": "S3_ENGINE", "candle_ts": int(last_h1['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": 1.5, "score": score}
-
-def evaluate_algorithm_5(symbol: str, df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> tuple:
-    if df_h1.empty or len(df_h1) < 50 or df_h4.empty or len(df_h4) < 50: return None
-    c1, h4_ema200 = df_h1.iloc[-1], df_h4.iloc[-1]['ema200']
-    dist_to_h4_ema200 = ((c1['close'] - h4_ema200) / h4_ema200) * 100
-    if dist_to_h4_ema200 < 0.0 or dist_to_h4_ema200 > 2.5: return None
-    c1_range = c1['high'] - c1['low']
-    if c1_range == 0: return None
-    shadow_pct = (min(c1['open'], c1['close']) - c1['low']) / c1_range
-    recent_low = df_h1['low'].iloc[-12:-1].min()
-    if shadow_pct < 0.30 and c1['low'] > recent_low * 1.002: return None
-    avg_vol_20 = df_h1['volume'].iloc[-21:-1].mean()
-    vol_ratio = c1['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
-    if vol_ratio > 4.5: return None
+    # 4. Volume & Momentum (30đ)
+    vol_score = 15 if h1['rvol'] >= 1.2 else (5 if h1['rvol'] >= 0.8 else 0)
+    mom_score = 15 if h1['ema21'] > df_h1.iloc[-5]['ema21'] else 0
     
-    entry = c1['close']; sl = min(c1['low'], recent_low) * 0.995
-    tp1 = entry + (entry - sl) * 2.0; tp2 = entry + (entry - sl) * 3.5
+    total_score = trend_score + loc_score + conf_score + vol_score + mom_score
+    if total_score < 60: return None
     
-    score = min(75 + int(shadow_pct * 25) + int(min(vol_ratio * 4, 10)), 99)
-    return {"symbol": symbol, "internal_setup_name": "S5_ENGINE", "candle_ts": int(c1['timestamp']), "market_entry": round(entry, 4), "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), "rr": 2.0, "score": score}
-
-# ALGO 6 - SL/TP ĐỘNG DỰA VÀO ĐỘNG LỰC THỊ TRƯỜNG & COIN KHỎE SO VỚI BTC
-def evaluate_algorithm_6_leading_coin(symbol: str, df_h1: pd.DataFrame, df_btc_h1: pd.DataFrame) -> tuple:
-    if df_h1.empty or len(df_h1) < 50 or df_btc_h1.empty or len(df_btc_h1) < 50: return None
-    
-    c1, c6 = df_h1.iloc[-1], df_h1.iloc[-6]
-    btc_c1, btc_c6 = df_btc_h1.iloc[-1], df_btc_h1.iloc[-6]
-
-    if c1['close'] <= c1['ema21']: return None
-
-    sym_ret = (c1['close'] - c6['close']) / c6['close']
-    btc_ret = (btc_c1['close'] - btc_c6['close']) / btc_c6['close']
-    if sym_ret <= btc_ret or sym_ret <= 0: return None
-
-    dist_ema21 = ((c1['close'] - c1['ema21']) / c1['ema21']) * 100
-    if dist_ema21 > 4.5 or dist_ema21 < 0.5: return None
-
-    avg_vol_20 = df_h1['volume'].iloc[-21:-1].mean()
-    vol_ratio = c1['volume'] / avg_vol_20 if avg_vol_20 > 0 else 1.0
-    if vol_ratio < 1.5: return None 
-
-    entry = c1['close']
-    atr_14 = c1['atr14'] if pd.notna(c1['atr14']) and c1['atr14'] > 0 else (c1['high'] - c1['low'])
-    
-    # Tính Stop Loss động dựa trên Cấu trúc 12H và ATR đệm
-    local_swing_low = df_h1['low'].iloc[-12:-1].min()
-    sl = min(c1['low'], local_swing_low) - (atr_14 * 0.3)
+    # Tính SL/TP chuẩn ATR
+    entry = h1['close']
+    swing_low = df_h1['low'].iloc[-6:-1].min()
+    sl = min(swing_low, h1['low']) - (0.5 * h1['atr14'])
     
     risk = entry - sl
-    if risk <= 0: return None
+    if risk <= 0 or (risk / entry * 100 > 10): return None # Bỏ nếu SL > 10%
     
-    if (risk / entry) * 100 < 1.2:
-        sl = entry - (atr_14 * 1.5)
-        risk = entry - sl
-
-    # Tính Lực Đẩy Market Force
-    rs_diff = sym_ret - btc_ret
-    market_force = 1.0 + (vol_ratio * 0.15) + (rs_diff * 10)
-    market_force = min(market_force, 2.5) 
-
-    # Tính Take Profit động theo lực mở rộng
-    recent_resistance = df_h1['high'].iloc[-48:-1].max() 
-    tp1_min = entry + risk * 1.5
-    tp1_base = max(recent_resistance, tp1_min)
-    tp1 = entry + (tp1_base - entry) * min(market_force, 1.3)
+    tp1 = entry + (1.5 * risk)
+    tp2 = entry + (3.0 * risk)
     
-    tp2 = entry + (tp1 - entry) * 1.618 * market_force
-    rr = round((tp1 - entry) / risk, 2)
-    
-    score = 75
-    rs_bonus = min(int(rs_diff * 1000), 15)
-    vol_bonus = min(int((vol_ratio - 1.5) * 4), 10)
-    score = min(score + rs_bonus + vol_bonus, 99)
+    return {"symbol": sym, "setup": "S1_ATR_PULLBACK", "score": total_score, "class": "A" if total_score>=75 else "B", "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": 1.5, "ts": int(h1['timestamp'])}
 
-    return {
-        "symbol": symbol, "internal_setup_name": "S6_RELATIVE_STRENGTH", 
-        "candle_ts": int(c1['timestamp']), "market_entry": round(entry, 4), 
-        "sl": round(sl, 4), "tp1": round(tp1, 4), "tp2": round(tp2, 4), 
-        "rr": rr, "score": score
-    }
+# SETUP 5: NỀN NÉN H4 (BASE BREAKOUT)
+def quant_setup_base_breakout(sym, df_h1, df_h4, btc_regime):
+    h4, h1 = df_h4.iloc[-1], df_h1.iloc[-1]
+    
+    # Check nền 24 nến H1
+    base_high = df_h1['high'].iloc[-25:-1].max()
+    base_low = df_h1['low'].iloc[-25:-1].min()
+    base_range_atr = (base_high - base_low) / h1['atr14']
+    
+    if base_range_atr > 4.0: return None # Nền quá lỏng
+    if h4['ema200'] < df_h4.iloc[-5]['ema200']: return None # H4 EMA200 cắm xuống
+    
+    # Breakout Trigger
+    if h1['close'] <= base_high: return None # Chưa break
+    if h1['rvol'] < 1.5 or h1['rvol'] > 4.5: return None # Vol không đạt hoặc quá fomo
+    
+    # Distance: Tránh mua đuổi nếu nến break quá xa nền
+    if (h1['close'] - base_high) / h1['atr14'] > 1.5: return None
+    
+    entry = h1['close']
+    sl = base_low - (0.3 * h1['atr14'])
+    risk = entry - sl
+    tp1 = entry + (1.5 * risk)
+    tp2 = entry + (3.0 * risk)
+    
+    total_score = 85 # Breakout chuẩn mặc định Class A
+    return {"symbol": sym, "setup": "S5_BASE_BREAKOUT", "score": total_score, "class": "A", "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": 1.5, "ts": int(h1['timestamp'])}
+
+# SETUP 6: COIN KHỎE (RELATIVE STRENGTH vs BTC)
+def quant_setup_rs_leader(sym, df_h1, df_btc_h1, btc_regime):
+    h1, btc_h1 = df_h1.iloc[-1], df_btc_h1.iloc[-1]
+    h1_12, btc_12 = df_h1.iloc[-12], df_btc_h1.iloc[-12]
+    
+    # Tính RS 12H
+    sym_ret = (h1['close'] - h1_12['close']) / h1_12['close']
+    btc_ret = (btc_h1['close'] - btc_12['close']) / btc_12['close']
+    
+    if sym_ret - btc_ret < 0.02: return None # Phải khỏe hơn BTC ít nhất 2%
+    
+    # Chỉ mua nhịp hồi (Flag) hoặc bám EMA, không mua đuổi
+    dist_atr = (h1['close'] - h1['ema21']) / h1['atr14']
+    if dist_atr > 2.0 or dist_atr < 0: return None
+    
+    if h1['rvol'] < 1.5: return None
+    
+    entry = h1['close']
+    sl = df_h1['low'].iloc[-6:-1].min() - (0.5 * h1['atr14'])
+    risk = entry - sl
+    tp1 = entry + (1.5 * risk)
+    tp2 = entry + (3.0 * risk)
+    
+    return {"symbol": sym, "setup": "S6_RS_LEADER", "score": 90, "class": "A", "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": 1.5, "ts": int(h1['timestamp'])}
 
 # ==============================================================================
-# 6. GỬI CẢNH BÁO TELEGRAM (ẨN PHƯƠNG PHÁP, CHỈ HIỂN THỊ ĐIỂM SỐ UY TÍN)
+# 6. TELEGRAM ALERT (HIỂN THỊ HẠNG A/B & KHUYẾN NGHỊ ĐI VỐN)
 # ==============================================================================
-def send_telegram_alert(sig: dict) -> bool:
+def send_telegram_alert(sig: dict, btc_regime: str) -> bool:
     if not BOT_TOKEN or not CHAT_ID: return False
+    
+    # Khuyến nghị đi vốn theo Hạng và BTC
+    size_advice = "Vào 100% Vol (Hạng A)" if sig['class'] == 'A' else "Vào 50% Vol (Hạng B)"
+    if btc_regime == "DEFENSIVE": size_advice = "⚠️ BTC ĐANG XẤU - Chỉ vào 30-50% Vol hoặc Bỏ qua!"
 
-    msg = f"""🚀 <b>[HIGH QUALITY LONG SIGNAL] #{sig['symbol']}</b>
+    msg = f"""🚀 <b>[QUANT SYSTEM SIGNAL] #{sig['symbol']}</b>
 -------------------------------------
-⭐️ <b>ĐIỂM UY TÍN KỸ THUẬT: {sig['score']}/100</b>
+⭐️ <b>HẠNG TÍN HIỆU: CLASS {sig['class']} (Score: {sig['score']}/100)</b>
+📊 <b>TRẠNG THÁI BTC: {btc_regime}</b>
+💡 <b>KHUYẾN NGHỊ VỐN:</b> <i>{size_advice}</i>
 -------------------------------------
 🎯 <b>KẾ HOẠCH VÀO LỆNH (LONG):</b>
 
-📍 <b>Entry:</b> <code>{sig['market_entry']:.4f}</code>
-🛑 <b>Stop Loss:</b> <code>{sig['sl']:.4f}</code>
-🎯 <b>Take Profit 1:</b> <code>{sig['tp1']:.4f}</code>
-🚀 <b>Take Profit 2:</b> <code>{sig['tp2']:.4f}</code>
-📐 <b>Tỷ lệ R:R Tham khảo:</b> 1:{sig['rr']}
+📍 <b>Entry (Thị trường):</b> <code>{sig['entry']:.4f}</code>
+🛑 <b>Stop Loss (Đệm ATR):</b> <code>{sig['sl']:.4f}</code>
+🎯 <b>Take Profit 1 (1.5R):</b> <code>{sig['tp1']:.4f}</code> <i>(Chốt 50%, dời SL hòa vốn)</i>
+🚀 <b>Take Profit 2 (Trailing):</b> <code>{sig['tp2']:.4f}</code> <i>(Gồng theo EMA21 H1)</i>
 -------------------------------------
-👉 <b>CHECK CHART & QUẢN TRỊ RỦI RO ĐẦY ĐỦ!</b>"""
+👉 <b>{sig['setup']} - STRICT RISK MANAGEMENT!</b>"""
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
-        res = requests.post(url, json=payload, timeout=8)
+        res = requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=8)
         return res.status_code == 200
-    except Exception as e:
-        print(f"[TELEGRAM ERROR]: {e}", flush=True)
-        return False
+    except: return False
 
 # ==============================================================================
-# 7. VÒNG LẶP SCANNER BẤT TẬN
+# 7. VÒNG LẶP QUÉT ĐỊNH LƯỢNG (MAIN LOOP)
 # ==============================================================================
-def run_scanner_loop():
+def run_quant_scanner():
     init_db()
     Thread(target=run_flask, daemon=True).start()
 
-    print("⚡️ Bắt đầu Bybit Top-Down Scanner (5 Algorithms - Đã ẩn Setup 4)...", flush=True)
+    print("⚡️ Bắt đầu Quant Engine (ATR Norm, BTC Regime, Soft Scoring)...", flush=True)
     while True:
         try:
-            # Lấy dữ liệu BTC để đo sức mạnh tương đối (RS)
-            df_btc_h1 = get_closed_klines_df("BTCUSDT", "60", limit=220)
-            if df_btc_h1.empty or len(df_btc_h1) < 200:
-                print("⏳ Không tải được dữ liệu BTCUSDT, bỏ qua vòng quét này...")
+            # 1. Đo lường Market Regime (BTC)
+            df_btc_h1 = get_klines("BTCUSDT", "60", limit=220)
+            if df_btc_h1.empty:
                 time.sleep(10)
                 continue
+            
+            df_btc_h1 = add_indicators(df_btc_h1)
+            btc_regime = get_btc_regime(df_btc_h1)
+            print(f"\n🌍 Trạng thái thị trường (BTC Regime): {btc_regime}", flush=True)
+            
+            # Nếu thị trường quá xấu, cảnh báo giới hạn lệnh
+            active_trades = get_active_trades_count()
+            if active_trades >= MAX_ACTIVE_TRADES:
+                print(f"⏸ Đã đạt max {MAX_ACTIVE_TRADES} lệnh mở. Tạm ngưng quét để bảo toàn rủi ro...", flush=True)
+                time.sleep(SCAN_INTERVAL_SECONDS)
+                continue
 
-            tickers = get_bybit_crypto_tickers()
+            tickers = get_tickers()
             sent_count = 0
+            print(f"🔍 [SCANNER] Đang rà soát {len(tickers[:MAX_SYMBOLS_SCAN])} đồng có thanh khoản tốt...", flush=True)
 
             for t in tickers[:MAX_SYMBOLS_SCAN]:
                 sym = t['symbol']
-                df_h1 = get_closed_klines_df(sym, "60", limit=220)
-                df_h4 = get_closed_klines_df(sym, "240", limit=220)
-                
-                if df_h1.empty or df_h4.empty or len(df_h1) < 200 or len(df_h4) < 200: continue
+                print(f"  ➤ Đang soi Quant Model: {sym}...", end="\r", flush=True) 
+
+                df_h1 = get_klines(sym, "60", limit=220)
+                df_h4 = get_klines(sym, "240", limit=220)
+                if df_h1.empty or df_h4.empty: continue
+                    
                 df_h1 = add_indicators(df_h1)
                 df_h4 = add_indicators(df_h4)
 
+                # Chạy qua các màng lọc Quant
                 candidates = []
-                # Đánh giá đồng loạt các Setup (1, 2, 3, 5, và 6)
                 for eval_fn in [
-                    lambda: evaluate_algorithm_1(sym, df_h1, df_h4),
-                    lambda: evaluate_algorithm_2(sym, df_h4),
-                    lambda: evaluate_algorithm_3(sym, df_h1, df_h4),
-                    lambda: evaluate_algorithm_5(sym, df_h1, df_h4),
-                    lambda: evaluate_algorithm_6_leading_coin(sym, df_h1, df_btc_h1)
+                    lambda: quant_setup_pullback(sym, df_h1, df_h4, btc_regime),
+                    lambda: quant_setup_base_breakout(sym, df_h1, df_h4, btc_regime),
+                    lambda: quant_setup_rs_leader(sym, df_h1, df_btc_h1, btc_regime)
                 ]:
                     res = eval_fn()
-                    if res and res['score'] >= MIN_QUALITY_SCORE:
-                        candidates.append(res)
+                    if res: candidates.append(res)
 
-                # Chọn kèo có điểm số cao nhất của Coin đó để gửi đi
                 if candidates:
                     best_sig = max(candidates, key=lambda x: x['score'])
-                    if get_active_trades_count() < MAX_ACTIVE_TRADES or is_symbol_currently_active(sym):
-                        if not is_signal_already_sent(sym, best_sig['internal_setup_name'], best_sig['candle_ts']):
-                            if send_telegram_alert(best_sig):
-                                record_sent_signal(sym, best_sig['internal_setup_name'], best_sig['candle_ts'])
-                                save_active_trade(best_sig)
-                                sent_count += 1
-                                print(f"✅ [SIGNAL SENT] #{sym} | Score: {best_sig['score']}/100", flush=True)
+                    
+                    # Phòng thủ: Nếu BTC đang xấu, từ chối lệnh Hạng B
+                    if btc_regime == "DEFENSIVE" and best_sig['class'] == 'B':
+                        continue
 
-            print(f"\n📊 --- BÁO CÁO VÒNG QUÉT TỰ ĐỘNG ---", flush=True)
-            print(f"• Tín hiệu lọc được và gửi thành công: {sent_count}", flush=True)
+                    if not is_signal_sent(sym, best_sig['setup'], best_sig['ts']):
+                        if send_telegram_alert(best_sig, btc_regime):
+                            record_signal(sym, best_sig['setup'], best_sig['ts'])
+                            sent_count += 1
+                            print(f"\n✅ [SIGNAL FIRED] #{sym} | Hạng {best_sig['class']} | Setup: {best_sig['setup']}", flush=True)
+                            
+                            # Nếu nổ lệnh, dừng quét 5 phút (Cooldown) để không bị spam nhiều lệnh cùng lúc
+                            print(f"⏳ Cooldown 5 phút sau khi bắn lệnh để tránh tương quan rủi ro...", flush=True)
+                            time.sleep(300)
+                            break # Thoát vòng for để bắt đầu lại từ đầu
+
+            print(f"\n📊 --- BÁO CÁO VÒNG QUÉT ---", flush=True)
+            print(f"• Tín hiệu nổ thành công: {sent_count}")
+            print(f"⏳ Bot tạm nghỉ {SCAN_INTERVAL_SECONDS} giây...", flush=True)
 
         except Exception as e:
-            print(f"[ERROR] Scanner Loop Error: {e}", flush=True)
+            print(f"\n[ERROR] Quant Loop Error: {e}", flush=True)
 
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
-    run_scanner_loop()
+    run_quant_scanner()

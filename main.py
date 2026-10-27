@@ -1,4 +1,4 @@
-import os
+code = """import os
 import time
 import requests
 import numpy as np
@@ -26,9 +26,9 @@ def run_flask():
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 
-MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "20000000")) # Lọc thanh khoản > 20M USD
+MIN_TURNOVER_24H = float(os.environ.get("MIN_TURNOVER_24H", "1000000")) # Lọc thanh khoản > 1M USD
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
-MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "100"))
+MAX_SYMBOLS_SCAN = int(os.environ.get("MAX_SYMBOLS_SCAN", "300")) # Quét tối đa 300 coin
 
 MAX_ACTIVE_TRADES = 3  # Giới hạn rủi ro: Tối đa 3 lệnh mở cùng lúc
 DB_PATH = "quant_signals.db"
@@ -40,7 +40,7 @@ BASE_URL = "https://api.bybit.com"
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("""
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS sent_signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL,
@@ -48,15 +48,15 @@ def init_db():
                 candle_timestamp INTEGER NOT NULL,
                 UNIQUE(symbol, setup_name, candle_timestamp)
             )
-        """)
-        cursor.execute("""
+        ''')
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS active_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT UNIQUE NOT NULL,
                 entry REAL NOT NULL,
                 status TEXT DEFAULT 'OPEN'
             )
-        """)
+        ''')
         conn.commit()
 
 def is_signal_sent(symbol: str, setup_name: str, candle_ts: int) -> bool:
@@ -91,7 +91,7 @@ def get_tickers():
                 sym = t.get("symbol", "")
                 turnover = float(t.get("turnover24h", 0))
                 price_chg = float(t.get("price24hPcnt", 0)) * 100
-                # Lọc: Turnover > 20M, chưa pump quá 20% trong 24h
+                # Lọc: Turnover > 1M, chưa pump quá 20% trong 24h
                 if sym.endswith("USDT") and turnover >= MIN_TURNOVER_24H and price_chg <= 20.0:
                     valid.append({"symbol": sym, "turnover": turnover})
             return sorted(valid, key=lambda x: x["turnover"], reverse=True)
@@ -249,7 +249,7 @@ def send_telegram_alert(sig: dict, btc_regime: str) -> bool:
     size_advice = "Vào 100% Vol (Hạng A)" if sig['class'] == 'A' else "Vào 50% Vol (Hạng B)"
     if btc_regime == "DEFENSIVE": size_advice = "⚠️ BTC ĐANG XẤU - Chỉ vào 30-50% Vol hoặc Bỏ qua!"
 
-    msg = f"""🚀 <b>[QUANT SYSTEM SIGNAL] #{sig['symbol']}</b>
+    msg = f'''🚀 <b>[QUANT SYSTEM SIGNAL] #{sig['symbol']}</b>
 -------------------------------------
 ⭐️ <b>HẠNG TÍN HIỆU: CLASS {sig['class']} (Score: {sig['score']}/100)</b>
 📊 <b>TRẠNG THÁI BTC: {btc_regime}</b>
@@ -262,7 +262,7 @@ def send_telegram_alert(sig: dict, btc_regime: str) -> bool:
 🎯 <b>Take Profit 1 (1.5R):</b> <code>{sig['tp1']:.4f}</code> <i>(Chốt 50%, dời SL hòa vốn)</i>
 🚀 <b>Take Profit 2 (Trailing):</b> <code>{sig['tp2']:.4f}</code> <i>(Gồng theo EMA21 H1)</i>
 -------------------------------------
-👉 <b>{sig['setup']} - STRICT RISK MANAGEMENT!</b>"""
+👉 <b>{sig['setup']} - STRICT RISK MANAGEMENT!</b>'''
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
@@ -277,7 +277,7 @@ def run_quant_scanner():
     init_db()
     Thread(target=run_flask, daemon=True).start()
 
-    print("⚡️ Bắt đầu Quant Engine (ATR Norm, BTC Regime, Soft Scoring)...", flush=True)
+    print("⚡️ Bắt đầu Quant Engine (Quét 300 Coin, Turnover > 1M)...", flush=True)
     while True:
         try:
             # 1. Đo lường Market Regime (BTC)
@@ -288,7 +288,7 @@ def run_quant_scanner():
             
             df_btc_h1 = add_indicators(df_btc_h1)
             btc_regime = get_btc_regime(df_btc_h1)
-            print(f"\n🌍 Trạng thái thị trường (BTC Regime): {btc_regime}", flush=True)
+            print(f"\\n🌍 Trạng thái thị trường (BTC Regime): {btc_regime}", flush=True)
             
             # Nếu thị trường quá xấu, cảnh báo giới hạn lệnh
             active_trades = get_active_trades_count()
@@ -303,7 +303,7 @@ def run_quant_scanner():
 
             for t in tickers[:MAX_SYMBOLS_SCAN]:
                 sym = t['symbol']
-                print(f"  ➤ Đang soi Quant Model: {sym}...", end="\r", flush=True) 
+                print(f"  ➤ Đang soi Quant Model: {sym}...", end="\\r", flush=True) 
 
                 df_h1 = get_klines(sym, "60", limit=220)
                 df_h4 = get_klines(sym, "240", limit=220)
@@ -333,21 +333,28 @@ def run_quant_scanner():
                         if send_telegram_alert(best_sig, btc_regime):
                             record_signal(sym, best_sig['setup'], best_sig['ts'])
                             sent_count += 1
-                            print(f"\n✅ [SIGNAL FIRED] #{sym} | Hạng {best_sig['class']} | Setup: {best_sig['setup']}", flush=True)
+                            print(f"\\n✅ [SIGNAL FIRED] #{sym} | Hạng {best_sig['class']} | Setup: {best_sig['setup']}", flush=True)
                             
                             # Nếu nổ lệnh, dừng quét 5 phút (Cooldown) để không bị spam nhiều lệnh cùng lúc
                             print(f"⏳ Cooldown 5 phút sau khi bắn lệnh để tránh tương quan rủi ro...", flush=True)
                             time.sleep(300)
                             break # Thoát vòng for để bắt đầu lại từ đầu
 
-            print(f"\n📊 --- BÁO CÁO VÒNG QUÉT ---", flush=True)
+            print(f"\\n📊 --- BÁO CÁO VÒNG QUÉT ---", flush=True)
             print(f"• Tín hiệu nổ thành công: {sent_count}")
             print(f"⏳ Bot tạm nghỉ {SCAN_INTERVAL_SECONDS} giây...", flush=True)
 
         except Exception as e:
-            print(f"\n[ERROR] Quant Loop Error: {e}", flush=True)
+            print(f"\\n[ERROR] Quant Loop Error: {e}", flush=True)
 
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
     run_quant_scanner()
+"""
+
+with open("main.py", "w", encoding="utf-8") as f:
+    f.write(code)
+
+print("Your PY file is ready")
+print("[file-tag: main.py]")

@@ -33,9 +33,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters
+    ContextTypes
 )
 
 # -----------------------------------------------------------------------------
@@ -59,13 +57,17 @@ SCAN_INTERVAL_MINUTES = 60  # Quét sau mỗi nến H1 đóng (hoặc chu kỳ 1
 SYMBOL_REFRESH_HOURS = 6   # Cập nhật danh sách coin mỗi 6 giờ
 
 # Danh sách mã TradFi/Non-crypto loại trừ nếu xuất hiện
-TRADFI_PREFIXES_EXCLUDE = ("XAU", "XAG", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD", "US30", "US500", "NAS100", "DE30", "UK100", "NIKKEI", "AAPL", "NVDA", "TSLA", "AMZN", "MSFT", "GOOGL", "META")
+TRADFI_PREFIXES_EXCLUDE = (
+    "XAU", "XAG", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD", 
+    "US30", "US500", "NAS100", "DE30", "UK100", "NIKKEI", 
+    "AAPL", "NVDA", "TSLA", "AMZN", "MSFT", "GOOGL", "META"
+)
 
 # Lock chống quét chồng lặp
 SCAN_LOCK = asyncio.Lock()
 
 # -----------------------------------------------------------------------------
-# 2. FLASK HEALTH CHECK SERVER
+# 2. FLASK HEALTH CHECK SERVER (Duy trì keep-alive trên Render)
 # -----------------------------------------------------------------------------
 flask_app = Flask(__name__)
 
@@ -134,17 +136,6 @@ class DatabaseManager:
                 watch_price REAL NOT NULL,
                 candles_count INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """)
-
-            # Bảng lưu Klines Cache
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS klines_cache (
-                symbol TEXT NOT NULL,
-                interval TEXT NOT NULL,
-                open_time INTEGER NOT NULL,
-                open REAL, high REAL, low REAL, close REAL, volume REAL,
-                PRIMARY KEY (symbol, interval, open_time)
             )
             """)
 
@@ -221,8 +212,6 @@ class DatabaseManager:
             cursor.execute(query, params)
             conn.commit()
 
-    # ĐÃ XÓA ĐOẠN CODE LỖI `def get_active_signals((...):` TẠI ĐÂY
-
     def get_active_signals_list(self) -> List[Dict[str, Any]]:
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -255,12 +244,6 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM watch_list")
             return [dict(row) for row in cursor.fetchall()]
-
-    def update_watch_candle_count(self, symbol: str):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE watch_list SET candles_count = candles_count + 1 WHERE symbol=?", (symbol,))
-            conn.commit()
 
     def delete_watch(self, symbol: str):
         with self.get_connection() as conn:
@@ -299,7 +282,7 @@ class BybitClient:
                         return data.get("result", {})
                     else:
                         logger.warning(f"Bybit API error code {data.get('retCode')}: {data.get('retMsg')}")
-                elif resp.status_code == 429: # Rate limit
+                elif resp.status_code == 429:
                     time.sleep(2 * (attempt + 1))
             except Exception as e:
                 logger.error(f"Lỗi HTTP/Connection khi gọi {endpoint}: {e}")
@@ -307,10 +290,6 @@ class BybitClient:
         return None
 
     def get_all_crypto_usdt_perpetual_symbols(self) -> List[Dict[str, Any]]:
-        """
-        Lấy toàn bộ danh sách cặp coin Crypto USDT Perpetual đang hoạt động.
-        Phân trang qua nextPageCursor, loại bỏ TradFi / Cổ phiếu / Forex.
-        """
         symbols = []
         cursor = ""
         while True:
@@ -332,9 +311,7 @@ class BybitClient:
                 settle_coin = item.get("settleCoin", "")
                 base_coin = item.get("baseCoin", "").upper()
 
-                # Kiểm tra bộ lọc
                 if contract_type == "LinearPerpetual" and settle_coin == "USDT":
-                    # Loại bỏ các cặp không phải Crypto
                     if base_coin.startswith(TRADFI_PREFIXES_EXCLUDE):
                         continue
                     symbols.append({
@@ -352,10 +329,6 @@ class BybitClient:
         return symbols
 
     def fetch_klines(self, symbol: str, interval: str = "60", limit: int = 200) -> Optional[pd.DataFrame]:
-        """
-        Interval values: '60' (H1), '240' (H4), 'D' (D1)
-        Trả về DataFrame chuẩn sắp xếp thời gian tăng dần (cũ -> mới).
-        """
         params = {
             "category": "linear",
             "symbol": symbol,
@@ -366,11 +339,9 @@ class BybitClient:
         if not res or "list" not in res or len(res["list"]) == 0:
             return None
 
-        # Bybit trả về nến mới nhất ở đầu mảng (descending)
         raw_list = res["list"]
         rows = []
         for item in raw_list:
-            # item: [start_time, open, high, low, close, volume, turnover]
             rows.append({
                 "open_time": int(item[0]),
                 "open": float(item[1]),
@@ -403,31 +374,24 @@ bybit = BybitClient()
 class TechnicalAnalyzer:
     @staticmethod
     def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-        """Thêm các chỉ báo EMA20, SMA20 Volume, RSI, ATR, ADX & DI"""
         if df is None or len(df) < 30:
             return df
 
-        # EMA 20
         df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
-
-        # SMA 20 Volume
         df['vol_sma20'] = df['volume'].rolling(window=20).mean()
 
-        # RSI (14)
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / (loss.replace(0, 0.00001))
         df['rsi'] = 100 - (100 / (1 + rs))
 
-        # ATR (14)
         tr1 = df['high'] - df['low']
         tr2 = (df['high'] - df['close'].shift(1)).abs()
         tr3 = (df['low'] - df['close'].shift(1)).abs()
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         df['atr'] = tr.rolling(window=14).mean()
 
-        # ADX (14) & +DI / -DI
         up_move = df['high'] - df['high'].shift(1)
         down_move = df['low'].shift(1) - df['low']
 
@@ -447,7 +411,6 @@ class TechnicalAnalyzer:
 
     @staticmethod
     def find_pivots(df: pd.DataFrame, left: int = 3, right: int = 3) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Xác định Swing High (Pivot High) và Swing Low (Pivot Low) trong quá khứ"""
         swing_highs = []
         swing_lows = []
 
@@ -458,12 +421,10 @@ class TechnicalAnalyzer:
             current_high = df['high'].iloc[i]
             current_low = df['low'].iloc[i]
 
-            # Swing High
             if all(current_high >= df['high'].iloc[i - k] for k in range(1, left + 1)) and \
                all(current_high > df['high'].iloc[i + k] for k in range(1, right + 1)):
                 swing_highs.append({'index': i, 'price': current_high, 'time': df['open_time'].iloc[i]})
 
-            # Swing Low
             if all(current_low <= df['low'].iloc[i - k] for k in range(1, left + 1)) and \
                all(current_low < df['low'].iloc[i + k] for k in range(1, right + 1)):
                 swing_lows.append({'index': i, 'price': current_low, 'time': df['open_time'].iloc[i]})
@@ -472,10 +433,6 @@ class TechnicalAnalyzer:
 
     @staticmethod
     def check_h4_bullish_choch(df_h4: pd.DataFrame) -> Tuple[bool, float, float]:
-        """
-        Kiểm tra CHoCH Tăng trên H4 trong 8 nến H4 gần nhất.
-        Trả về: (Is_CHoCH, Swing_High_Broken, Swing_Low_Origin)
-        """
         if df_h4 is None or len(df_h4) < 20:
             return False, 0.0, 0.0
 
@@ -487,9 +444,8 @@ class TechnicalAnalyzer:
         last_swing_low = swing_lows[-1]['price']
         atr_h4 = df_h4['atr'].iloc[-2] if not np.isnan(df_h4['atr'].iloc[-2]) else (last_swing_high * 0.01)
 
-        # Kiểm tra 8 nến H4 gần nhất có nến nào đóng cửa vượt Swing High trước đó + 0.1 ATR H4
         recent_h4 = df_h4.tail(8)
-        for idx, row in recent_h4.iterrows():
+        for _, row in recent_h4.iterrows():
             if row['close'] > (last_swing_high + 0.1 * atr_h4):
                 return True, last_swing_high, last_swing_low
 
@@ -501,31 +457,19 @@ class TechnicalAnalyzer:
 class WaveStrengthEngine:
     @staticmethod
     def calculate_score(df_h1: pd.DataFrame, df_h4: pd.DataFrame, btc_24h_gain: float) -> int:
-        """
-        Tính điểm sức mạnh sóng 0 - 100 điểm dựa trên đặc tả:
-        1. Cấu trúc H4: 25d
-        2. ADX & DI H4: 20d
-        3. RSI H1/H4: 15d
-        4. Volume & Động lượng H1: 20d
-        5. EMA20 H4: 10d
-        6. Sức mạnh tương đối so với BTC: 10d
-        """
         score = 0
         if df_h1 is None or df_h4 is None or len(df_h1) < 20 or len(df_h4) < 20:
             return 50
 
-        # Nến đã đóng mới nhất
         h1_last = df_h1.iloc[-2]
         h4_last = df_h4.iloc[-2]
 
-        # 1. Cấu trúc H4 (Max 25 pts)
         is_choch, _, _ = TechnicalAnalyzer.check_h4_bullish_choch(df_h4)
         if is_choch:
             score += 25
         elif h4_last['close'] > h4_last['ema20']:
             score += 15
 
-        # 2. ADX và DI H4 (Max 20 pts)
         adx_h4 = h4_last['adx'] if not np.isnan(h4_last['adx']) else 20.0
         plus_di = h4_last['plus_di'] if not np.isnan(h4_last['plus_di']) else 0.0
         minus_di = h4_last['minus_di'] if not np.isnan(h4_last['minus_di']) else 0.0
@@ -535,7 +479,6 @@ class WaveStrengthEngine:
         elif adx_h4 >= 20 and plus_di > minus_di:
             score += 12
 
-        # 3. RSI H1 / H4 (Max 15 pts)
         rsi_h1 = h1_last['rsi'] if not np.isnan(h1_last['rsi']) else 50.0
         rsi_h4 = h4_last['rsi'] if not np.isnan(h4_last['rsi']) else 50.0
 
@@ -544,7 +487,6 @@ class WaveStrengthEngine:
         elif rsi_h1 >= 50 or rsi_h4 >= 50:
             score += 8
 
-        # 4. Volume và Động lượng (Max 20 pts)
         vol_sma = h1_last['vol_sma20'] if not np.isnan(h1_last['vol_sma20']) else 1.0
         vol_ratio = h1_last['volume'] / (vol_sma if vol_sma > 0 else 1.0)
 
@@ -555,11 +497,9 @@ class WaveStrengthEngine:
         elif vol_ratio >= 1.2:
             score += 8
 
-        # 5. EMA20 H4 (Max 10 pts)
         if h4_last['close'] > h4_last['ema20']:
             score += 10
 
-        # 6. Sức mạnh tương đối với BTC (Max 10 pts)
         coin_24h_gain = ((df_h1['close'].iloc[-2] - df_h1['close'].iloc[-25]) / df_h1['close'].iloc[-25]) * 100 if len(df_h1) > 25 else 0.0
         if coin_24h_gain > btc_24h_gain:
             score += 10
@@ -572,45 +512,29 @@ class WaveStrengthEngine:
 class SetupDetector:
     @staticmethod
     def detect_setup_1_early_reversal(df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> Tuple[bool, bool, Dict[str, Any]]:
-        """
-        SETUP 1 – EARLY REVERSAL
-        Trả về: (Is_Confirmed_Signal, Is_Watch_Signal, Detail_Dict)
-        """
         if df_h1 is None or df_h4 is None or len(df_h1) < 30 or len(df_h4) < 20:
             return False, False, {}
 
-        h1_last = df_h1.iloc[-2]  # Nến H1 đóng gần nhất
-        h4_last = df_h4.iloc[-2]  # Nến H4 đóng gần nhất
+        h1_last = df_h1.iloc[-2]
+        h4_last = df_h4.iloc[-2]
         atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (h1_last['close'] * 0.01)
 
-        # Điều kiện H1:
-        # - Đóng cửa vượt đỉnh 12 nến trước
         high_12 = df_h1['high'].iloc[-14:-2].max()
         cond_h1_breakout = h1_last['close'] > high_12
-
-        # - Volume H1 > 1.5x SMA20 Volume
         vol_sma = h1_last['vol_sma20'] if not np.isnan(h1_last['vol_sma20']) else 1.0
         cond_h1_vol = h1_last['volume'] > (1.5 * vol_sma)
-
-        # - EMA20 H1 hướng lên
         cond_h1_ema = h1_last['ema20'] > df_h1['ema20'].iloc[-3]
-
-        # - Giá chưa cách vùng breakout quá 1.5 ATR H1
         cond_h1_dist = (h1_last['close'] - high_12) <= (1.5 * atr_h1)
 
         h1_valid = cond_h1_breakout and cond_h1_vol and cond_h1_ema and cond_h1_dist
-
         if not h1_valid:
             return False, False, {}
 
-        # Điều kiện H4:
         is_h4_choch, _, h4_swing_low = TechnicalAnalyzer.check_h4_bullish_choch(df_h4)
         cond_h4_rsi = h4_last['rsi'] > 50 and h4_last['rsi'] > df_h4['rsi'].iloc[-3]
         cond_h4_di = h4_last['plus_di'] > h4_last['minus_di']
-
         h4_confirmed = is_h4_choch and cond_h4_rsi and cond_h4_di
 
-        # Tìm H1 Swing Low gần nhất để làm SL
         _, h1_lows = TechnicalAnalyzer.find_pivots(df_h1, left=2, right=2)
         h1_sl_price = h1_lows[-1]['price'] if h1_lows else df_h1['low'].iloc[-6:-2].min()
 
@@ -618,56 +542,44 @@ class SetupDetector:
             "symbol": "",
             "setup_name": "SETUP 1 – EARLY REVERSAL",
             "signal_price": h1_last['close'],
-            "paper_entry": df_h1['open'].iloc[-1],  # Open nến tiếp theo
+            "paper_entry": df_h1['open'].iloc[-1],
             "structure_low": h1_sl_price if h1_lows else h4_swing_low,
             "atr_h1": atr_h1,
             "vol_ratio": round(h1_last['volume'] / (vol_sma if vol_sma > 0 else 1.0), 2)
         }
 
         if h1_valid and h4_confirmed:
-            return True, False, details  # CONFIRMED LONG
+            return True, False, details
         elif h1_valid:
-            return False, True, details  # EARLY WATCH (H1 hợp lệ nhưng H4 chưa xác nhận)
+            return False, True, details
 
         return False, False, {}
 
     @staticmethod
     def detect_setup_2_accumulation_breakout(df_h1: pd.DataFrame, df_h4: pd.DataFrame) -> Tuple[bool, bool, Dict[str, Any]]:
-        """
-        SETUP 2 – ACCUMULATION BREAKOUT
-        """
         if df_h1 is None or len(df_h1) < 50:
             return False, False, {}
 
         h1_last = df_h1.iloc[-2]
         atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (h1_last['close'] * 0.01)
 
-        # 1. Tích lũy trong 18-48 nến
-        base_df = df_h1.iloc[-30:-2]  # Lấy 28 nến
+        base_df = df_h1.iloc[-30:-2]
         base_high = base_df['high'].max()
         base_low = base_df['low'].min()
         range_height = base_high - base_low
 
         cond_range_atr = range_height <= (5.0 * atr_h1)
-
-        # 2. ATR co hẹp trước breakout
         atr_recent = df_h1['atr'].iloc[-6:-2].mean()
         atr_prior = df_h1['atr'].iloc[-20:-6].mean()
         cond_atr_contract = atr_recent <= atr_prior
 
-        # 3. Nến H1 đóng cửa vượt đỉnh nền tối thiểu 0.1 ATR
         cond_breakout = h1_last['close'] > (base_high + 0.1 * atr_h1)
-
-        # 4. Volume breakout > 1.8x SMA20
         vol_sma = h1_last['vol_sma20'] if not np.isnan(h1_last['vol_sma20']) else 1.0
         cond_vol = h1_last['volume'] > (1.8 * vol_sma)
 
-        # 5. Thân nến >= 60% biên độ (High - Low)
         candle_range = h1_last['high'] - h1_last['low']
         candle_body = abs(h1_last['close'] - h1_last['open'])
         cond_body = (candle_body / (candle_range if candle_range > 0 else 1.0)) >= 0.60
-
-        # 6. RSI H1 từ 55 - 72
         rsi_h1 = h1_last['rsi'] if not np.isnan(h1_last['rsi']) else 50.0
         cond_rsi = 55.0 <= rsi_h1 <= 72.0
 
@@ -682,21 +594,17 @@ class SetupDetector:
                 "atr_h1": atr_h1,
                 "vol_ratio": round(h1_last['volume'] / (vol_sma if vol_sma > 0 else 1.0), 2)
             }
-            # Kiểm tra bối cảnh H4
             h4_last = df_h4.iloc[-2] if df_h4 is not None and len(df_h4) >= 5 else None
             h4_bearish = h4_last is not None and h4_last['close'] < h4_last['ema20'] and h4_last['rsi'] < 45
 
             if h4_bearish:
-                return False, True, details # BOUNCE RISK / WATCH
-            return True, False, details     # CONFIRMED LONG
+                return False, True, details
+            return True, False, details
 
         return False, False, {}
 
     @staticmethod
     def detect_setup_3_breakout_retest(df_h1: pd.DataFrame, df_h4: pd.DataFrame, prior_breakout_price: float) -> Tuple[bool, Dict[str, Any]]:
-        """
-        SETUP 3 – BREAKOUT RETEST
-        """
         if df_h1 is None or len(df_h1) < 20 or prior_breakout_price <= 0:
             return False, {}
 
@@ -704,21 +612,13 @@ class SetupDetector:
         h1_prev = df_h1.iloc[-3]
         atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (h1_last['close'] * 0.01)
 
-        # Retest nằm trong khoảng 1-8 nến gần nhất
         recent_low = df_h1['low'].iloc[-8:-2].min()
         cond_retest_dist = abs(recent_low - prior_breakout_price) <= (0.3 * atr_h1)
-
-        # Không đóng dưới vùng breakout quá 0.3 ATR
         cond_no_deep_close = all(df_h1['close'].iloc[-8:-2] >= (prior_breakout_price - 0.3 * atr_h1))
-
-        # Nến tăng xác nhận đóng trên đỉnh nến trước
         cond_bullish_confirm = h1_last['close'] > h1_prev['high'] and h1_last['close'] > h1_last['open']
 
-        # Volume > 1.2x SMA20
         vol_sma = h1_last['vol_sma20'] if not np.isnan(h1_last['vol_sma20']) else 1.0
         cond_vol = h1_last['volume'] > (1.2 * vol_sma)
-
-        # RSI H4 >= 55
         h4_rsi = df_h4['rsi'].iloc[-2] if df_h4 is not None and len(df_h4) >= 5 else 50.0
         cond_h4_rsi = h4_rsi >= 55.0
 
@@ -742,11 +642,6 @@ class SetupDetector:
 class SmartRiskEngine:
     @staticmethod
     def calculate_sl(setup_name: str, details: Dict[str, Any]) -> Tuple[float, str, bool, str]:
-        """
-        Tính SL theo cấu trúc giá và ATR theo đúng quy tắc:
-        SL = Structure_Low - 0.35 * ATR_H1
-        Trả về: (SL_Price, Reason_String, Is_Valid, Tag)
-        """
         paper_entry = details["paper_entry"]
         atr_h1 = details["atr_h1"]
 
@@ -764,8 +659,6 @@ class SmartRiskEngine:
             reason = "Default Structure Low"
 
         sl_price = struct_low - (0.35 * atr_h1)
-
-        # Kiểm tra tính hợp lệ
         if sl_price >= paper_entry:
             return 0.0, "SL >= Paper Entry (Invalid)", False, "INVALID_SL"
 
@@ -783,48 +676,29 @@ class SmartRiskEngine:
 
     @staticmethod
     def calculate_tp(df_h1: pd.DataFrame, df_h4: pd.DataFrame, paper_entry: float, sl_price: float) -> Tuple[float, float, float, float, str]:
-        """
-        Tìm kháng cự gần nhất trên H1/H4 làm TP1 và TP2.
-        Trả về: (TP1, TP2, RR_TP1, RR_TP2, TP2_Note)
-        """
         risk = paper_entry - sl_price
         if risk <= 0:
             return round(paper_entry * 1.05, 4), round(paper_entry * 1.10, 4), 1.0, 2.0, "DEFAULT"
 
         atr_h1 = df_h1['atr'].iloc[-2] if 'atr' in df_h1.columns else (paper_entry * 0.01)
 
-        # Tìm các đỉnh Swing High trên H1 và H4
         h1_highs, _ = TechnicalAnalyzer.find_pivots(df_h1, left=2, right=2)
         h4_highs, _ = TechnicalAnalyzer.find_pivots(df_h4, left=2, right=2) if df_h4 is not None else ([], [])
 
-        all_res = []
-        for h in h1_highs + h4_highs:
-            if h['price'] > paper_entry:
-                all_res.append(h['price'])
-
+        all_res = [h['price'] for h in h1_highs + h4_highs if h['price'] > paper_entry]
         all_res.sort()
 
-        # Gộp các vùng kháng cự cách nhau < 0.25 ATR
         grouped_res = []
         for res in all_res:
             if not grouped_res:
                 grouped_res.append(res)
-            else:
-                if (res - grouped_res[-1]) >= (0.25 * atr_h1):
-                    grouped_res.append(res)
+            elif (res - grouped_res[-1]) >= (0.25 * atr_h1):
+                grouped_res.append(res)
 
-        # TP1
-        if len(grouped_res) >= 1:
-            tp1 = grouped_res[0]
-        else:
-            tp1 = paper_entry + (2.0 * risk) # Ưu tiên R:R = 2.0 nếu không có cản
-
-        # TP2
+        tp1 = grouped_res[0] if len(grouped_res) >= 1 else paper_entry + (2.0 * risk)
         tp2_note = "CONFIRMED RESISTANCE"
-        if len(grouped_res) >= 2:
-            tp2 = grouped_res[1]
-        else:
-            tp2 = paper_entry + (3.5 * risk)
+        tp2 = grouped_res[1] if len(grouped_res) >= 2 else paper_entry + (3.5 * risk)
+        if len(grouped_res) < 2:
             tp2_note = "ATR PROJECTION – NOT CONFIRMED RESISTANCE"
 
         rr_tp1 = round((tp1 - paper_entry) / risk, 2)
@@ -838,10 +712,6 @@ class SmartRiskEngine:
 class TrailingAndMonitorEngine:
     @staticmethod
     def calculate_trailing_stop(df_h1: pd.DataFrame, df_h4: pd.DataFrame, highest_price: float, prev_trailing: float) -> float:
-        """
-        Công thức Trailing Stop:
-        TrailCandidate = Highest High - MAX(2.5 * ATR_H1, 0.8 * ATR_H4)
-        """
         if df_h1 is None or len(df_h1) < 5:
             return prev_trailing
 
@@ -850,8 +720,6 @@ class TrailingAndMonitorEngine:
 
         buffer = max(2.5 * atr_h1, 0.8 * atr_h4)
         candidate = highest_price - buffer
-
-        # Không hạ Trailing Stop sau khi đã nâng
         return max(prev_trailing, round(candidate, 4))
 
 # -----------------------------------------------------------------------------
@@ -864,7 +732,6 @@ class TelegramService:
         self.api_url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     def send_message_sync(self, text: str, parse_mode: str = "HTML") -> bool:
-        """Gửi tin nhắn Telegram đồng bộ"""
         if not self.token or self.token.startswith("YOUR_"):
             logger.info(f"[TELEGRAM PREVIEW]\n{text}")
             return False
@@ -884,7 +751,6 @@ class TelegramService:
 
     @staticmethod
     def format_signal_message(data: Dict[str, Any]) -> str:
-        """Định dạng thông báo tín hiệu mới theo mẫu đặc tả"""
         symbol = data['symbol']
         chart_url = f"https://www.bybit.com/trade/usdt/{symbol}"
         gain_tp1 = round(((data['tp1'] - data['paper_entry']) / data['paper_entry']) * 100, 2)
@@ -915,7 +781,6 @@ class TelegramService:
 
     @staticmethod
     def format_tp_update_message(symbol: str, gain_pct: float, score: int, status_type: str, trailing_sl: float) -> str:
-        """Định dạng thông báo Smart TP (+10%, +15%...)"""
         chart_url = f"https://www.bybit.com/trade/usdt/{symbol}"
 
         if status_type == "STRONG":
@@ -959,7 +824,6 @@ class MarketScanner:
             self.last_symbol_refresh = now
 
     def scan_market(self):
-        """Hàm chính thực hiện quét toàn bộ thị trường"""
         self.refresh_symbols_if_needed()
         total_symbols = len(self.symbols_cache)
         scanned_ok = 0
@@ -973,7 +837,6 @@ class MarketScanner:
         for item in self.symbols_cache:
             symbol = item["symbol"]
             try:
-                # 1. Fetch Dữ liệu Klines H1, H4
                 df_h1 = bybit.fetch_klines(symbol, interval="60", limit=120)
                 df_h4 = bybit.fetch_klines(symbol, interval="240", limit=80)
 
@@ -981,20 +844,15 @@ class MarketScanner:
                     insufficient_data += 1
                     continue
 
-                # Thêm chỉ báo kỹ thuật
                 df_h1 = TechnicalAnalyzer.add_indicators(df_h1)
                 df_h4 = TechnicalAnalyzer.add_indicators(df_h4)
-
                 scanned_ok += 1
 
-                # 2. Kiểm tra tín hiệu đã active để theo dõi Smart TP / Trailing Stop
                 active_sig = db.get_signal_by_symbol(symbol)
                 if active_sig and active_sig["state"] not in ("FINISHED", "INVALIDATED"):
                     self._process_active_signal(active_sig, df_h1, df_h4, btc_gain)
                     continue
 
-                # 3. Quét các Setup Mới
-                # SETUP 1
                 is_s1_conf, is_s1_watch, s1_details = SetupDetector.detect_setup_1_early_reversal(df_h1, df_h4)
                 if is_s1_conf:
                     self._create_paper_signal(symbol, "SETUP 1 – EARLY REVERSAL", s1_details, df_h1, df_h4, btc_gain)
@@ -1003,7 +861,6 @@ class MarketScanner:
                 elif is_s1_watch:
                     db.add_watch(symbol, "SETUP 1 – EARLY REVERSAL", s1_details["signal_price"])
 
-                # SETUP 2
                 is_s2_conf, is_s2_watch, s2_details = SetupDetector.detect_setup_2_accumulation_breakout(df_h1, df_h4)
                 if is_s2_conf:
                     self._create_paper_signal(symbol, "SETUP 2 – ACCUMULATION BREAKOUT", s2_details, df_h1, df_h4, btc_gain)
@@ -1012,7 +869,6 @@ class MarketScanner:
                 elif is_s2_watch:
                     db.add_watch(symbol, "SETUP 2 – ACCUMULATION BREAKOUT", s2_details.get("signal_price", 0.0))
 
-                # SETUP 3 (Nếu trước đó từng xuất hiện trong Watch)
                 watch_item = next((w for w in db.get_watch_list() if w["symbol"] == symbol), None)
                 if watch_item:
                     is_s3_conf, s3_details = SetupDetector.detect_setup_3_breakout_retest(df_h1, df_h4, watch_item["watch_price"])
@@ -1026,7 +882,7 @@ class MarketScanner:
                 logger.error(f"Lỗi khi xử lý symbol {symbol}: {e}")
                 api_errors += 1
 
-            time.sleep(0.05) # Rate limit protection
+            time.sleep(0.05)
 
         db.log_scan(total_symbols, scanned_ok, api_errors, insufficient_data, signals_found)
         logger.info(f"=== TỔNG KẾT QUÉT: Scanned OK={scanned_ok}/{total_symbols}, Signals={signals_found}, Errors={api_errors} ===")
@@ -1058,13 +914,11 @@ class MarketScanner:
             "vol_ratio": details.get("vol_ratio", 1.5)
         }
 
-        # Lưu DB và Gửi Telegram
         db.save_signal(sig_data)
         msg_text = telegram_service.format_signal_message(sig_data)
         telegram_service.send_message_sync(msg_text)
 
     def _process_active_signal(self, sig: Dict[str, Any], df_h1: pd.DataFrame, df_h4: pd.DataFrame, btc_gain: float):
-        """Theo dõi giá khi tín hiệu đang chạy (Smart TP / Trailing Stop)"""
         symbol = sig["symbol"]
         paper_entry = sig["paper_entry"]
         sl_price = sig["sl_price"]
@@ -1072,31 +926,24 @@ class MarketScanner:
         current_high = df_h1['high'].iloc[-2]
         current_low = df_h1['low'].iloc[-2]
 
-        # Kiểm tra Cắt lỗ (Stop Loss)
         if current_low <= sl_price:
             db.update_signal_state(symbol, "FINISHED")
             logger.info(f"Signal #{symbol} đã chạm Stop Loss {sl_price}. Kết thúc theo dõi.")
             return
 
-        # Tính Mức tăng % lớn nhất
         gain_pct = ((current_close - paper_entry) / paper_entry) * 100
         prev_max_gain = sig.get("max_gain_pct", 0.0)
         new_max_gain = max(prev_max_gain, gain_pct)
 
-        # Tính Trailing Stop
         prev_trailing = sig.get("trailing_stop", 0.0)
         new_trailing = TrailingAndMonitorEngine.calculate_trailing_stop(df_h1, df_h4, current_high, prev_trailing)
 
-        # Kiểm tra Trailing Stop Hit
         if new_trailing > 0 and current_close < new_trailing:
             db.update_signal_state(symbol, "FINISHED", max_gain=new_max_gain, trailing_stop=new_trailing)
             logger.info(f"Signal #{symbol} đóng dưới Trailing Stop {new_trailing}. TREND EXIT.")
             return
 
-        # Đánh giá lại Wave Score
         current_score = WaveStrengthEngine.calculate_score(df_h1, df_h4, btc_gain)
-
-        # Xử lý các mốc Smart TP: +10%, +15%, +20%, +30%
         notified_m10 = sig.get("notified_m10", 0)
         notified_m15 = sig.get("notified_m15", 0)
 
@@ -1118,12 +965,11 @@ class MarketScanner:
 scanner = MarketScanner()
 
 # -----------------------------------------------------------------------------
-# 12. BACKTEST & MISS WAVE ANALYZER ENGINE
+# 12. BACKTEST ANALYZER
 # -----------------------------------------------------------------------------
 class BacktestAnalyzer:
     @staticmethod
     def run_simple_backtest() -> Dict[str, Any]:
-        """Thống kê các tín hiệu đã lưu trong SQLite Database"""
         with db.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM signals")
@@ -1295,7 +1141,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 14. AUTOMATED BACKGROUND SCAN SCHEDULER
 # -----------------------------------------------------------------------------
 async def scheduled_scanner_loop():
-    """Lập lịch chạy tự động mỗi 1 giờ (sau khi nến H1 đóng)"""
     logger.info("Đã khởi chạy Scheduler vòng quét tự động...")
     while True:
         try:
@@ -1305,7 +1150,6 @@ async def scheduled_scanner_loop():
         except Exception as e:
             logger.error(f"Lỗi trong vòng quét tự động: {e}")
 
-        # Nằm chờ 1 giờ (3600s)
         await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
 
 # -----------------------------------------------------------------------------
@@ -1316,18 +1160,15 @@ def main():
     logger.info(" KHỞI ĐỘNG HỆ THỐNG BYBIT H1 SMART WAVE PRO BOT ")
     logger.info("==================================================")
 
-    # 1. Khởi chạy Flask Server ở luồng riêng (Background Thread)
     flask_thread = threading.Thread(target=run_flask_server, daemon=True)
     flask_thread.start()
 
-    # 2. Khởi tạo Telegram Bot Application
     if not BOT_TOKEN or BOT_TOKEN.startswith("YOUR_"):
         logger.error("CHƯA CẤU HÌNH BOT_TOKEN! Vui lòng thiết lập biến môi trường BOT_TOKEN.")
         sys.exit(1)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Thêm Handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -1338,11 +1179,9 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # 3. Tạo Task chạy Scanner ẩn theo chu kỳ
     loop = asyncio.get_event_loop()
     loop.create_task(scheduled_scanner_loop())
 
-    # 4. Chạy Telegram Bot Polling
     logger.info("Bot đã sẵn sàng và đang lắng nghe lệnh trên Telegram...")
     app.run_polling()
 

@@ -279,7 +279,6 @@ class BybitClient:
         return None
 
     def get_all_crypto_usdt_perpetual_symbols(self) -> List[Dict[str, Any]]:
-        """Quét 100% toàn bộ Crypto USDT Perpetual trên Bybit qua nextPageCursor"""
         symbols = []
         cursor = ""
         while True:
@@ -362,7 +361,6 @@ class TechnicalAnalyzer:
 
     @staticmethod
     def check_structure_bullish(df_tf: pd.DataFrame) -> bool:
-        """Kiểm tra cấu trúc tăng trên H4 hoặc D1 (Higher Highs & Higher Lows)"""
         if df_tf is None or len(df_tf) < 20:
             return True
         highs, lows = TechnicalAnalyzer.find_pivots(df_tf, left=2, right=2)
@@ -408,7 +406,7 @@ class SetupDetector:
         atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (h1_last['close'] * 0.01)
         vol_sma = h1_last['vol_sma20'] if h1_last['vol_sma20'] > 0 else 1
 
-        # 1. SETUP 2: ACCUMULATION BREAKOUT
+        # Setup 2: Accumulation Breakout
         base_df = df_h1.iloc[-30:-2]
         base_high, base_low = base_df['high'].max(), base_df['low'].min()
         if (base_high - base_low) <= (5.0 * atr_h1) and h1_last['close'] > (base_high + 0.1 * atr_h1):
@@ -416,19 +414,18 @@ class SetupDetector:
                 details = {"setup_name": "SETUP 2 – ACCUMULATION BREAKOUT", "signal_price": h1_last['close'], "paper_entry": df_h1['open'].iloc[-1], "base_low": base_low, "base_high": base_high, "atr_h1": atr_h1, "vol_ratio": round(h1_last['volume']/vol_sma, 2)}
                 return True, False, details
 
-        # 2. SETUP 1: EARLY REVERSAL
+        # Setup 1: Early Reversal
         high_12 = df_h1['high'].iloc[-14:-2].max()
         if h1_last['close'] > high_12 and h1_last['volume'] > (1.5 * vol_sma) and (h1_last['close'] - high_12 <= 1.5 * atr_h1):
             _, lows = TechnicalAnalyzer.find_pivots(df_h1, left=2, right=2)
             sl_low = lows[-1]['price'] if lows else df_h1['low'].iloc[-6:-2].min()
             details = {"setup_name": "SETUP 1 – EARLY REVERSAL", "signal_price": h1_last['close'], "paper_entry": df_h1['open'].iloc[-1], "structure_low": sl_low, "atr_h1": atr_h1, "vol_ratio": round(h1_last['volume']/vol_sma, 2)}
             
-            # Kiểm tra xác nhận H4/D1
             h4_confirmed = TechnicalAnalyzer.check_structure_bullish(df_h4)
             if h4_confirmed:
                 return True, False, details
             else:
-                return False, True, details # EARLY WATCH
+                return False, True, details
 
         return False, False, {}
 
@@ -444,7 +441,7 @@ class SetupDetector:
         return False, {}
 
 # -----------------------------------------------------------------------------
-# 8. SMART SL & SMART TP ENGINE (H4 / D1 RESISTANCE)
+# 8. SMART SL & SMART TP ENGINE
 # -----------------------------------------------------------------------------
 class SmartRiskEngine:
     @staticmethod
@@ -570,13 +567,11 @@ class MarketScanner:
                 df_d1 = TechnicalAnalyzer.add_indicators(df_d1)
                 ok += 1
 
-                # Quản lý lệnh đang chạy (Smart TP & Trailing Stop)
                 active = db.get_signal_by_symbol(symbol)
                 if active and active["state"] not in ('FINISHED', 'INVALIDATED'):
                     self._process_active(active, df_h1, df_h4, df_d1, btc_gain)
                     continue
 
-                # Quét Setup mới
                 is_conf, is_watch, details = SetupDetector.detect_all_setups(df_h1, df_h4, df_d1)
                 if is_conf:
                     self._create_signal(symbol, details, df_h1, df_h4, df_d1, btc_gain)
@@ -585,7 +580,6 @@ class MarketScanner:
                 elif is_watch:
                     db.add_watch(symbol, details["setup_name"], details["signal_price"])
 
-                # Kiểm tra Setup 3 (Retest) từ Watchlist
                 watch = next((w for w in db.get_watch_list() if w["symbol"] == symbol), None)
                 if watch:
                     is_s3, details3 = SetupDetector.detect_setup_3_retest(df_h1, watch["watch_price"])
@@ -688,8 +682,9 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Hoàn tất!")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status_text = 'Đang chạy' if SYSTEM_STATE['is_scanning'] else 'Đang chờ (Idle)'
     msg = f"""📊 <b>TRẠNG THÁI HỆ THỐNG 24/7</b>
-🤖 <b>Quét tự động:</b> {'Đang chạy' id SYSTEM_STATE['is_scanning'] else 'Đang chờ (Idle)'}
+🤖 <b>Quét tự động:</b> {status_text}
 ⏱ <b>Lần quét gần nhất:</b> {SYSTEM_STATE['last_scan_time']}
 ⏳ <b>Lần quét kế tiếp:</b> {SYSTEM_STATE['next_scan_time']}
 🌐 <b>Số coin thành công:</b> {SYSTEM_STATE['scanned_ok']} / {SYSTEM_STATE['total_symbols_scanned']}
@@ -728,7 +723,6 @@ def main():
 
     async def main_async():
         asyncio.create_task(full_auto_scheduler())
-        # Quét ngay 1 vòng đầu tiên khi khởi động
         asyncio.create_task(asyncio.to_thread(scanner.scan_market))
 
         await app.initialize()

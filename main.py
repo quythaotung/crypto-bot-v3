@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-BYBIT H1 SMART WAVE PRO - FULL PRODUCTION EDITION (SINGLE FILE)
+BYBIT H1 SMART WAVE PRO - STRICT QUALITY CONTROL PRODUCTION BOT
 ===============================================================================
 """
 
@@ -38,12 +38,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("SmartWaveProProduction")
+logger = logging.getLogger("SmartWaveProStrict")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 CHAT_ID = os.environ.get("CHAT_ID", "YOUR_TELEGRAM_CHAT_ID_HERE")
 PORT = int(os.environ.get("PORT", "10000"))
-DB_PATH = os.environ.get("DB_PATH", "smart_wave_pro_prod.db")
+DB_PATH = os.environ.get("DB_PATH", "smart_wave_pro_strict.db")
 
 BYBIT_BASE_URL = "https://api.bybit.com"
 SYMBOL_REFRESH_HOURS = 6
@@ -76,7 +76,7 @@ flask_app = Flask(__name__)
 def health_check():
     return jsonify({
         "status": "online",
-        "system": "BYBIT H1 SMART WAVE PRO PRODUCTION",
+        "system": "BYBIT H1 SMART WAVE PRO STRICT CONTROL",
         "is_scanning": SYSTEM_STATE["is_scanning"],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
@@ -254,13 +254,13 @@ class DatabaseManager:
 db = DatabaseManager()
 
 # -----------------------------------------------------------------------------
-# 4. BYBIT V5 CLIENT (QUÉT 100% COIN KHÔNG GIỚI HẠN)
+# 4. BYBIT V5 CLIENT
 # -----------------------------------------------------------------------------
 class BybitClient:
     def __init__(self, base_url: str = BYBIT_BASE_URL):
         self.base_url = base_url
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "SmartWaveProProd/1.0"})
+        self.session.headers.update({"User-Agent": "SmartWaveProStrict/1.0"})
 
     def _request(self, endpoint: str, params: Dict[str, Any] = None, retries: int = 3) -> Optional[Dict[str, Any]]:
         url = f"{self.base_url}{endpoint}"
@@ -394,7 +394,7 @@ class WaveStrengthEngine:
         return min(max(score, 0), 100)
 
 # -----------------------------------------------------------------------------
-# 7. SETUP DETECTOR (3 SETUP LONG & ANTI-MISS)
+# 7. SETUP DETECTOR (STRICT QUALITY CONTROL)
 # -----------------------------------------------------------------------------
 class SetupDetector:
     @staticmethod
@@ -441,30 +441,51 @@ class SetupDetector:
         return False, {}
 
 # -----------------------------------------------------------------------------
-# 8. SMART SL & SMART TP ENGINE
+# 8. SMART SL & SMART TP ENGINE (STRICT FILTER & ATR PROJECTION)
 # -----------------------------------------------------------------------------
 class SmartRiskEngine:
     @staticmethod
-    def calculate_sl(setup_name: str, details: Dict[str, Any]) -> Tuple[float, str, bool]:
+    def calculate_sl(setup_name: str, details: Dict[str, Any]) -> Tuple[float, str, bool, str]:
         entry, atr = details["paper_entry"], details["atr_h1"]
         if "SETUP 1" in setup_name: struct_low = details.get("structure_low", entry * 0.95); reason = "H1 Swing Low - 0.35 ATR"
         elif "SETUP 2" in setup_name: struct_low = details.get("base_low", entry * 0.95); reason = "Base Low - 0.35 ATR"
         else: struct_low = details.get("retest_low", entry * 0.95); reason = "Retest Low - 0.35 ATR"
+        
         sl = struct_low - (0.35 * atr)
-        if sl >= entry: return 0.0, "Invalid SL", False
-        return round(sl, 4), reason, True
+        if sl >= entry: return 0.0, "Invalid SL", False, "INVALID"
+
+        risk = entry - sl
+        risk_atr = risk / atr if atr > 0 else 1.0
+        sl_tag = "NORMAL"
+        if risk_atr > 4.5:
+            sl_tag = "SL TOO WIDE (Rủi ro khoảng cách SL lớn so với ATR)"
+
+        return round(sl, 4), reason, True, sl_tag
 
     @staticmethod
-    def calculate_tp(df_h1: pd.DataFrame, df_h4: pd.DataFrame, df_d1: pd.DataFrame, entry: float, sl: float) -> Tuple[float, float, float, float]:
+    def calculate_tp(df_h1: pd.DataFrame, df_h4: pd.DataFrame, df_d1: pd.DataFrame, entry: float, sl: float) -> Tuple[float, str, float, str, float, float]:
         risk = entry - sl
         h1_highs, _ = TechnicalAnalyzer.find_pivots(df_h1, left=2, right=2)
         h4_highs, _ = TechnicalAnalyzer.find_pivots(df_h4, left=2, right=2) if df_h4 is not None else ([], [])
         d1_highs, _ = TechnicalAnalyzer.find_pivots(df_d1, left=2, right=2) if df_d1 is not None else ([], [])
 
         res = sorted(list(set([h['price'] for h in h1_highs + h4_highs + d1_highs if h['price'] > entry])))
+        
+        # TP1
         tp1 = res[0] if len(res) >= 1 else entry + (2.0 * risk)
-        tp2 = res[1] if len(res) >= 2 else entry + (3.5 * risk)
-        return round(tp1, 4), round(tp2, 4), round((tp1 - entry)/risk, 2), round((tp2 - entry)/risk, 2)
+        tp1_note = "CONFIRMED RESISTANCE" if len(res) >= 1 else "ATR PROJECTION (Không tìm thấy cản gần)"
+        rr_tp1 = round((tp1 - entry) / risk, 2)
+
+        # TP2
+        if len(res) >= 2:
+            tp2 = res[1]
+            tp2_note = "CONFIRMED RESISTANCE"
+        else:
+            tp2 = entry + (3.5 * risk)
+            tp2_note = "ATR PROJECTION (Thiếu kháng cự thứ 2 hợp lệ)"
+        rr_tp2 = round((tp2 - entry) / risk, 2)
+
+        return round(tp1, 4), tp1_note, rr_tp1, round(tp2, 4), tp2_note, rr_tp2
 
 # -----------------------------------------------------------------------------
 # 9. TRAILING STOP & MONITORING ENGINE
@@ -498,17 +519,21 @@ class TelegramService:
 
     def notify_signal(self, data: Dict[str, Any]):
         chart_url = f"https://www.bybit.com/trade/usdt/{data['symbol']}"
-        msg = f"""🚀 <b>BYBIT H1 SMART WAVE PRO – FULL AUTO</b>
+        msg = f"""🚀 <b>BYBIT H1 SMART WAVE PRO – STRICT QC</b>
 🪙 <b>Coin:</b> #{data['symbol']}
 🟢 <b>{data['setup_name']}</b>
 ⏱ <b>Timeframe:</b> H1 / H4 / D1
 
 💰 <b>Signal Price:</b> {data['signal_price']}
 📍 <b>Paper Entry:</b> {data['paper_entry']}
-🛡 <b>SL Structure:</b> {data['sl_price']} ({data['sl_reason']})
-🎯 <b>TP1:</b> {data['tp1']} (R: {data['tp1_rr']}) | <b>TP2:</b> {data['tp2']} (R: {data['tp2_rr']})
-💪 <b>Wave Strength:</b> {data['wave_score']}/100
-✅ <b>Status:</b> CONFIRMED – PAPER SIGNAL
+🛡 <b>SL Structure:</b> {data['sl_price']} ({data['sl_reason']}) - ⚠️ <i>{data['sl_tag']}</i>
+
+🎯 <b>TP1:</b> {data['tp1']} ({data['tp1_note']}) | <b>R:</b> {data['tp1_rr']}
+🎯 <b>TP2:</b> {data['tp2']} ({data['tp2_note']}) | <b>R:</b> {data['tp2_rr']}
+
+💪 <b>Wave Strength Score:</b> {data['wave_score']}/100
+📊 <b>Bối cảnh đa khung:</b> H4/D1 xu hướng tăng đã xác nhận cấu trúc
+✅ <b>Status:</b> {data['state']}
 
 🔗 <a href="{chart_url}">Mở biểu đồ Bybit #{data['symbol']}</a>"""
         self.send_message_sync(msg)
@@ -550,7 +575,7 @@ class MarketScanner:
         total = len(self.symbols_cache)
         ok, errors, found = 0, 0, 0
 
-        logger.info(f"=== [FULL AUTO] BẮT ĐẦU QUÉT TOÀN BỘ THỊ TRƯỜNG: {total} COIN ===")
+        logger.info(f"=== [STRICT QC] BẮT ĐẦU QUÉT TOÀN BỘ THỊ TRƯỜNG: {total} COIN ===")
         btc_gain = bybit.get_btc_24h_change()
 
         for item in self.symbols_cache:
@@ -573,18 +598,16 @@ class MarketScanner:
                     continue
 
                 is_conf, is_watch, details = SetupDetector.detect_all_setups(df_h1, df_h4, df_d1)
-                if is_conf:
-                    self._create_signal(symbol, details, df_h1, df_h4, df_d1, btc_gain)
+                if is_conf or is_watch:
+                    self._create_signal(symbol, details, df_h1, df_h4, df_d1, btc_gain, is_watch)
                     found += 1
                     continue
-                elif is_watch:
-                    db.add_watch(symbol, details["setup_name"], details["signal_price"])
 
                 watch = next((w for w in db.get_watch_list() if w["symbol"] == symbol), None)
                 if watch:
                     is_s3, details3 = SetupDetector.detect_setup_3_retest(df_h1, watch["watch_price"])
                     if is_s3:
-                        self._create_signal(symbol, details3, df_h1, df_h4, df_d1, btc_gain)
+                        self._create_signal(symbol, details3, df_h1, df_h4, df_d1, btc_gain, is_watch=False)
                         db.delete_watch(symbol)
                         found += 1
 
@@ -599,18 +622,41 @@ class MarketScanner:
         SYSTEM_STATE["signals_found"] += found
         SYSTEM_STATE["is_scanning"] = False
         db.log_scan(total, ok, errors, total - ok, found)
-        logger.info(f"=== [FULL AUTO] HOÀN TẤT QUÉT: Tìm thấy {found} tín hiệu mới ===")
+        logger.info(f"=== [STRICT QC] HOÀN TẤT QUÉT: Tìm thấy {found} tín hiệu ===")
 
-    def _create_signal(self, symbol: str, details: Dict, df_h1, df_h4, df_d1, btc_gain):
+    def _create_signal(self, symbol: str, details: Dict, df_h1, df_h4, df_d1, btc_gain, is_watch: bool):
         details["symbol"] = symbol
-        sl, reason, valid = SmartRiskEngine.calculate_sl(details["setup_name"], details)
+        sl, reason, valid, sl_tag = SmartRiskEngine.calculate_sl(details["setup_name"], details)
         if not valid: return
-        tp1, tp2, rr1, rr2 = SmartRiskEngine.calculate_tp(df_h1, df_h4, df_d1, details["paper_entry"], sl)
+        
+        tp1, tp1_note, rr1, tp2, tp2_note, rr2 = SmartRiskEngine.calculate_tp(df_h1, df_h4, df_d1, details["paper_entry"], sl)
         score = WaveStrengthEngine.calculate_score(df_h1, df_h4, df_d1, btc_gain)
 
-        sig = {"symbol": symbol, "setup_name": details["setup_name"], "state": "CONFIRMED", "signal_price": details["signal_price"], "paper_entry": details["paper_entry"], "sl_price": sl, "sl_reason": reason, "tp1": tp1, "tp2": tp2, "tp1_rr": rr1, "tp2_rr": rr2, "wave_score": score}
+        # BỘ LỌC NGHIÊM NGẶT THEO YÊU CẦU MỚI:
+        # 1. Nếu R TP1 dưới 1.5 -> Đánh dấu LOW REWARD SPACE và không CONFIRMED chính thức.
+        # 2. Nếu Wave Strength dưới 70 -> Đưa vào WATCH / LOW CONFIDENCE.
+        state = "CONFIRMED"
+        if rr1 < 1.5:
+            details["setup_name"] += " [LOW REWARD SPACE]"
+            state = "WATCH / LOW REWARD"
+        elif score < 70 or is_watch:
+            state = "WATCH / LOW CONFIDENCE"
+
+        sig = {
+            "symbol": symbol, "setup_name": details["setup_name"], "state": state,
+            "signal_price": details["signal_price"], "paper_entry": details["paper_entry"],
+            "sl_price": sl, "sl_reason": reason, "sl_tag": sl_tag,
+            "tp1": tp1, "tp1_note": tp1_note, "tp2": tp2, "tp2_note": tp2_note,
+            "tp1_rr": rr1, "tp2_rr": rr2, "wave_score": score
+        }
+
         db.save_signal(sig)
-        telegram_service.notify_signal(sig)
+        
+        # Chỉ gửi thông báo chính thức nếu đạt chuẩn nghiêm ngặt (tránh spam setup kém chất lượng)
+        if state == "CONFIRMED":
+            telegram_service.notify_signal(sig)
+        else:
+            logger.info(f"Lọc bỏ / Chuyển sang Watchlist (Không bắn tin chính thức): #{symbol} | Trạng thái: {state} | R_TP1: {rr1} | Score: {score}")
 
     def _process_active(self, sig: Dict, df_h1, df_h4, df_d1, btc_gain):
         symbol, entry, sl = sig["symbol"], sig["paper_entry"], sig["sl_price"]
@@ -670,7 +716,7 @@ async def full_auto_scheduler():
 # 12. TELEGRAM COMMAND HANDLERS
 # -----------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 <b>BYBIT H1 SMART WAVE PRO – FULL PRODUCTION</b>\nBot hoạt động 24/7 tự động quét 100% coin.\n/status - Trạng thái\n/active - Lệnh đang chạy", parse_mode="HTML")
+    await update.message.reply_text("🚀 <b>BYBIT H1 SMART WAVE PRO – STRICT QC</b>\nBot hoạt động 24/7 với bộ lọc chất lượng nghiêm ngặt.\n/status - Trạng thái\n/active - Lệnh đang chạy", parse_mode="HTML")
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if SCAN_LOCK.locked():
@@ -683,7 +729,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_text = 'Đang chạy' if SYSTEM_STATE['is_scanning'] else 'Đang chờ (Idle)'
-    msg = f"""📊 <b>TRẠNG THÁI HỆ THỐNG 24/7</b>
+    msg = f"""📊 <b>TRẠNG THÁI HỆ THỐNG STRICT QC</b>
 🤖 <b>Quét tự động:</b> {status_text}
 ⏱ <b>Lần quét gần nhất:</b> {SYSTEM_STATE['last_scan_time']}
 ⏳ <b>Lần quét kế tiếp:</b> {SYSTEM_STATE['next_scan_time']}
@@ -706,7 +752,7 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 def main():
     logger.info("==================================================")
-    logger.info(" KHỞI ĐỘNG HỆ THỐNG PRODUCTION 24/7 BOT ")
+    logger.info(" KHỞI ĐỘNG HỆ THỐNG STRICT QC 24/7 BOT ")
     logger.info("==================================================")
 
     threading.Thread(target=run_flask_server, daemon=True).start()
@@ -727,7 +773,7 @@ def main():
 
         await app.initialize()
         await app.start()
-        logger.info("Bot Production đã sẵn sàng 24/7!")
+        logger.info("Bot Strict QC đã sẵn sàng 24/7!")
         await app.updater.start_polling()
         await asyncio.Event().wait()
 

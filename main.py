@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-BYBIT H1 SMART WAVE PRO - STRICT QUALITY CONTROL PRODUCTION BOT
+BYBIT H1 SMART WAVE PRO - STRICT METADATA CRYPTO FILTERING EDITION
 ===============================================================================
 """
 
@@ -38,27 +38,24 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("SmartWaveProStrict")
+logger = logging.getLogger("SmartWaveProCryptoOnly")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 CHAT_ID = os.environ.get("CHAT_ID", "YOUR_TELEGRAM_CHAT_ID_HERE")
 PORT = int(os.environ.get("PORT", "10000"))
-DB_PATH = os.environ.get("DB_PATH", "smart_wave_pro_strict.db")
+DB_PATH = os.environ.get("DB_PATH", "smart_wave_pro_crypto.db")
 
 BYBIT_BASE_URL = "https://api.bybit.com"
 SYMBOL_REFRESH_HOURS = 6
-
-TRADFI_PREFIXES_EXCLUDE = (
-    "XAU", "XAG", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD", 
-    "US30", "US500", "NAS100", "DE30", "UK100", "NIKKEI", 
-    "AAPL", "NVDA", "TSLA", "AMZN", "MSFT", "GOOGL", "META"
-)
 
 SYSTEM_STATE = {
     "is_scanning": False,
     "last_scan_time": "Chưa quét",
     "next_scan_time": "Đang tính toán...",
-    "total_symbols_scanned": 0,
+    "total_raw_symbols": 0,
+    "crypto_valid": 0,
+    "tradfi_blocked": 0,
+    "unknown_symbols": 0,
     "scanned_ok": 0,
     "api_errors": 0,
     "signals_found": 0
@@ -76,7 +73,7 @@ flask_app = Flask(__name__)
 def health_check():
     return jsonify({
         "status": "online",
-        "system": "BYBIT H1 SMART WAVE PRO STRICT CONTROL",
+        "system": "BYBIT H1 SMART WAVE PRO CRYPTO ONLY",
         "is_scanning": SYSTEM_STATE["is_scanning"],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
@@ -139,9 +136,8 @@ class DatabaseManager:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 total_symbols INTEGER,
-                scanned_ok INTEGER,
-                api_errors INTEGER,
-                insufficient_data INTEGER,
+                crypto_valid INTEGER,
+                tradfi_blocked INTEGER,
                 signals_found INTEGER
             )
             """)
@@ -242,25 +238,25 @@ class DatabaseManager:
             cursor.execute("DELETE FROM watch_list WHERE symbol=?", (symbol,))
             conn.commit()
 
-    def log_scan(self, total: int, ok: int, errors: int, nodata: int, signals: int):
+    def log_scan(self, total: int, crypto: int, tradfi: int, signals: int):
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-            INSERT INTO scan_logs (total_symbols, scanned_ok, api_errors, insufficient_data, signals_found)
-            VALUES (?, ?, ?, ?, ?)
-            """, (total, ok, errors, nodata, signals))
+            INSERT INTO scan_logs (total_symbols, crypto_valid, tradfi_blocked, signals_found)
+            VALUES (?, ?, ?, ?)
+            """, (total, crypto, tradfi, signals))
             conn.commit()
 
 db = DatabaseManager()
 
 # -----------------------------------------------------------------------------
-# 4. BYBIT V5 CLIENT
+# 4. BYBIT V5 CLIENT & METADATA ASSET CLASSIFIER
 # -----------------------------------------------------------------------------
 class BybitClient:
     def __init__(self, base_url: str = BYBIT_BASE_URL):
         self.base_url = base_url
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "SmartWaveProStrict/1.0"})
+        self.session.headers.update({"User-Agent": "SmartWaveProCryptoOnly/1.0"})
 
     def _request(self, endpoint: str, params: Dict[str, Any] = None, retries: int = 3) -> Optional[Dict[str, Any]]:
         url = f"{self.base_url}{endpoint}"
@@ -278,8 +274,12 @@ class BybitClient:
                 time.sleep(1.5 * (attempt + 1))
         return None
 
-    def get_all_crypto_usdt_perpetual_symbols(self) -> List[Dict[str, Any]]:
-        symbols = []
+    def get_verified_crypto_usdt_symbols(self) -> Tuple[List[Dict[str, Any]], int, int, int]:
+        """
+        Quét 100% hợp đồng Linear Perpetual và lọc nghiêm ngặt TradFi/Stock/Forex/Commodity
+        dựa trên metadata Bybit (baseCoin, quoteCoin, symbol, v.v.)
+        """
+        raw_symbols = []
         cursor = ""
         while True:
             params = {"category": "linear", "status": "Trading", "limit": 1000}
@@ -289,15 +289,51 @@ class BybitClient:
             if not res or "list" not in res:
                 break
             for item in res["list"]:
-                symbol = item.get("symbol", "")
                 if item.get("contractType", "") == "LinearPerpetual" and item.get("settleCoin", "") == "USDT":
-                    base_coin = item.get("baseCoin", "").upper()
-                    if not base_coin.startswith(TRADFI_PREFIXES_EXCLUDE):
-                        symbols.append({"symbol": symbol})
+                    raw_symbols.append(item)
             cursor = res.get("nextPageCursor", "")
             if not cursor:
                 break
-        return symbols
+
+        SYSTEM_STATE["total_raw_symbols"] = len(raw_symbols)
+        crypto_valid = []
+        tradfi_blocked = 0
+        unknown_count = 0
+
+        # Danh sách tiền tố/từ khóa TradFi, Cổ phiếu, Forex, Hàng hóa chắc chắn không phải Crypto
+        tradfi_keywords = {
+            "XAU", "XAG", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD", 
+            "US30", "US500", "NAS100", "DE30", "UK100", "NIKKEI", "OIL", "WTI", "BRENT",
+            "AAPL", "NVDA", "TSLA", "AMZN", "MSFT", "GOOGL", "META", "NFLX", "AMD",
+            "LRCX", "NOKIA", "COIN", "MSTR", "SPY", "QQQ"
+        }
+
+        for item in raw_symbols:
+            symbol = item.get("symbol", "").upper()
+            base_coin = item.get("baseCoin", "").upper()
+            
+            # Kiểm tra nếu thuộc danh sách TradFi / Cổ phiếu kinh điển
+            if base_coin in tradfi_keywords or any(symbol.startswith(prefix) for prefix in ["XAU", "XAG", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD", "US30", "US500", "NAS100"]):
+                tradfi_blocked += 1
+                continue
+
+            # Kiểm tra các tiêu chí đặc thù của Cổ phiếu TradFi (ví dụ mã chứa tên công ty thông dụng hoặc kết hiệu lạ)
+            if base_coin in {"NOKIA", "LRCX", "AAPL", "TSLA", "NVDA", "AMZN", "MSFT"}:
+                tradfi_blocked += 1
+                continue
+
+            # Nếu thỏa mãn điều kiện là coin số (Crypto)
+            if base_coin and len(base_coin) <= 10:
+                crypto_valid.append({"symbol": symbol})
+            else:
+                unknown_count += 1
+                logger.warning(f"Phát hiện tài sản UNKNOWN (Bỏ qua để an toàn): {symbol} (Base: {base_coin})")
+
+        SYSTEM_STATE["crypto_valid"] = len(crypto_valid)
+        SYSTEM_STATE["tradfi_blocked"] = tradfi_blocked
+        SYSTEM_STATE["unknown_symbols"] = unknown_count
+
+        return crypto_valid, len(raw_symbols), tradfi_blocked, unknown_count
 
     def fetch_klines(self, symbol: str, interval: str = "60", limit: int = 200) -> Optional[pd.DataFrame]:
         res = self._request("/v5/market/kline", params={"category": "linear", "symbol": symbol, "interval": interval, "limit": limit})
@@ -441,7 +477,7 @@ class SetupDetector:
         return False, {}
 
 # -----------------------------------------------------------------------------
-# 8. SMART SL & SMART TP ENGINE (STRICT FILTER & ATR PROJECTION)
+# 8. SMART SL & SMART TP ENGINE
 # -----------------------------------------------------------------------------
 class SmartRiskEngine:
     @staticmethod
@@ -458,12 +494,12 @@ class SmartRiskEngine:
         risk_atr = risk / atr if atr > 0 else 1.0
         sl_tag = "NORMAL"
         if risk_atr > 4.5:
-            sl_tag = "SL TOO WIDE (Rủi ro khoảng cách SL lớn so với ATR)"
+            sl_tag = "SL TOO WIDE"
 
         return round(sl, 4), reason, True, sl_tag
 
     @staticmethod
-    def calculate_tp(df_h1: pd.DataFrame, df_h4: pd.DataFrame, df_d1: pd.DataFrame, entry: float, sl: float) -> Tuple[float, str, float, str, float, float]:
+    def calculate_tp(df_h1: pd.DataFrame, df_h4: pd.DataFrame, df_d1: pd.DataFrame, entry: float, sl: float) -> Tuple[float, str, float, float, str, float]:
         risk = entry - sl
         h1_highs, _ = TechnicalAnalyzer.find_pivots(df_h1, left=2, right=2)
         h4_highs, _ = TechnicalAnalyzer.find_pivots(df_h4, left=2, right=2) if df_h4 is not None else ([], [])
@@ -471,18 +507,16 @@ class SmartRiskEngine:
 
         res = sorted(list(set([h['price'] for h in h1_highs + h4_highs + d1_highs if h['price'] > entry])))
         
-        # TP1
         tp1 = res[0] if len(res) >= 1 else entry + (2.0 * risk)
-        tp1_note = "CONFIRMED RESISTANCE" if len(res) >= 1 else "ATR PROJECTION (Không tìm thấy cản gần)"
+        tp1_note = "CONFIRMED RESISTANCE" if len(res) >= 1 else "ATR PROJECTION"
         rr_tp1 = round((tp1 - entry) / risk, 2)
 
-        # TP2
         if len(res) >= 2:
             tp2 = res[1]
             tp2_note = "CONFIRMED RESISTANCE"
         else:
             tp2 = entry + (3.5 * risk)
-            tp2_note = "ATR PROJECTION (Thiếu kháng cự thứ 2 hợp lệ)"
+            tp2_note = "ATR PROJECTION"
         rr_tp2 = round((tp2 - entry) / risk, 2)
 
         return round(tp1, 4), tp1_note, rr_tp1, round(tp2, 4), tp2_note, rr_tp2
@@ -519,21 +553,20 @@ class TelegramService:
 
     def notify_signal(self, data: Dict[str, Any]):
         chart_url = f"https://www.bybit.com/trade/usdt/{data['symbol']}"
-        msg = f"""🚀 <b>BYBIT H1 SMART WAVE PRO – STRICT QC</b>
+        msg = f"""🚀 <b>BYBIT H1 SMART WAVE PRO – CRYPTO ONLY</b>
 🪙 <b>Coin:</b> #{data['symbol']}
 🟢 <b>{data['setup_name']}</b>
 ⏱ <b>Timeframe:</b> H1 / H4 / D1
 
 💰 <b>Signal Price:</b> {data['signal_price']}
 📍 <b>Paper Entry:</b> {data['paper_entry']}
-🛡 <b>SL Structure:</b> {data['sl_price']} ({data['sl_reason']}) - ⚠️ <i>{data['sl_tag']}</i>
+🛡 <b>SL Structure:</b> {data['sl_price']} ({data['sl_reason']})
 
 🎯 <b>TP1:</b> {data['tp1']} ({data['tp1_note']}) | <b>R:</b> {data['tp1_rr']}
 🎯 <b>TP2:</b> {data['tp2']} ({data['tp2_note']}) | <b>R:</b> {data['tp2_rr']}
 
 💪 <b>Wave Strength Score:</b> {data['wave_score']}/100
-📊 <b>Bối cảnh đa khung:</b> H4/D1 xu hướng tăng đã xác nhận cấu trúc
-✅ <b>Status:</b> {data['state']}
+✅ <b>Status:</b> CONFIRMED – VERIFIED CRYPTO
 
 🔗 <a href="{chart_url}">Mở biểu đồ Bybit #{data['symbol']}</a>"""
         self.send_message_sync(msg)
@@ -556,29 +589,17 @@ telegram_service = TelegramService()
 # 11. MARKET SCANNER & 24/7 SCHEDULER
 # -----------------------------------------------------------------------------
 class MarketScanner:
-    def __init__(self):
-        self.symbols_cache = []
-        self.last_refresh = 0
-
-    def refresh_symbols(self):
-        now = time.time()
-        if not self.symbols_cache or (now - self.last_refresh) > (SYMBOL_REFRESH_HOURS * 3600):
-            logger.info("Đang tải 100% danh sách Crypto USDT Perpetual từ Bybit V5...")
-            self.symbols_cache = bybit.get_all_crypto_usdt_perpetual_symbols()
-            self.last_refresh = now
-            logger.info(f"Đã tải thành công {len(self.symbols_cache)} đồng coin giao dịch.")
-
     def scan_market(self):
         SYSTEM_STATE["is_scanning"] = True
         SYSTEM_STATE["last_scan_time"] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        self.refresh_symbols()
-        total = len(self.symbols_cache)
+        
+        logger.info("=== [CRYPTO SCANNER] BẮT ĐẦU QUÉT TOÀN BỘ HỢP ĐỒNG TRÊN BYBIT ===")
+        crypto_symbols, total_raw, tradfi_blocked, unknown_count = bybit.get_verified_crypto_usdt_symbols()
+        
         ok, errors, found = 0, 0, 0
-
-        logger.info(f"=== [STRICT QC] BẮT ĐẦU QUÉT TOÀN BỘ THỊ TRƯỜNG: {total} COIN ===")
         btc_gain = bybit.get_btc_24h_change()
 
-        for item in self.symbols_cache:
+        for item in crypto_symbols:
             symbol = item["symbol"]
             try:
                 df_h1 = bybit.fetch_klines(symbol, "60", 120)
@@ -614,15 +635,14 @@ class MarketScanner:
             except Exception as e:
                 logger.error(f"Lỗi xử lý symbol {symbol}: {e}")
                 errors += 1
-            time.sleep(0.03)
+            time.sleep(0.02)
 
-        SYSTEM_STATE["total_symbols_scanned"] = total
         SYSTEM_STATE["scanned_ok"] = ok
         SYSTEM_STATE["api_errors"] = errors
         SYSTEM_STATE["signals_found"] += found
         SYSTEM_STATE["is_scanning"] = False
-        db.log_scan(total, ok, errors, total - ok, found)
-        logger.info(f"=== [STRICT QC] HOÀN TẤT QUÉT: Tìm thấy {found} tín hiệu ===")
+        db.log_scan(total_raw, len(crypto_symbols), tradfi_blocked, found)
+        logger.info(f"=== [CRYPTO SCANNER] HOÀN TẤT: Hợp lệ={len(crypto_symbols)}, Chặn TradFi={tradfi_blocked}, Tìm thấy={found} ===")
 
     def _create_signal(self, symbol: str, details: Dict, df_h1, df_h4, df_d1, btc_gain, is_watch: bool):
         details["symbol"] = symbol
@@ -632,9 +652,6 @@ class MarketScanner:
         tp1, tp1_note, rr1, tp2, tp2_note, rr2 = SmartRiskEngine.calculate_tp(df_h1, df_h4, df_d1, details["paper_entry"], sl)
         score = WaveStrengthEngine.calculate_score(df_h1, df_h4, df_d1, btc_gain)
 
-        # BỘ LỌC NGHIÊM NGẶT THEO YÊU CẦU MỚI:
-        # 1. Nếu R TP1 dưới 1.5 -> Đánh dấu LOW REWARD SPACE và không CONFIRMED chính thức.
-        # 2. Nếu Wave Strength dưới 70 -> Đưa vào WATCH / LOW CONFIDENCE.
         state = "CONFIRMED"
         if rr1 < 1.5:
             details["setup_name"] += " [LOW REWARD SPACE]"
@@ -645,18 +662,14 @@ class MarketScanner:
         sig = {
             "symbol": symbol, "setup_name": details["setup_name"], "state": state,
             "signal_price": details["signal_price"], "paper_entry": details["paper_entry"],
-            "sl_price": sl, "sl_reason": reason, "sl_tag": sl_tag,
+            "sl_price": sl, "sl_reason": reason,
             "tp1": tp1, "tp1_note": tp1_note, "tp2": tp2, "tp2_note": tp2_note,
             "tp1_rr": rr1, "tp2_rr": rr2, "wave_score": score
         }
 
         db.save_signal(sig)
-        
-        # Chỉ gửi thông báo chính thức nếu đạt chuẩn nghiêm ngặt (tránh spam setup kém chất lượng)
         if state == "CONFIRMED":
             telegram_service.notify_signal(sig)
-        else:
-            logger.info(f"Lọc bỏ / Chuyển sang Watchlist (Không bắn tin chính thức): #{symbol} | Trạng thái: {state} | R_TP1: {rr1} | Score: {score}")
 
     def _process_active(self, sig: Dict, df_h1, df_h4, df_d1, btc_gain):
         symbol, entry, sl = sig["symbol"], sig["paper_entry"], sig["sl_price"]
@@ -672,24 +685,18 @@ class MarketScanner:
 
         if trailing > 0 and close < trailing:
             db.update_signal_state(symbol, "FINISHED", max_gain=max_gain, trailing_stop=trailing)
-            telegram_service.notify_tp_update(symbol, gain, WaveStrengthEngine.calculate_score(df_h1, df_h4, df_d1, btc_gain), "TREND EXIT (Hit Trailing Stop)", trailing)
+            telegram_service.notify_tp_update(symbol, gain, WaveStrengthEngine.calculate_score(df_h1, df_h4, df_d1, btc_gain), "TREND EXIT", trailing)
             return
 
         score = WaveStrengthEngine.calculate_score(df_h1, df_h4, df_d1, btc_gain)
-        m10, m15, m20 = sig.get("notified_m10", 0), sig.get("notified_m15", 0), sig.get("notified_m20", 0)
+        m10, m15 = sig.get("notified_m10", 0), sig.get("notified_m15", 0)
 
-        if score < 50 and gain >= 8.0:
-            telegram_service.notify_tp_update(symbol, gain, score, "MOMENTUM WEAKENING (Lực tăng suy yếu)", trailing)
-            db.update_signal_state(symbol, "WEAKENING", max_gain=max_gain, trailing_stop=trailing)
-        elif gain >= 10.0 and not m10:
+        if gain >= 10.0 and not m10:
             telegram_service.notify_tp_update(symbol, gain, score, "EXTENDED WAVE (+10%)", trailing)
             db.update_signal_state(symbol, "SMART_TP", max_gain=max_gain, trailing_stop=trailing, m10=1)
         elif gain >= 15.0 and not m15:
             telegram_service.notify_tp_update(symbol, gain, score, "EXTENDED WAVE (+15%)", trailing)
             db.update_signal_state(symbol, "EXTENDED", max_gain=max_gain, trailing_stop=trailing, m15=1)
-        elif gain >= 20.0 and not m20:
-            telegram_service.notify_tp_update(symbol, gain, score, "EXTENDED WAVE (+20% Bùng nổ lớn)", trailing)
-            db.update_signal_state(symbol, "EXTENDED", max_gain=max_gain, trailing_stop=trailing, m20=1)
         else:
             db.update_signal_state(symbol, sig["state"], max_gain=max_gain, trailing_stop=trailing)
 
@@ -716,7 +723,7 @@ async def full_auto_scheduler():
 # 12. TELEGRAM COMMAND HANDLERS
 # -----------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 <b>BYBIT H1 SMART WAVE PRO – STRICT QC</b>\nBot hoạt động 24/7 với bộ lọc chất lượng nghiêm ngặt.\n/status - Trạng thái\n/active - Lệnh đang chạy", parse_mode="HTML")
+    await update.message.reply_text("🚀 <b>BYBIT H1 SMART WAVE PRO – CRYPTO ONLY</b>\nBot hoạt động 24/7 chỉ quét thị trường Tiền Điện Tử.\n/status - Thống kê tài sản\n/active - Lệnh đang chạy", parse_mode="HTML")
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if SCAN_LOCK.locked():
@@ -729,11 +736,14 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_text = 'Đang chạy' if SYSTEM_STATE['is_scanning'] else 'Đang chờ (Idle)'
-    msg = f"""📊 <b>TRẠNG THÁI HỆ THỐNG STRICT QC</b>
-🤖 <b>Quét tự động:</b> {status_text}
+    msg = f"""📊 <b>THỐNG KÊ BỘ LỌC TÀI SẢN BYBIT</b>
+🤖 <b>Trạng thái quét:</b> {status_text}
 ⏱ <b>Lần quét gần nhất:</b> {SYSTEM_STATE['last_scan_time']}
 ⏳ <b>Lần quét kế tiếp:</b> {SYSTEM_STATE['next_scan_time']}
-🌐 <b>Số coin thành công:</b> {SYSTEM_STATE['scanned_ok']} / {SYSTEM_STATE['total_symbols_scanned']}
+🌐 <b>Tổng số hợp đồng gốc:</b> {SYSTEM_STATE['total_raw_symbols']}
+✅ <b>Crypto hợp lệ quét:</b> {SYSTEM_STATE['crypto_valid']}
+🚫 <b>TradFi / Cổ phiếu đã chặn:</b> {SYSTEM_STATE['tradfi_blocked']}
+❓ <b>Tài sản chưa xác định (Unknown):</b> {SYSTEM_STATE['unknown_symbols']}
 🎯 <b>Tín hiệu đã phát hiện:</b> {SYSTEM_STATE['signals_found']}"""
     await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -752,7 +762,7 @@ async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 def main():
     logger.info("==================================================")
-    logger.info(" KHỞI ĐỘNG HỆ THỐNG STRICT QC 24/7 BOT ")
+    logger.info(" KHỞI ĐỘNG HỆ THỐNG CRYPTO ONLY 24/7 BOT ")
     logger.info("==================================================")
 
     threading.Thread(target=run_flask_server, daemon=True).start()
@@ -773,7 +783,7 @@ def main():
 
         await app.initialize()
         await app.start()
-        logger.info("Bot Strict QC đã sẵn sàng 24/7!")
+        logger.info("Bot Crypto Only đã sẵn sàng 24/7!")
         await app.updater.start_polling()
         await asyncio.Event().wait()
 

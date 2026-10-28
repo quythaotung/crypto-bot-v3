@@ -221,8 +221,7 @@ class DatabaseManager:
             cursor.execute(query, params)
             conn.commit()
 
-    def get_active_signals(() -> List[Dict[str, Any]]:
-        pass # Helper method
+    # ĐÃ XÓA ĐOẠN CODE LỖI `def get_active_signals((...):` TẠI ĐÂY
 
     def get_active_signals_list(self) -> List[Dict[str, Any]]:
         with self.get_connection() as conn:
@@ -1304,4 +1303,48 @@ async def scheduled_scanner_loop():
                 async with SCAN_LOCK:
                     await asyncio.to_thread(scanner.scan_market)
         except Exception as e:
-            logger.error(f
+            logger.error(f"Lỗi trong vòng quét tự động: {e}")
+
+        # Nằm chờ 1 giờ (3600s)
+        await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
+
+# -----------------------------------------------------------------------------
+# 15. MAIN ENTRY POINT
+# -----------------------------------------------------------------------------
+def main():
+    logger.info("==================================================")
+    logger.info(" KHỞI ĐỘNG HỆ THỐNG BYBIT H1 SMART WAVE PRO BOT ")
+    logger.info("==================================================")
+
+    # 1. Khởi chạy Flask Server ở luồng riêng (Background Thread)
+    flask_thread = threading.Thread(target=run_flask_server, daemon=True)
+    flask_thread.start()
+
+    # 2. Khởi tạo Telegram Bot Application
+    if not BOT_TOKEN or BOT_TOKEN.startswith("YOUR_"):
+        logger.error("CHƯA CẤU HÌNH BOT_TOKEN! Vui lòng thiết lập biến môi trường BOT_TOKEN.")
+        sys.exit(1)
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Thêm Handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("active", cmd_active))
+    app.add_handler(CommandHandler("top", cmd_top))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("coin", cmd_coin))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    # 3. Tạo Task chạy Scanner ẩn theo chu kỳ
+    loop = asyncio.get_event_loop()
+    loop.create_task(scheduled_scanner_loop())
+
+    # 4. Chạy Telegram Bot Polling
+    logger.info("Bot đã sẵn sàng và đang lắng nghe lệnh trên Telegram...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()

@@ -48,13 +48,13 @@ DB_PATH = os.environ.get("DB_PATH", "mexc_dual_signals.db")
 MEXC_SPOT_BASE_URL = "https://api.mexc.com"
 MEXC_FUTURES_BASE_URL = "https://contract.mexc.com"
 
-# Adjustable Hard Filters Thresholds for MEXC
-MIN_SPOT_VOL_24H = float(os.environ.get("MIN_SPOT_VOL_24H", "1000000"))       # 1M USDT (phù hợp MEXC Spot)
-MIN_FUTURES_TURNOVER_24H = float(os.environ.get("MIN_FUTURES_TURNOVER_24H", "5000000")) # 5M USDT
-MAX_SPOT_SPREAD_PCT = float(os.environ.get("MAX_SPOT_SPREAD_PCT", "0.35"))    # 0.35%
+# Adjustable Hard Filters Thresholds (Expanded Scan Range: 50 - 100+ MEXC Coins)
+MIN_SPOT_VOL_24H = float(os.environ.get("MIN_SPOT_VOL_24H", "500000"))         # 500k USDT
+MIN_FUTURES_TURNOVER_24H = float(os.environ.get("MIN_FUTURES_TURNOVER_24H", "2000000")) # 2M USDT
+MAX_SPOT_SPREAD_PCT = float(os.environ.get("MAX_SPOT_SPREAD_PCT", "0.35"))      # 0.35%
 COOLDOWN_HOURS = 4
 
-# Blacklist
+# Blacklist Stablecoins & Leveraged Tokens
 STABLE_AND_ETF_BLACKLIST = {
     "USDT", "USDC", "BUSD", "TUSD", "DAI", "EUR", "GBP", "FDUSD", "USDE",
     "3L", "3S", "4L", "4S", "5L", "5S", "DOWN", "UP", "BULL", "BEAR"

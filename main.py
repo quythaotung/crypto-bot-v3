@@ -48,13 +48,13 @@ DB_PATH = os.environ.get("DB_PATH", "mexc_dual_signals.db")
 MEXC_SPOT_BASE_URL = "https://api.mexc.com"
 MEXC_FUTURES_BASE_URL = "https://contract.mexc.com"
 
-# Hard Filters Configurable Thresholds
-MIN_SPOT_VOL_24H = float(os.environ.get("MIN_SPOT_VOL_24H", "5000000"))       # 5M USDT
-MIN_FUTURES_TURNOVER_24H = float(os.environ.get("MIN_FUTURES_TURNOVER_24H", "20000000")) # 20M USDT
-MAX_SPOT_SPREAD_PCT = float(os.environ.get("MAX_SPOT_SPREAD_PCT", "0.25"))    # 0.25%
+# Adjustable Hard Filters Thresholds for MEXC
+MIN_SPOT_VOL_24H = float(os.environ.get("MIN_SPOT_VOL_24H", "1000000"))       # 1M USDT (phù hợp MEXC Spot)
+MIN_FUTURES_TURNOVER_24H = float(os.environ.get("MIN_FUTURES_TURNOVER_24H", "5000000")) # 5M USDT
+MAX_SPOT_SPREAD_PCT = float(os.environ.get("MAX_SPOT_SPREAD_PCT", "0.35"))    # 0.35%
 COOLDOWN_HOURS = 4
 
-# Stablecoins & Leveraged Tokens Blacklist
+# Blacklist
 STABLE_AND_ETF_BLACKLIST = {
     "USDT", "USDC", "BUSD", "TUSD", "DAI", "EUR", "GBP", "FDUSD", "USDE",
     "3L", "3S", "4L", "4S", "5L", "5S", "DOWN", "UP", "BULL", "BEAR"
@@ -92,7 +92,7 @@ def run_flask_server():
     flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 # -----------------------------------------------------------------------------
-# 3. SQLITE DATABASE MANAGER (HISTORICAL STORAGE, SNAPSHOTS, & BACKTEST)
+# 3. SQLITE DATABASE MANAGER
 # -----------------------------------------------------------------------------
 class DatabaseManager:
     def __init__(self, db_path: str = DB_PATH):
@@ -107,7 +107,6 @@ class DatabaseManager:
     def _init_db(self):
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            # Bảng lưu vết tín hiệu đã phát ra (chống spam 4h)
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,7 +129,6 @@ class DatabaseManager:
                 telegram_sent INTEGER DEFAULT 0
             )
             """)
-            # Bảng lưu snapshot Open Interest Futures (đo biến động %OI 1 giờ)
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS oi_snapshots (
                 symbol TEXT NOT NULL,
@@ -139,7 +137,6 @@ class DatabaseManager:
                 PRIMARY KEY (symbol, timestamp)
             )
             """)
-            # Bảng lưu log hoạt động quét
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS scan_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,7 +158,6 @@ class DatabaseManager:
             conn.commit()
 
     def get_oi_1h_ago(self, symbol: str, current_ts: int) -> Optional[float]:
-        # Tìm snapshot OI trong khoảng 50 - 70 phút trước
         ts_1h_ago = current_ts - 3600
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -169,12 +165,11 @@ class DatabaseManager:
             SELECT hold_vol FROM oi_snapshots 
             WHERE symbol = ? AND timestamp BETWEEN ? AND ?
             ORDER BY ABS(timestamp - ?) ASC LIMIT 1
-            """, (symbol, ts_1h_ago - 600, ts_1h_ago + 600, ts_1h_ago))
+            """, (symbol, ts_1h_ago - 900, ts_1h_ago + 900, ts_1h_ago))
             row = cursor.fetchone()
             return row["hold_vol"] if row else None
 
     def cleanup_old_oi_snapshots(self):
-        # Xóa bớt snapshot OI cũ hơn 24 giờ để nhẹ DB
         cutoff = int(time.time()) - 86400
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -229,7 +224,7 @@ class DatabaseManager:
 db = DatabaseManager()
 
 # -----------------------------------------------------------------------------
-# 4. MEXC API CLIENT (DUAL SPOT & FUTURES REST ENDPOINTS)
+# 4. MEXC API CLIENT
 # -----------------------------------------------------------------------------
 class MexcClient:
     def __init__(self):
@@ -253,11 +248,8 @@ class MexcClient:
         return None
 
     def get_qualified_universe(self) -> List[Dict[str, Any]]:
-        # 1. Lấy toàn bộ ticker 24h Spot
         spot_tickers = self._request(MEXC_SPOT_BASE_URL, "/api/v3/ticker/24hr")
-        # 2. Lấy toàn bộ bookTicker Spot để tính Spread
         book_tickers = self._request(MEXC_SPOT_BASE_URL, "/api/v3/ticker/bookTicker")
-        # 3. Lấy toàn bộ hợp đồng Futures Detail & Tickers
         futures_details = self._request(MEXC_FUTURES_BASE_URL, "/api/v1/contract/detail")
         futures_tickers = self._request(MEXC_FUTURES_BASE_URL, "/api/v1/contract/ticker")
 
@@ -265,49 +257,46 @@ class MexcClient:
             logger.error("Không thể tải đầy đủ thông tin danh mục từ MEXC API!")
             return []
 
-        # Chuyển dữ liệu Futures sang Dict tra cứu cho nhanh
         futures_map = {}
         fut_ticker_data = futures_tickers.get("data", []) if isinstance(futures_tickers, dict) else futures_tickers
         if isinstance(fut_ticker_data, list):
             for ft in fut_ticker_data:
-                futures_map[ft.get("symbol")] = ft
+                sym = ft.get("symbol", "").replace("_", "").upper()
+                futures_map[sym] = ft
 
         fut_detail_set = set()
         fut_detail_data = futures_details.get("data", []) if isinstance(futures_details, dict) else futures_details
         if isinstance(fut_detail_data, list):
             for fd in fut_detail_data:
-                if fd.get("state") == 0: # Active
-                    fut_detail_set.add(fd.get("symbol"))
+                if fd.get("state") == 0:
+                    sym = fd.get("symbol", "").replace("_", "").upper()
+                    fut_detail_set.add(sym)
 
-        book_map = {b["symbol"]: b for b in book_tickers if "symbol" in b}
+        book_map = {b["symbol"]: b for b in book_tickers if isinstance(b, dict) and "symbol" in b}
 
         qualified = []
         for st in spot_tickers:
-            symbol_spot = st.get("symbol", "")
+            if not isinstance(st, dict): continue
+            symbol_spot = st.get("symbol", "").upper()
             if not symbol_spot.endswith("USDT"):
                 continue
 
             base_coin = symbol_spot[:-4]
-            # Loại bỏ Stablecoin và ETF
             if base_coin in STABLE_AND_ETF_BLACKLIST or any(base_coin.endswith(suffix) for suffix in ["3L", "3S", "4L", "4S", "5L", "5S"]):
                 continue
 
-            # Kiểm tra Volume Spot 24h >= 5M USDT
             spot_vol_quote = float(st.get("quoteVolume", 0.0))
             if spot_vol_quote < MIN_SPOT_VOL_24H:
                 continue
 
-            # Tương ứng cặp Futures MEXC: BTCUSDT -> BTC_USDT
-            symbol_futures = f"{base_coin}_USDT"
-            if symbol_futures not in fut_detail_set or symbol_futures not in futures_map:
+            if symbol_spot not in fut_detail_set or symbol_spot not in futures_map:
                 continue
 
-            ft_info = futures_map[symbol_futures]
+            ft_info = futures_map[symbol_spot]
             futures_turnover_24h = float(ft_info.get("amount24", 0.0))
             if futures_turnover_24h < MIN_FUTURES_TURNOVER_24H:
                 continue
 
-            # Tính Spread Spot
             book = book_map.get(symbol_spot)
             if not book:
                 continue
@@ -320,22 +309,20 @@ class MexcClient:
                 continue
 
             hold_vol = float(ft_info.get("holdVol", 0.0))
-            last_price = float(st.get("lastPrice", 0.0))
 
             qualified.append({
                 "spot_symbol": symbol_spot,
-                "futures_symbol": symbol_futures,
+                "futures_symbol": ft_info.get("symbol", f"{base_coin}_USDT"),
                 "spot_volume_24h": spot_vol_quote,
                 "futures_turnover_24h": futures_turnover_24h,
                 "spread_pct": spread_pct,
-                "last_price": last_price,
+                "last_price": float(st.get("lastPrice", 0.0)),
                 "hold_vol": hold_vol
             })
 
         return qualified
 
     def fetch_spot_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> Optional[pd.DataFrame]:
-        # MEXC Spot Klines: /api/v3/klines
         res = self._request(MEXC_SPOT_BASE_URL, "/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": limit})
         if not res or not isinstance(res, list) or len(res) == 0:
             return None
@@ -355,20 +342,8 @@ class MexcClient:
         return df
 
     def fetch_spot_orderflow_and_cvd(self, symbol: str, limit: int = 1000) -> Tuple[float, float, bool]:
-        """
-        Lấy khớp lệnh aggTrades từ MEXC Spot (/api/v3/aggTrades)
-        Trả về: (taker_buy_ratio_pct, cvd_value, is_data_sufficient)
-        isBuyerMaker = True -> Seller là maker, Buyer là taker -> TAKER BUY.
-        isBuyerMaker = False -> Buyer là maker, Seller là taker -> TAKER SELL.
-        """
         res = self._request(MEXC_SPOT_BASE_URL, "/api/v3/aggTrades", params={"symbol": symbol, "limit": limit})
-        if not res or not isinstance(res, list) or len(res) < 100:
-            return 50.0, 0.0, False
-
-        now_ms = int(time.time() * 1000)
-        earliest_trade_ts = int(res[0]["T"])
-        # Kiểm tra xem dữ liệu aggTrades có phủ tối thiểu 45 phút gần nhất không
-        if (now_ms - earliest_trade_ts) < (45 * 60 * 1000):
+        if not res or not isinstance(res, list) or len(res) < 30:
             return 50.0, 0.0, False
 
         taker_buy_vol = 0.0
@@ -380,9 +355,9 @@ class MexcClient:
             vol_usdt = qty * price
             is_buyer_maker = t.get("m", False)
 
-            if is_buyer_maker: # Buyer là Taker -> Taker Buy
+            if is_buyer_maker:
                 taker_buy_vol += vol_usdt
-            else: # Seller là Taker -> Taker Sell
+            else:
                 taker_sell_vol += vol_usdt
 
         total_vol = taker_buy_vol + taker_sell_vol
@@ -396,12 +371,12 @@ class MexcClient:
 mexc_api = MexcClient()
 
 # -----------------------------------------------------------------------------
-# 5. TECHNICAL INDICATORS & STRUCTURE ANALYSIS
+# 5. TECHNICAL INDICATORS & STRUCTURE
 # -----------------------------------------------------------------------------
 class TechnicalAnalyzer:
     @staticmethod
     def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or len(df) < 30:
+        if df is None or len(df) < 25:
             return df
         df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
         df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
@@ -438,7 +413,7 @@ class TechnicalAnalyzer:
         return h1_last['close'] > h1_last['ema20'] > h1_last['ema50']
 
 # -----------------------------------------------------------------------------
-# 6. SETUP ENGINES (INDEPENDENT SETUPS 1 & 2)
+# 6. SETUP ENGINES
 # -----------------------------------------------------------------------------
 class SetupEngine:
     @staticmethod
@@ -446,21 +421,12 @@ class SetupEngine:
         df_h1: pd.DataFrame, df_m15: pd.DataFrame, oi_change_pct: float,
         taker_buy_pct: float, cvd_val: float, is_cvd_valid: bool
     ) -> Tuple[bool, Dict[str, Any], int]:
-        """
-        SETUP 1 — LONG READY ENTRY (Hồi quy hỗ trợ / Retest)
-        """
-        if df_h1 is None or df_m15 is None or len(df_h1) < 30 or len(df_m15) < 15:
+        if df_h1 is None or df_m15 is None or len(df_h1) < 25 or len(df_m15) < 12:
             return False, {}, 0
 
-        # Cần dữ liệu Orderflow thực tế
-        if not is_cvd_valid or cvd_val <= 0 or taker_buy_pct < 55.0:
+        if taker_buy_pct < 52.0 or oi_change_pct < -3.5:
             return False, {}, 0
 
-        # OI không sụt quá 3% trong 1h
-        if oi_change_pct < -3.0:
-            return False, {}, 0
-
-        # Cấu trúc H1 phải tăng
         if not TechnicalAnalyzer.is_h1_uptrend(df_h1):
             return False, {}, 0
 
@@ -468,7 +434,6 @@ class SetupEngine:
         current_price = df_h1['close'].iloc[-1]
         atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (current_price * 0.01)
 
-        # Xác định vùng hỗ trợ H1 (EMA20, EMA50 hoặc Swing Low)
         _, lows = TechnicalAnalyzer.find_pivots(df_h1.iloc[:-1], left=2, right=2)
         swing_low = lows[-1]['price'] if lows else df_h1['low'].iloc[-15:-1].min()
         ema20 = h1_last['ema20']
@@ -476,49 +441,42 @@ class SetupEngine:
 
         support_ref = max([s for s in [swing_low, ema20, ema50] if s <= current_price], default=swing_low)
 
-        # Kiểm tra khoảng cách hiện tại đến hỗ trợ không vượt quá 0.25 ATR H1
         dist_to_support = abs(current_price - support_ref)
-        if dist_to_support > (0.25 * atr_h1):
+        if dist_to_support > (0.35 * atr_h1):
             return False, {}, 0
 
-        # Kiểm tra M15 đóng nến xác nhận lực mua tại hỗ trợ
         m15_last = df_m15.iloc[-2]
-        m15_is_bullish = m15_last['close'] > m15_last['open'] and (m15_last['close'] - m15_last['low']) >= 0.6 * (m15_last['high'] - m15_last['low'])
+        m15_is_bullish = m15_last['close'] > m15_last['open'] or (m15_last['close'] - m15_last['low']) >= 0.5 * (m15_last['high'] - m15_last['low'])
         if not m15_is_bullish:
             return False, {}, 0
 
-        # Spot Volume H1 >= 1.3x
         vol_sma_h1 = h1_last['vol_sma20'] if h1_last['vol_sma20'] > 0 else 1
         vol_ratio_h1 = h1_last['volume'] / vol_sma_h1
-        if vol_ratio_h1 < 1.3:
+        if vol_ratio_h1 < 1.2:
             return False, {}, 0
 
-        # TÍNH SL VÀ TP DỰA TRÊN CẤU TRÚC GIÁ THỰC TẾ
         sl_price = round(swing_low - (0.20 * atr_h1), 4)
         if sl_price >= current_price:
             return False, {}, 0
 
         risk = current_price - sl_price
 
-        # TP1 & TP2 từ đỉnh Swing High thực tế
         highs, _ = TechnicalAnalyzer.find_pivots(df_h1.iloc[:-1], left=2, right=2)
         valid_res = sorted([h['price'] for h in highs if h['price'] > current_price])
 
-        tp1 = valid_res[0] if len(valid_res) >= 1 else current_price + (1.6 * risk)
+        tp1 = valid_res[0] if len(valid_res) >= 1 else current_price + (1.5 * risk)
         tp2 = valid_res[1] if len(valid_res) >= 2 else current_price + (2.5 * risk)
 
         rr1 = round((tp1 - current_price) / risk, 2)
         rr2 = round((tp2 - current_price) / risk, 2)
 
-        # Ưu tiên TP1 >= 1.5R và TP2 >= 2.0R (Không tự ép R)
-        if rr1 < 1.5 or rr2 < 2.0:
+        if rr1 < 1.3 or rr2 < 1.8:
             return False, {}, 0
 
-        # Chấm điểm chất lượng /100
         score = 75
-        if vol_ratio_h1 >= 1.8: score += 10
-        if taker_buy_pct >= 60.0: score += 10
-        if oi_change_pct >= 1.0: score += 5
+        if vol_ratio_h1 >= 1.5: score += 10
+        if taker_buy_pct >= 58.0: score += 10
+        if oi_change_pct >= 0.5: score += 5
         score = min(score, 100)
 
         details = {
@@ -535,7 +493,7 @@ class SetupEngine:
             "oi_change_pct": round(oi_change_pct, 2),
             "taker_buy_pct": taker_buy_pct,
             "cvd_val": cvd_val,
-            "reason_entry": "Giá hồi quy sát hỗ trợ kỹ thuật H1 với nến M15 rút chân xác nhận.",
+            "reason_entry": "Giá hồi quy sát hỗ trợ kỹ thuật H1 với nến M15 xác nhận.",
             "reason_sl": "Dưới đáy Swing Low H1 + Đệm rủi ro 0.20 ATR.",
             "reason_tp": "Theo vùng kháng cự cấu trúc H1/H4 gần nhất.",
             "candle_timestamp": int(h1_last['open_time'])
@@ -547,51 +505,32 @@ class SetupEngine:
         df_h1: pd.DataFrame, oi_change_pct: float,
         taker_buy_pct: float, cvd_val: float, is_cvd_valid: bool
     ) -> Tuple[bool, Dict[str, Any], int]:
-        """
-        SETUP 2 — LONG MONEY FLOW EXPLOSION (Bứt phá nền tích lũy)
-        """
-        if df_h1 is None or len(df_h1) < 30:
+        if df_h1 is None or len(df_h1) < 25:
             return False, {}, 0
 
-        # Cần dữ liệu Orderflow thực tế
-        if not is_cvd_valid or cvd_val <= 0 or taker_buy_pct < 60.0:
-            return False, {}, 0
-
-        # OI Futures H1 tăng >= 5%
-        if oi_change_pct < 5.0:
+        if taker_buy_pct < 55.0 or oi_change_pct < 3.0:
             return False, {}, 0
 
         h1_last = df_h1.iloc[-2]
         current_price = df_h1['close'].iloc[-1]
         atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (current_price * 0.01)
 
-        # Kiểm tra breakout nền tích lũy 12–24 nến H1
-        base_range = df_h1.iloc[-26:-2]
+        base_range = df_h1.iloc[-20:-2]
         base_high = base_range['high'].max()
         base_low = base_range['low'].min()
 
-        # Nến H1 đóng cửa nằm trên đỉnh nền
         if h1_last['close'] <= base_high:
             return False, {}, 0
 
-        # Đóng cửa nằm gần đỉnh nến (Upper Shadow <= 25% tổng range nến)
-        range_candle = h1_last['high'] - h1_last['low']
-        if range_candle > 0 and (h1_last['high'] - h1_last['close']) / range_candle > 0.25:
-            return False, {}, 0
-
-        # Volume Spot H1 >= 2.2x
         vol_sma_h1 = h1_last['vol_sma20'] if h1_last['vol_sma20'] > 0 else 1
         vol_ratio_h1 = h1_last['volume'] / vol_sma_h1
-        if vol_ratio_h1 < 2.2:
+        if vol_ratio_h1 < 1.8:
             return False, {}, 0
 
-        # Kiểm tra giá không cách đỉnh vùng breakout quá 0.7 ATR H1
         dist_from_breakout = current_price - base_high
-        if dist_from_breakout > (0.7 * atr_h1):
-            logger.info(f"Loại bỏ {df_h1}: Giá đã chạy quá xa khỏi vùng Breakout ({dist_from_breakout:.4f} > 0.7 ATR)")
+        if dist_from_breakout > (0.8 * atr_h1):
             return False, {}, 0
 
-        # TÍNH SL VÀ TP CHUẨN CẤU TRÚC
         sl_price = round(base_low - (0.20 * atr_h1), 4)
         if sl_price >= current_price:
             return False, {}, 0
@@ -601,19 +540,19 @@ class SetupEngine:
         highs, _ = TechnicalAnalyzer.find_pivots(df_h1.iloc[:-1], left=2, right=2)
         valid_res = sorted([h['price'] for h in highs if h['price'] > current_price])
 
-        tp1 = valid_res[0] if len(valid_res) >= 1 else current_price + (1.8 * risk)
-        tp2 = valid_res[1] if len(valid_res) >= 2 else current_price + (2.8 * risk)
+        tp1 = valid_res[0] if len(valid_res) >= 1 else current_price + (1.6 * risk)
+        tp2 = valid_res[1] if len(valid_res) >= 2 else current_price + (2.6 * risk)
 
         rr1 = round((tp1 - current_price) / risk, 2)
         rr2 = round((tp2 - current_price) / risk, 2)
 
-        if rr1 < 1.5 or rr2 < 2.0:
+        if rr1 < 1.3 or rr2 < 1.8:
             return False, {}, 0
 
         score = 85
-        if vol_ratio_h1 >= 3.0: score += 5
-        if taker_buy_pct >= 65.0: score += 5
-        if oi_change_pct >= 8.0: score += 5
+        if vol_ratio_h1 >= 2.5: score += 5
+        if taker_buy_pct >= 60.0: score += 5
+        if oi_change_pct >= 5.0: score += 5
         score = min(score, 100)
 
         details = {
@@ -638,7 +577,7 @@ class SetupEngine:
         return True, details, score
 
 # -----------------------------------------------------------------------------
-# 7. TELEGRAM NOTIFICATION SERVICE
+# 7. TELEGRAM SERVICE
 # -----------------------------------------------------------------------------
 class TelegramService:
     def __init__(self, token=BOT_TOKEN, chat_id=CHAT_ID):
@@ -695,7 +634,7 @@ class TelegramService:
 telegram_service = TelegramService()
 
 # -----------------------------------------------------------------------------
-# 8. MARKET SCANNER & SCHEDULER
+# 8. MARKET SCANNER
 # -----------------------------------------------------------------------------
 class MarketScanner:
     def scan_market(self):
@@ -705,7 +644,6 @@ class MarketScanner:
         
         logger.info("=== [MEXC ENGINE] BẮT ĐẦU VÒNG QUÉT THỊ TRƯỜNG ===")
         
-        # 1. Lọc danh mục thỏa mãn điều kiện cứng (Spot + Futures)
         qualified_list = mexc_api.get_qualified_universe()
         SYSTEM_STATE["qualified_symbols"] = len(qualified_list)
         
@@ -717,16 +655,14 @@ class MarketScanner:
             hold_vol = item["hold_vol"]
 
             try:
-                # Lưu snapshot OI để tính biến động 1 giờ
                 db.save_oi_snapshot(fut_sym, current_ts, hold_vol)
                 oi_1h_ago = db.get_oi_1h_ago(fut_sym, current_ts)
                 oi_change_pct = (((hold_vol - oi_1h_ago) / oi_1h_ago) * 100.0) if oi_1h_ago and oi_1h_ago > 0 else 0.0
 
-                # Lấy Klines Spot H1 & M15
                 df_h1 = mexc_api.fetch_spot_klines(spot_sym, "1h", 60)
                 df_m15 = mexc_api.fetch_spot_klines(spot_sym, "15m", 40)
 
-                if df_h1 is None or df_m15 is None or len(df_h1) < 30:
+                if df_h1 is None or df_m15 is None or len(df_h1) < 25:
                     continue
 
                 df_h1 = TechnicalAnalyzer.add_indicators(df_h1)
@@ -734,11 +670,8 @@ class MarketScanner:
                 ok_count += 1
 
                 candle_ts = int(df_h1['open_time'].iloc[-2])
-
-                # Lấy dữ liệu Orderflow & CVD thực tế từ aggTrades
                 taker_buy_pct, cvd_val, is_cvd_valid = mexc_api.fetch_spot_orderflow_and_cvd(spot_sym)
 
-                # KIỂM TRA SETUP 1 (LONG READY ENTRY)
                 if not db.is_cooldown_active(spot_sym, "LONG READY ENTRY", candle_ts):
                     is_s1, d1, score1 = SetupEngine.evaluate_setup_1_ready_entry(
                         df_h1, df_m15, oi_change_pct, taker_buy_pct, cvd_val, is_cvd_valid
@@ -752,7 +685,6 @@ class MarketScanner:
                         time.sleep(0.05)
                         continue
 
-                # KIỂM TRA SETUP 2 (LONG MONEY FLOW EXPLOSION)
                 if not db.is_cooldown_active(spot_sym, "LONG MONEY FLOW EXPLOSION", candle_ts):
                     is_s2, d2, score2 = SetupEngine.evaluate_setup_2_money_flow_explosion(
                         df_h1, oi_change_pct, taker_buy_pct, cvd_val, is_cvd_valid
@@ -771,7 +703,6 @@ class MarketScanner:
                 error_count += 1
             time.sleep(0.02)
 
-        # Xóa bớt snapshot OI cũ
         db.cleanup_old_oi_snapshots()
 
         SYSTEM_STATE["scanned_ok"] = ok_count

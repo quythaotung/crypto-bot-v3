@@ -227,7 +227,7 @@ class DatabaseManager:
 db = DatabaseManager()
 
 # -----------------------------------------------------------------------------
-# 4. MEXC API CLIENT (FUTURES ONLY)
+# 4. MEXC API CLIENT (FUTURES OPTIMIZED)
 # -----------------------------------------------------------------------------
 class MexcClient:
     def __init__(self):
@@ -251,7 +251,6 @@ class MexcClient:
         return None
 
     def get_qualified_universe(self) -> List[Dict[str, Any]]:
-        # Lấy trực tiếp danh sách Hợp đồng và Ticker Futures từ MEXC API
         futures_details = self._request(MEXC_FUTURES_BASE_URL, "/api/v1/contract/detail")
         futures_tickers = self._request(MEXC_FUTURES_BASE_URL, "/api/v1/contract/ticker")
 
@@ -305,19 +304,47 @@ class MexcClient:
         return qualified
 
     def fetch_spot_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> Optional[pd.DataFrame]:
-        res = self._request(MEXC_SPOT_BASE_URL, "/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": limit})
-        if not res or not isinstance(res, list) or len(res) == 0:
+        # Mapping timeframe sang định dạng MEXC Futures API
+        interval_map = {"1h": "Min60", "4h": "Hour4", "1d": "Day1", "15m": "Min15"}
+        fut_interval = interval_map.get(interval, "Min60")
+        
+        # Đảm bảo symbol đúng định dạng Futures (vd: BTC_USDT)
+        fut_symbol = symbol if "_" in symbol else f"{symbol[:-4]}_USDT"
+        
+        res = self._request(
+            MEXC_FUTURES_BASE_URL, 
+            f"/api/v1/contract/kline/{fut_symbol}", 
+            params={"interval": fut_interval}
+        )
+        
+        if not res or not isinstance(res, dict) or not res.get("success"):
             return None
+            
+        data = res.get("data", {})
+        if not data or "time" not in data:
+            return None
+            
+        times = data.get("time", [])
+        opens = data.get("open", [])
+        highs = data.get("high", [])
+        lows = data.get("low", [])
+        closes = data.get("close", [])
+        vols = data.get("vol", [])
+        
+        if not times or len(times) == 0:
+            return None
+            
         rows = []
-        for i in res:
+        for i in range(len(times)):
             rows.append({
-                "open_time": int(i[0]),
-                "open": float(i[1]),
-                "high": float(i[2]),
-                "low": float(i[3]),
-                "close": float(i[4]),
-                "volume": float(i[5])
+                "open_time": int(times[i]) * 1000,
+                "open": float(opens[i]),
+                "high": float(highs[i]),
+                "low": float(lows[i]),
+                "close": float(closes[i]),
+                "volume": float(vols[i])
             })
+            
         df = pd.DataFrame(rows)
         df.sort_values(by="open_time", ascending=True, inplace=True)
         df.reset_index(drop=True, inplace=True)
@@ -901,11 +928,6 @@ class SetupEngine:
         df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float,
         oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
     ) -> Tuple[bool, Dict[str, Any], int, str]:
-        """
-        SETUP 7 – H1 BEATUSDT PULLBACK RE-ACCUMULATION (THUẦN NẾN PA H1 ĐẦU CHU KỲ)
-        Bắt nhịp Long đầu chu kỳ khi giá sau nhịp đẩy đầu tiên nhúng về test EMA200 và đóng nến xanh vượt EMA21.
-        Không bắt buộc Volume bùng nổ, ưu tiên Price Action tái tích lũy.
-        """
         if df_h1 is None or len(df_h1) < 35:
             return False, {}, 0, "Dữ liệu nến H1 không đủ"
 
@@ -1187,7 +1209,9 @@ class MarketScanner:
             except Exception as e:
                 logger.error(f"Lỗi xử lý symbol {spot_sym}: {e}")
                 error_count += 1
-            time.sleep(0.02)
+            
+            # Đã tăng delay lên 0.1s để chống bị MEXC chặn IP
+            time.sleep(0.1)
 
         db.cleanup_old_oi_snapshots()
 

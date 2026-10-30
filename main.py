@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 7 SETUPS)
-SETUP 1 – H4 BREAKOUT MỞ SÓNG (Breakout Khung H4 + H1 Trigger)
-SETUP 2 – H4 EMA200 REBOUND (Pullback H4 EMA21/200 + H1 Reclaim)
-SETUP 3 – SPOT & FUTURES ORDERFLOW EXPLOSION (Strict Orderflow Data)
+MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 8 SETUPS)
+SETUP 1 – H4 BREAKOUT MỞ SÓNG
+SETUP 2 – H4 EMA200 REBOUND
+SETUP 3 – SPOT & FUTURES ORDERFLOW EXPLOSION
 SETUP 4 – H1 SIDEWAY BREAKOUT / RE-ACCUMULATION LONG
 SETUP 5 – H1 PULLBACK RECOVERY LONG (Mô hình BEATUSDT H1)
-SETUP 6 – H1 EARLY MOMENTUM RECLAIM (Thuần Nến Price Action H1 - Không Check Vol)
-SETUP 7 – H4 EMA21 BREAKOUT RECLAIM (Thuần Nến Price Action H4 - Không Check Vol)
+SETUP 6 – H1 EARLY MOMENTUM RECLAIM (Thuần Nến PA H1 - Không Check Vol)
+SETUP 7 – H4 EMA21 BREAKOUT RECLAIM (Thuần Nến PA H4 - Mô hình 1000PEPEUSDT)
+SETUP 8 – H1 3-CANDLE EMA21 RECLAIM (Thuần Nến PA H1 - Mô hình IDOLUSDT)
 ===============================================================================
 """
 
@@ -87,7 +88,7 @@ flask_app = Flask(__name__)
 def health_check():
     return jsonify({
         "status": "online",
-        "system": "MEXC MULTI-ENGINE SIGNAL PLATFORM (PRO - 7 SETUPS)",
+        "system": "MEXC MULTI-ENGINE SIGNAL PLATFORM (PRO - 8 SETUPS)",
         "is_scanning": SYSTEM_STATE["is_scanning"],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
@@ -408,7 +409,7 @@ class TechnicalAnalyzer:
         return highs, lows
 
 # -----------------------------------------------------------------------------
-# 6. SETUP ENGINES (FULL 7 SETUPS)
+# 6. SETUP ENGINES (FULL 8 SETUPS)
 # -----------------------------------------------------------------------------
 class SetupEngine:
     @staticmethod
@@ -860,9 +861,6 @@ class SetupEngine:
         df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float,
         oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
     ) -> Tuple[bool, Dict[str, Any], int, str]:
-        """
-        SETUP 6 – H1 EARLY MOMENTUM RECLAIM (THUẦN NẾN PRICE ACTION H1 - KHÔNG CHECK VOLUME)
-        """
         if df_h1 is None or len(df_h1) < 25:
             return False, {}, 0, "Dữ liệu nến H1 không đủ"
 
@@ -938,30 +936,21 @@ class SetupEngine:
         df_h4: pd.DataFrame, df_h1: pd.DataFrame, current_realtime_price: float,
         oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
     ) -> Tuple[bool, Dict[str, Any], int, str]:
-        """
-        SETUP 7 – H4 EMA21 BREAKOUT RECLAIM (THUẦN NẾN PRICE ACTION H4 - MÔ HÌNH 1000PEPEUSDT)
-        Cây nến H4 xanh đầu tiên đóng cửa nhô dứt khoát vượt EMA21, bắt đầu chuỗi tăng bùng nổ. HOÀN TOÀN KHÔNG CHECK VOLUME.
-        """
         if df_h4 is None or len(df_h4) < 25:
             return False, {}, 0, "Dữ liệu nến H4 không đủ"
 
-        h4_candle_last = df_h4.iloc[-2]  # Cây nến H4 vừa đóng cửa hoàn chỉnh
-        h4_candle_prev = df_h4.iloc[-3]  # Cây nến H4 trước đó
+        h4_candle_last = df_h4.iloc[-2]
+        h4_candle_prev = df_h4.iloc[-3]
         entry_price = h4_candle_last['close']
 
-        # 1. Kiểm tra trễ giá Real-time so với điểm đóng cửa nến H4
         atr_h4 = h4_candle_last['atr'] if not np.isnan(h4_candle_last['atr']) else (entry_price * 0.015)
         if current_realtime_price > entry_price + (0.5 * atr_h4):
             return False, {}, 0, f"Giá real-time ({current_realtime_price}) đã chạy quá xa Entry H4 ({entry_price})"
 
-        # 2. Khung H4 nằm trên EMA200 (hoặc nằm quanh dải hỗ trợ EMA200)
         ema200_h4 = h4_candle_last.get('ema200', 0)
         if entry_price < ema200_h4 * 0.995:
             return False, {}, 0, "H4 nằm sâu dưới EMA200"
 
-        # 3. ĐIỀU KIỆN KỸ THUẬT NẾN H4 (MÔ HÌNH 1000PEPEUSDT):
-        # - Cây nến H4 trước đó (candle_prev) đóng cửa nằm DƯỚI hoặc SÁT EMA21 H4
-        # - Cây nến H4 vừa đóng (candle_last) là NẾN XANH TĂNG GIÁ (Close > Open) và ĐÓNG CỬA DỨT KHÓAT VƯỢT LÊN EMA21
         ema21_h4 = h4_candle_last['ema21']
         is_h4_green = h4_candle_last['close'] > h4_candle_last['open']
         is_h4_reclaim_ema21 = h4_candle_last['close'] > ema21_h4
@@ -970,8 +959,6 @@ class SetupEngine:
         if not (is_h4_green and is_h4_reclaim_ema21 and is_prev_below_ema21):
             return False, {}, 0, "Nến H4 chưa đóng xanh dứt khoát vượt EMA21 H4 hoặc nến trước đã ở trên EMA21"
 
-        # 4. TÍNH STOP LOSS VÀ TAKE PROFIT (R:R TỐI THIỂU 1:2.0 CHUẨN ĐẸP)
-        # SL đặt dưới đáy râu nến H4 gần nhất + đệm ATR
         swing_low_h4 = min(h4_candle_prev['low'], h4_candle_last['low'])
         sl_price = round(swing_low_h4 - (0.15 * atr_h4), 4)
         if sl_price >= entry_price:
@@ -979,7 +966,6 @@ class SetupEngine:
 
         risk = entry_price - sl_price
 
-        # TP1 và TP2 tìm theo đỉnh Pivot H4 cũ
         h4_highs, _ = TechnicalAnalyzer.find_pivots(df_h4.iloc[:-1], left=2, right=2)
         valid_res = sorted([h['price'] for h in h4_highs if h['price'] > entry_price])
 
@@ -1020,6 +1006,103 @@ class SetupEngine:
         }
         return True, details, score, "ĐẠT CHUẨN SETUP 7 (H4 EMA21 RECLAIM PA)"
 
+    @staticmethod
+    def evaluate_setup_8_h1_3candle_reclaim_pa(
+        df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float,
+        oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
+    ) -> Tuple[bool, Dict[str, Any], int, str]:
+        """
+        SETUP 8 – H1 3-CANDLE EMA21 RECLAIM (THUẦN NẾN PRICE ACTION H1 - MÔ HÌNH IDOLUSDT)
+        Điều kiện:
+        1. Cả H1 và H4 nằm trên EMA200 (hoặc chạm dải hỗ trợ EMA200 dốc lên).
+        2. Nến H1 thứ 1 (c3): Nhúng giảm qua EMA21.
+        3. Nến H1 thứ 2 (c2): Đóng xanh hồi phục lại sát EMA21.
+        4. Nến H1 thứ 3 (c1): ĐÓNG XANH DỨT KHÓAT VƯỢT LÊN TRÊN EMA21.
+        5. Stop Loss đặt dưới đáy của nến H1 thứ 3 (hoặc cụm nến đáy). HOÀN TOÀN KHÔNG CHECK VOLUME.
+        """
+        if df_h1 is None or len(df_h1) < 25:
+            return False, {}, 0, "Dữ liệu nến H1 không đủ"
+
+        c1 = df_h1.iloc[-2]  # Cây nến H1 xanh thứ 3 vừa đóng cửa hoàn chỉnh (Trigger Candle)
+        c2 = df_h1.iloc[-3]  # Cây nến H1 xanh thứ 2
+        c3 = df_h1.iloc[-4]  # Cây nến H1 thứ 1 (Nến nhúng tạo đáy)
+        entry_price = c1['close']
+
+        # 1. Kiểm tra trễ giá Real-time so với điểm đóng cửa nến 3
+        atr_h1 = c1['atr'] if not np.isnan(c1['atr']) else (entry_price * 0.01)
+        if current_realtime_price > entry_price + (0.5 * atr_h1):
+            return False, {}, 0, f"Giá real-time ({current_realtime_price}) đã chạy xa Entry nến 3 ({entry_price})"
+
+        # 2. Khung H1 và H4 bắt buộc nằm trên EMA200
+        ema200_h1 = c1.get('ema200', 0)
+        if entry_price < ema200_h1 * 0.998:
+            return False, {}, 0, "H1 nằm dưới EMA200"
+
+        if df_h4 is not None and len(df_h4) >= 20:
+            h4_last = df_h4.iloc[-2]
+            if h4_last['close'] < h4_last.get('ema200', 0) * 0.998:
+                return False, {}, 0, "H4 nằm dưới EMA200"
+
+        # 3. ĐIỀU KIỆN CẤU TRÚC 3 NẾN H1 (MÔ HÌNH IDOLUSDT):
+        # - Nến c1 (Nến 3) bắt buộc là NẾN XANH TĂNG GIÁ (Close > Open) và ĐÓNG CỬA TRÊN EMA21
+        # - Nến c3 (Nến 1) hoặc c2 (Nến 2) từng có râu/thân nhúng DƯỚI đường EMA21 H1
+        ema21_h1 = c1['ema21']
+        is_c1_green = c1['close'] > c1['open']
+        is_c1_above_ema21 = c1['close'] > ema21_h1
+        is_dip_below_ema21 = (c3['low'] < c3['ema21']) or (c2['low'] < c2['ema21'])
+
+        if not (is_c1_green and is_c1_above_ema21 and is_dip_below_ema21):
+            return False, {}, 0, "Chưa đúng cấu trúc 3 nến H1 nhúng và vọt vượt EMA21"
+
+        # 4. TÍNH STOP LOSS VÀ TAKE PROFIT (SL ĐẶT DƯỚI ĐÁY NẾN H1 THỨ 3 / CỤM ĐÁY)
+        swing_low = min(c1['low'], c2['low'], c3['low'])
+        sl_price = round(swing_low - (0.15 * atr_h1), 4)
+        if sl_price >= entry_price:
+            return False, {}, 0, "SL cao hơn hoặc bằng Entry"
+
+        risk = entry_price - sl_price
+
+        # TP1/TP2 theo cản Pivot H1/H4
+        h1_highs, _ = TechnicalAnalyzer.find_pivots(df_h1.iloc[:-1], left=2, right=2)
+        valid_res = sorted([h['price'] for h in h1_highs if h['price'] > entry_price])
+
+        tp1 = valid_res[0] if len(valid_res) >= 1 else entry_price + (1.8 * risk)
+        tp2 = valid_res[1] if len(valid_res) >= 2 else entry_price + (2.8 * risk)
+
+        rr1 = round((tp1 - entry_price) / risk, 2)
+        rr2 = round((tp2 - entry_price) / risk, 2)
+
+        if rr1 < 1.4 or rr2 < 2.0:
+            return False, {}, 0, f"Tỷ lệ R:R chưa đạt chuẩn IDOLUSDT (RR1={rr1}, RR2={rr2})"
+
+        vol_ratio = c1['volume'] / (c1['vol_sma20'] if c1['vol_sma20'] > 0 else 1)
+
+        score = 88
+        if is_c1_green: score += 5
+        score = min(score, 100)
+
+        details = {
+            "setup_type": "H1_3CANDLE_EMA21_RECLAIM_PA",
+            "signal_status": "CONFIRMED",
+            "price": entry_price,
+            "entry_zone": f"{round(ema21_h1, 4)} - {round(entry_price, 4)}",
+            "sl_price": round(sl_price, 4),
+            "tp1": round(tp1, 4),
+            "tp2": round(tp2, 4),
+            "tp1_rr": rr1,
+            "tp2_rr": rr2,
+            "score": score,
+            "spot_vol_ratio": round(vol_ratio, 2),
+            "oi_change_pct": round(oi_change_pct, 2),
+            "taker_buy_pct": taker_buy_pct if taker_buy_pct else 0.0,
+            "cvd_val": cvd_val if cvd_val else 0.0,
+            "reason_entry": f"Nến H1 thứ 3 đóng xanh dứt khoát cắt vượt lên EMA21 H1 khi H1/H4 nằm trên EMA200 (Mô hình IDOLUSDT, không xét Volume).",
+            "reason_sl": "Dưới đáy cây nến H1 thứ 3 / cụm nến tạo nền + Đệm rủi ro 0.15 ATR H1.",
+            "reason_tp": "Mục tiêu các đỉnh kháng cự H1/H4 (R:R ≥ 1:2).",
+            "candle_timestamp": int(c1['open_time'])
+        }
+        return True, details, score, "ĐẠT CHUẨN SETUP 8 (H1 3-CANDLE RECLAIM PA)"
+
 # -----------------------------------------------------------------------------
 # 7. TELEGRAM SERVICE
 # -----------------------------------------------------------------------------
@@ -1051,16 +1134,18 @@ class TelegramService:
         status_tag = f"[{data.get('signal_status', 'CONFIRMED')}]"
         setup_name = data["setup_type"]
         
-        if setup_name == "H4_EMA21_RECLAIM_PA":
+        if setup_name == "H1_3CANDLE_EMA21_RECLAIM_PA":
+            header = f"🚀 <b>[SETUP 8 – H1 3-CANDLE EMA21 RECLAIM {status_tag}]</b>"
+        elif setup_name == "H4_EMA21_RECLAIM_PA":
             header = f"👑 <b>[SETUP 7 – H4 EMA21 BREAKOUT RECLAIM {status_tag}]</b>"
         elif setup_name == "H1_EARLY_MOMENTUM_PA":
             header = f"⚡ <b>[SETUP 6 – H1 EARLY MOMENTUM {status_tag}]</b>"
         elif setup_name == "H1_PULLBACK_RECOVERY":
-            header = f"🚀 <b>[SETUP 5 – H1 PULLBACK RECOVERY {status_tag}]</b>"
+            header = f"🔥 <b>[SETUP 5 – H1 PULLBACK RECOVERY {status_tag}]</b>"
         elif setup_name == "H1_SIDEWAY_BREAKOUT":
-            header = f"🔥 <b>[SETUP 4 – H1 SIDEWAY BREAKOUT {status_tag}]</b>"
+            header = f"💥 <b>[SETUP 4 – H1 SIDEWAY BREAKOUT {status_tag}]</b>"
         elif setup_name == "LONG MONEY FLOW EXPLOSION":
-            header = f"💥 <b>[SETUP 3 – MONEY FLOW EXPLOSION {status_tag}]</b>"
+            header = f"💰 <b>[SETUP 3 – MONEY FLOW EXPLOSION {status_tag}]</b>"
         elif "EMA200 REBOUND" in setup_name:
             header = f"⚡ <b>[SETUP 2 – H4 EMA200 REBOUND {status_tag}]</b>"
         else:
@@ -1147,7 +1232,15 @@ class MarketScanner:
                 candidate_signals = []
                 rejection_reasons = []
 
-                # SETUP 7: H4 EMA21 BREAKOUT RECLAIM (THUẦN NẾN H4) - ƯU TIÊN KIỂM TRA MÔ HÌNH H4 ĐẸP
+                # SETUP 8: H1 3-CANDLE EMA21 RECLAIM (MÔ HÌNH IDOLUSDT) - ƯU TIÊN HÀNG ĐẦU
+                if not db.is_cooldown_active(spot_sym, "H1_3CANDLE_EMA21_RECLAIM_PA", candle_ts):
+                    is_s8, d8, score8, reason8 = SetupEngine.evaluate_setup_8_h1_3candle_reclaim_pa(
+                        df_h1, df_h4, realtime_price, oi_change_pct, taker_buy_pct, cvd_val
+                    )
+                    if is_s8: candidate_signals.append((score8, d8, "H1_3CANDLE_EMA21_RECLAIM_PA"))
+                    else: rejection_reasons.append(f"S8: {reason8}")
+
+                # SETUP 7: H4 EMA21 BREAKOUT RECLAIM (MÔ HÌNH 1000PEPEUSDT)
                 if not db.is_cooldown_active(spot_sym, "H4_EMA21_RECLAIM_PA", candle_ts):
                     is_s7, d7, score7, reason7 = SetupEngine.evaluate_setup_7_h4_ema21_reclaim_pa(
                         df_h4, df_h1, realtime_price, oi_change_pct, taker_buy_pct, cvd_val
@@ -1155,7 +1248,7 @@ class MarketScanner:
                     if is_s7: candidate_signals.append((score7, d7, "H4_EMA21_RECLAIM_PA"))
                     else: rejection_reasons.append(f"S7: {reason7}")
 
-                # SETUP 6: H1 EARLY MOMENTUM RECLAIM (THUẦN NẾN H1)
+                # SETUP 6: H1 EARLY MOMENTUM RECLAIM
                 if not db.is_cooldown_active(spot_sym, "H1_EARLY_MOMENTUM_PA", candle_ts):
                     is_s6, d6, score6, reason6 = SetupEngine.evaluate_setup_6_early_momentum(
                         df_h1, df_h4, realtime_price, oi_change_pct, taker_buy_pct, cvd_val
@@ -1259,8 +1352,8 @@ async def full_auto_scheduler():
 # -----------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 <b>MEXC MULTI-ENGINE LONG SIGNAL BOT (PRO 7 SETUPS)</b>\n"
-        "Bot quét tự động 24/7 phát hiện 7 Setup Long chuẩn xác kỹ thuật.\n"
+        "🚀 <b>MEXC MULTI-ENGINE LONG SIGNAL BOT (PRO 8 SETUPS)</b>\n"
+        "Bot quét tự động 24/7 phát hiện 8 Setup Long chuẩn xác kỹ thuật.\n"
         "/status - Thống kê trạng thái hệ thống\n"
         "/scan - Kích hoạt quét & In bảng tổng hợp chi tiết", 
         parse_mode="HTML"

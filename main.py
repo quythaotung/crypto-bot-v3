@@ -1304,6 +1304,7 @@ def main():
     logger.info(" KHỞI ĐỘNG HỆ THỐNG MEXC MULTI ENGINE 24/7 BOT ")
     logger.info("==================================================")
 
+    # Chạy Flask Server ngầm
     threading.Thread(target=run_flask_server, daemon=True).start()
 
     if not BOT_TOKEN or BOT_TOKEN.startswith("YOUR_"):
@@ -1315,12 +1316,14 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("scan", cmd_scan))
 
-    async def main_async():
+    async def post_init(application):
+        # Kích hoạt scheduler tự động và vòng quét đầu tiên
         asyncio.create_task(full_auto_scheduler())
         asyncio.create_task(asyncio.to_thread(scanner.scan_market))
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(main_async())
+    app.post_init = post_init
+
+    # run_polling() tự quản lý event loop chuẩn mực trên Python 3.10+
     app.run_polling()
 
 if __name__ == "__main__":

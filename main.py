@@ -2,15 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 8 SETUPS)
+MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 9 SETUPS)
 SETUP 1 – H4 BREAKOUT MỞ SÓNG
 SETUP 2 – H4 EMA200 REBOUND
 SETUP 3 – SPOT & FUTURES ORDERFLOW EXPLOSION
 SETUP 4 – H1 SIDEWAY BREAKOUT / RE-ACCUMULATION LONG
-SETUP 5 – H1 PULLBACK RECOVERY LONG (Mô hình BEATUSDT H1)
+SETUP 5 – H1 PULLBACK RECOVERY LONG
 SETUP 6 – H1 EARLY MOMENTUM RECLAIM (Thuần Nến PA H1 - Không Check Vol)
 SETUP 7 – H4 EMA21 BREAKOUT RECLAIM (Thuần Nến PA H4 - Mô hình 1000PEPEUSDT)
 SETUP 8 – H1 3-CANDLE EMA21 RECLAIM (Thuần Nến PA H1 - Mô hình IDOLUSDT)
+SETUP 9 – H1 BEATUSDT PULLBACK RE-ACCUMULATION (Thuần Nến PA H1 ĐẦU CHU KỲ)
 ===============================================================================
 """
 
@@ -88,7 +89,7 @@ flask_app = Flask(__name__)
 def health_check():
     return jsonify({
         "status": "online",
-        "system": "MEXC MULTI-ENGINE SIGNAL PLATFORM (PRO - 8 SETUPS)",
+        "system": "MEXC MULTI-ENGINE SIGNAL PLATFORM (PRO - 9 SETUPS)",
         "is_scanning": SYSTEM_STATE["is_scanning"],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
@@ -409,7 +410,7 @@ class TechnicalAnalyzer:
         return highs, lows
 
 # -----------------------------------------------------------------------------
-# 6. SETUP ENGINES (FULL 8 SETUPS)
+# 6. SETUP ENGINES (FULL 9 SETUPS)
 # -----------------------------------------------------------------------------
 class SetupEngine:
     @staticmethod
@@ -1011,29 +1012,18 @@ class SetupEngine:
         df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float,
         oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
     ) -> Tuple[bool, Dict[str, Any], int, str]:
-        """
-        SETUP 8 – H1 3-CANDLE EMA21 RECLAIM (THUẦN NẾN PRICE ACTION H1 - MÔ HÌNH IDOLUSDT)
-        Điều kiện:
-        1. Cả H1 và H4 nằm trên EMA200 (hoặc chạm dải hỗ trợ EMA200 dốc lên).
-        2. Nến H1 thứ 1 (c3): Nhúng giảm qua EMA21.
-        3. Nến H1 thứ 2 (c2): Đóng xanh hồi phục lại sát EMA21.
-        4. Nến H1 thứ 3 (c1): ĐÓNG XANH DỨT KHÓAT VƯỢT LÊN TRÊN EMA21.
-        5. Stop Loss đặt dưới đáy của nến H1 thứ 3 (hoặc cụm nến đáy). HOÀN TOÀN KHÔNG CHECK VOLUME.
-        """
         if df_h1 is None or len(df_h1) < 25:
             return False, {}, 0, "Dữ liệu nến H1 không đủ"
 
-        c1 = df_h1.iloc[-2]  # Cây nến H1 xanh thứ 3 vừa đóng cửa hoàn chỉnh (Trigger Candle)
-        c2 = df_h1.iloc[-3]  # Cây nến H1 xanh thứ 2
-        c3 = df_h1.iloc[-4]  # Cây nến H1 thứ 1 (Nến nhúng tạo đáy)
+        c1 = df_h1.iloc[-2]
+        c2 = df_h1.iloc[-3]
+        c3 = df_h1.iloc[-4]
         entry_price = c1['close']
 
-        # 1. Kiểm tra trễ giá Real-time so với điểm đóng cửa nến 3
         atr_h1 = c1['atr'] if not np.isnan(c1['atr']) else (entry_price * 0.01)
         if current_realtime_price > entry_price + (0.5 * atr_h1):
             return False, {}, 0, f"Giá real-time ({current_realtime_price}) đã chạy xa Entry nến 3 ({entry_price})"
 
-        # 2. Khung H1 và H4 bắt buộc nằm trên EMA200
         ema200_h1 = c1.get('ema200', 0)
         if entry_price < ema200_h1 * 0.998:
             return False, {}, 0, "H1 nằm dưới EMA200"
@@ -1043,9 +1033,6 @@ class SetupEngine:
             if h4_last['close'] < h4_last.get('ema200', 0) * 0.998:
                 return False, {}, 0, "H4 nằm dưới EMA200"
 
-        # 3. ĐIỀU KIỆN CẤU TRÚC 3 NẾN H1 (MÔ HÌNH IDOLUSDT):
-        # - Nến c1 (Nến 3) bắt buộc là NẾN XANH TĂNG GIÁ (Close > Open) và ĐÓNG CỬA TRÊN EMA21
-        # - Nến c3 (Nến 1) hoặc c2 (Nến 2) từng có râu/thân nhúng DƯỚI đường EMA21 H1
         ema21_h1 = c1['ema21']
         is_c1_green = c1['close'] > c1['open']
         is_c1_above_ema21 = c1['close'] > ema21_h1
@@ -1054,7 +1041,6 @@ class SetupEngine:
         if not (is_c1_green and is_c1_above_ema21 and is_dip_below_ema21):
             return False, {}, 0, "Chưa đúng cấu trúc 3 nến H1 nhúng và vọt vượt EMA21"
 
-        # 4. TÍNH STOP LOSS VÀ TAKE PROFIT (SL ĐẶT DƯỚI ĐÁY NẾN H1 THỨ 3 / CỤM ĐÁY)
         swing_low = min(c1['low'], c2['low'], c3['low'])
         sl_price = round(swing_low - (0.15 * atr_h1), 4)
         if sl_price >= entry_price:
@@ -1062,7 +1048,6 @@ class SetupEngine:
 
         risk = entry_price - sl_price
 
-        # TP1/TP2 theo cản Pivot H1/H4
         h1_highs, _ = TechnicalAnalyzer.find_pivots(df_h1.iloc[:-1], left=2, right=2)
         valid_res = sorted([h['price'] for h in h1_highs if h['price'] > entry_price])
 
@@ -1103,6 +1088,95 @@ class SetupEngine:
         }
         return True, details, score, "ĐẠT CHUẨN SETUP 8 (H1 3-CANDLE RECLAIM PA)"
 
+    @staticmethod
+    def evaluate_setup_9_beatusdt_pullback_reaccumulation(
+        df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float,
+        oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
+    ) -> Tuple[bool, Dict[str, Any], int, str]:
+        """
+        SETUP 9 – H1 BEATUSDT PULLBACK RE-ACCUMULATION (THUẦN NẾN PA H1 ĐẦU CHU KỲ)
+        Bắt nhịp Long đầu chu kỳ khi giá sau nhịp đẩy đầu tiên nhúng về test EMA200 và đóng nến xanh vượt EMA21.
+        Không bắt buộc Volume bùng nổ, ưu tiên Price Action tái tích lũy.
+        """
+        if df_h1 is None or len(df_h1) < 35:
+            return False, {}, 0, "Dữ liệu nến H1 không đủ"
+
+        candle_trigger = df_h1.iloc[-2]
+        candle_prev = df_h1.iloc[-3]
+        entry_price = candle_trigger['close']
+
+        atr_h1 = candle_trigger['atr'] if not np.isnan(candle_trigger['atr']) else (entry_price * 0.01)
+        if current_realtime_price > entry_price + (0.5 * atr_h1):
+            return False, {}, 0, f"Giá real-time ({current_realtime_price}) đã chạy xa Entry H1 ({entry_price})"
+
+        ema200_h1 = candle_trigger.get('ema200', 0)
+        ema200_prev = candle_prev.get('ema200', 0)
+        if entry_price < ema200_h1 or ema200_h1 < ema200_prev * 0.999:
+            return False, {}, 0, "H1 nằm dưới EMA200 hoặc EMA200 dốc xuống"
+
+        prior_high = df_h1['high'].iloc[-25:-5].max()
+        prior_low = df_h1['low'].iloc[-35:-20].min()
+        if prior_high < prior_low * 1.04:
+            return False, {}, 0, "Chưa có sóng đẩy bùng nổ đầu tiên"
+
+        pullback_low = df_h1['low'].iloc[-10:-2].min()
+        if pullback_low > ema200_h1 * 1.025:
+            return False, {}, 0, "Giá chưa nhúng hồi đủ sâu về vùng hỗ trợ EMA200"
+
+        ema21_h1 = candle_trigger['ema21']
+        is_green = candle_trigger['close'] > candle_trigger['open']
+        is_reclaim_ema21 = candle_trigger['close'] > ema21_h1
+        was_below_ema21 = candle_prev['close'] <= candle_prev['ema21'] * 1.002
+
+        if not (is_green and is_reclaim_ema21 and was_below_ema21):
+            return False, {}, 0, "Nến Trigger chưa đóng xanh vượt EMA21 H1"
+
+        sl_price = round(pullback_low - (0.15 * atr_h1), 4)
+        if sl_price >= entry_price:
+            return False, {}, 0, "SL cao hơn hoặc bằng Entry"
+
+        risk = entry_price - sl_price
+        
+        tp1 = max(prior_high, entry_price + (1.8 * risk))
+        
+        h4_highs, _ = TechnicalAnalyzer.find_pivots(df_h4.iloc[:-1] if df_h4 is not None else df_h1.iloc[:-1], left=2, right=2)
+        valid_res = sorted([h['price'] for h in h4_highs if h['price'] > entry_price])
+        tp2 = valid_res[0] if len(valid_res) >= 1 else entry_price + (3.0 * risk)
+
+        rr1 = round((tp1 - entry_price) / risk, 2)
+        rr2 = round((tp2 - entry_price) / risk, 2)
+
+        if rr1 < 1.5 or rr2 < 2.0:
+            return False, {}, 0, f"Tỷ lệ R:R chưa đạt chuẩn (RR1={rr1}, RR2={rr2})"
+
+        vol_ratio = candle_trigger['volume'] / (candle_trigger['vol_sma20'] if candle_trigger['vol_sma20'] > 0 else 1)
+
+        score = 88
+        if vol_ratio >= 1.3: score += 5
+        score = min(score, 100)
+
+        details = {
+            "setup_type": "H1_BEATUSDT_PULLBACK_REACCUMULATION",
+            "signal_status": "CONFIRMED",
+            "price": entry_price,
+            "entry_zone": f"{round(ema21_h1, 4)} - {round(entry_price, 4)}",
+            "sl_price": round(sl_price, 4),
+            "tp1": round(tp1, 4),
+            "tp2": round(tp2, 4),
+            "tp1_rr": rr1,
+            "tp2_rr": rr2,
+            "score": score,
+            "spot_vol_ratio": round(vol_ratio, 2),
+            "oi_change_pct": round(oi_change_pct, 2),
+            "taker_buy_pct": taker_buy_pct if taker_buy_pct else 0.0,
+            "cvd_val": cvd_val if cvd_val else 0.0,
+            "reason_entry": "Giá nhúng hồi rủ bỏ về EMA200 H1 và tạo nến xanh đóng vượt EMA21 (Mô hình BEATUSDT H1 đầu chu kỳ).",
+            "reason_sl": "Dưới đáy nhúng hồi / hỗ trợ EMA200 + Đệm rủi ro 0.15 ATR H1.",
+            "reason_tp": "Mục tiêu đỉnh sóng đẩy thứ nhất & cản H4 tiếp theo.",
+            "candle_timestamp": int(candle_trigger['open_time'])
+        }
+        return True, details, score, "ĐẠT CHUẨN SETUP BEATUSDT PULLBACK"
+
 # -----------------------------------------------------------------------------
 # 7. TELEGRAM SERVICE
 # -----------------------------------------------------------------------------
@@ -1134,7 +1208,9 @@ class TelegramService:
         status_tag = f"[{data.get('signal_status', 'CONFIRMED')}]"
         setup_name = data["setup_type"]
         
-        if setup_name == "H1_3CANDLE_EMA21_RECLAIM_PA":
+        if setup_name == "H1_BEATUSDT_PULLBACK_REACCUMULATION":
+            header = f"🔥 <b>[SETUP 9 – BEATUSDT PULLBACK {status_tag}]</b>"
+        elif setup_name == "H1_3CANDLE_EMA21_RECLAIM_PA":
             header = f"🚀 <b>[SETUP 8 – H1 3-CANDLE EMA21 RECLAIM {status_tag}]</b>"
         elif setup_name == "H4_EMA21_RECLAIM_PA":
             header = f"👑 <b>[SETUP 7 – H4 EMA21 BREAKOUT RECLAIM {status_tag}]</b>"
@@ -1232,7 +1308,15 @@ class MarketScanner:
                 candidate_signals = []
                 rejection_reasons = []
 
-                # SETUP 8: H1 3-CANDLE EMA21 RECLAIM (MÔ HÌNH IDOLUSDT) - ƯU TIÊN HÀNG ĐẦU
+                # SETUP 9: H1 BEATUSDT PULLBACK RE-ACCUMULATION
+                if not db.is_cooldown_active(spot_sym, "H1_BEATUSDT_PULLBACK_REACCUMULATION", candle_ts):
+                    is_s9, d9, score9, reason9 = SetupEngine.evaluate_setup_9_beatusdt_pullback_reaccumulation(
+                        df_h1, df_h4, realtime_price, oi_change_pct, taker_buy_pct, cvd_val
+                    )
+                    if is_s9: candidate_signals.append((score9, d9, "H1_BEATUSDT_PULLBACK_REACCUMULATION"))
+                    else: rejection_reasons.append(f"S9: {reason9}")
+
+                # SETUP 8: H1 3-CANDLE EMA21 RECLAIM (MÔ HÌNH IDOLUSDT)
                 if not db.is_cooldown_active(spot_sym, "H1_3CANDLE_EMA21_RECLAIM_PA", candle_ts):
                     is_s8, d8, score8, reason8 = SetupEngine.evaluate_setup_8_h1_3candle_reclaim_pa(
                         df_h1, df_h4, realtime_price, oi_change_pct, taker_buy_pct, cvd_val
@@ -1352,8 +1436,8 @@ async def full_auto_scheduler():
 # -----------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 <b>MEXC MULTI-ENGINE LONG SIGNAL BOT (PRO 8 SETUPS)</b>\n"
-        "Bot quét tự động 24/7 phát hiện 8 Setup Long chuẩn xác kỹ thuật.\n"
+        "🚀 <b>MEXC MULTI-ENGINE LONG SIGNAL BOT (PRO 9 SETUPS)</b>\n"
+        "Bot quét tự động 24/7 phát hiện 9 Setup Long chuẩn xác kỹ thuật.\n"
         "/status - Thống kê trạng thái hệ thống\n"
         "/scan - Kích hoạt quét & In bảng tổng hợp chi tiết", 
         parse_mode="HTML"
@@ -1423,17 +1507,3 @@ def main():
     async def main_async():
         asyncio.create_task(full_auto_scheduler())
         asyncio.create_task(asyncio.to_thread(scanner.scan_market))
-
-        await app.initialize()
-        await app.start()
-        logger.info("Bot MEXC Multi Engine Pro đã sẵn sàng 24/7!")
-        await app.updater.start_polling()
-        await asyncio.Event().wait()
-
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        logger.info("Dừng bot...")
-
-if __name__ == "__main__":
-    main()

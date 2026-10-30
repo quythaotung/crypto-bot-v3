@@ -2,8 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 5 SETUPS)
-In chi tiết tiến trình từng coin + Báo cáo kết quả phân tích trực quan
+MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 6 SETUPS)
+SETUP 1 – H4 BREAKOUT MỞ SÓNG (Breakout Khung H4 + H1 Trigger)
+SETUP 2 – H4 EMA200 REBOUND (Pullback H4 EMA21/200 + H1 Reclaim)
+SETUP 3 – SPOT & FUTURES ORDERFLOW EXPLOSION (Strict Orderflow Data)
+SETUP 4 – H1 SIDEWAY BREAKOUT / RE-ACCUMULATION LONG
+SETUP 5 – H1 PULLBACK RECOVERY LONG (Mô hình BEATUSDT H1)
+SETUP 6 – H1 EARLY MOMENTUM RECLAIM (Thuần Nến Price Action - Không cần Check Volume)
 ===============================================================================
 """
 
@@ -47,6 +52,7 @@ DB_PATH = os.environ.get("DB_PATH", "mexc_multi_signals.db")
 MEXC_SPOT_BASE_URL = "https://api.mexc.com"
 MEXC_FUTURES_BASE_URL = "https://contract.mexc.com"
 
+# Hard Filters cho MEXC
 MIN_SPOT_VOL_24H = float(os.environ.get("MIN_SPOT_VOL_24H", "500000"))         # 500k USDT
 MIN_FUTURES_TURNOVER_24H = float(os.environ.get("MIN_FUTURES_TURNOVER_24H", "2000000")) # 2M USDT
 MAX_SPOT_SPREAD_PCT = float(os.environ.get("MAX_SPOT_SPREAD_PCT", "0.35"))      # 0.35%
@@ -80,7 +86,7 @@ flask_app = Flask(__name__)
 def health_check():
     return jsonify({
         "status": "online",
-        "system": "MEXC MULTI-ENGINE SIGNAL & BACKTEST PLATFORM (PRO 5 SETUPS)",
+        "system": "MEXC MULTI-ENGINE SIGNAL PLATFORM (PRO - 6 SETUPS)",
         "is_scanning": SYSTEM_STATE["is_scanning"],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
@@ -401,7 +407,7 @@ class TechnicalAnalyzer:
         return highs, lows
 
 # -----------------------------------------------------------------------------
-# 6. SETUP ENGINES
+# 6. SETUP ENGINES (FULL 6 SETUPS)
 # -----------------------------------------------------------------------------
 class SetupEngine:
     @staticmethod
@@ -848,6 +854,92 @@ class SetupEngine:
         }
         return True, details, score, "ĐẠT CHUẨN SETUP 5"
 
+    @staticmethod
+    def evaluate_setup_6_early_momentum(
+        df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float,
+        oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
+    ) -> Tuple[bool, Dict[str, Any], int, str]:
+        """
+        SETUP 6 – H1 EARLY MOMENTUM RECLAIM (THUẦN NẾN PRICE ACTION - KHÔNG CHECK VOLUME)
+        Bắt Entry ngay ở cây nến xanh thứ 2 nhô đóng cửa vượt EMA21.
+        """
+        if df_h1 is None or len(df_h1) < 25:
+            return False, {}, 0, "Dữ liệu nến H1 không đủ"
+
+        candle_2 = df_h1.iloc[-2]  # Cây nến xanh thứ 2 vừa đóng cửa hoàn chỉnh
+        candle_1 = df_h1.iloc[-3]  # Cây nến xanh thứ 1 / nến tạo đáy
+        entry_price = candle_2['close']
+
+        # 1. Kiểm tra trễ giá Real-time so với điểm đóng cửa nến 2
+        atr_h1 = candle_2['atr'] if not np.isnan(candle_2['atr']) else (entry_price * 0.01)
+        if current_realtime_price > entry_price + (0.6 * atr_h1):
+            return False, {}, 0, f"Giá real-time ({current_realtime_price}) đã chạy xa Entry nến 2 ({entry_price})"
+
+        # 2. Khung H1 nằm trên đường EMA200 (hoặc EMA200 đang đi ngang)
+        ema200_h1 = candle_2.get('ema200', 0)
+        if entry_price < ema200_h1:
+            return False, {}, 0, "H1 nằm dưới EMA200"
+
+        # 3. ĐIỀU KIỆN NẾN THUẦN KỸ THUẬT:
+        # - Cây nến 1 đóng cửa nằm DƯỚI hoặc SÁT EMA21 (đang nén/tạo đáy)
+        # - Cây nến 2 là NẾN XANH TĂNG GIÁ (Close > Open) và ĐÓNG CỬA CẮT VƯỢT HẲN LÊN TRÊN EMA21
+        ema21_h1 = candle_2['ema21']
+        is_candle_2_green = candle_2['close'] > candle_2['open']
+        is_candle_2_reclaim_ema21 = candle_2['close'] > ema21_h1
+        is_candle_1_below_ema21 = candle_1['close'] <= candle_1['ema21'] * 1.002
+
+        if not (is_candle_2_green and is_candle_2_reclaim_ema21 and is_candle_1_below_ema21):
+            return False, {}, 0, "Nến 2 chưa đóng xanh vượt EMA21 hoặc nến 1 đã đóng sẵn trên EMA21"
+
+        # 4. TÍNH STOP LOSS VÀ TAKE PROFIT (SL CHẶT + RR TỐI THIỂU 1:1.5)
+        swing_low = min(candle_1['low'], candle_2['low'])
+        sl_price = round(swing_low - (0.15 * atr_h1), 4)
+        if sl_price >= entry_price:
+            return False, {}, 0, "SL cao hơn hoặc bằng Entry"
+
+        risk = entry_price - sl_price
+
+        # TP1 theo đỉnh H1 gần nhất, TP2 theo cản H4 tiếp theo
+        h1_highs, _ = TechnicalAnalyzer.find_pivots(df_h1.iloc[:-1], left=2, right=2)
+        valid_res = sorted([h['price'] for h in h1_highs if h['price'] > entry_price])
+
+        tp1 = valid_res[0] if len(valid_res) >= 1 else entry_price + (1.5 * risk)
+        tp2 = valid_res[1] if len(valid_res) >= 2 else entry_price + (2.5 * risk)
+
+        rr1 = round((tp1 - entry_price) / risk, 2)
+        rr2 = round((tp2 - entry_price) / risk, 2)
+
+        if rr1 < 1.3 or rr2 < 1.8:
+            return False, {}, 0, f"Tỷ lệ R:R chưa đạt yêu cầu (RR1={rr1}, RR2={rr2})"
+
+        vol_ratio = candle_2['volume'] / (candle_2['vol_sma20'] if candle_2['vol_sma20'] > 0 else 1)
+
+        score = 80
+        if is_candle_2_green: score += 5
+        score = min(score, 100)
+
+        details = {
+            "setup_type": "H1_EARLY_MOMENTUM_PA",
+            "signal_status": "EARLY_ENTRY",
+            "price": entry_price,
+            "entry_zone": f"{round(ema21_h1, 4)} - {round(entry_price, 4)}",
+            "sl_price": round(sl_price, 4),
+            "tp1": round(tp1, 4),
+            "tp2": round(tp2, 4),
+            "tp1_rr": rr1,
+            "tp2_rr": rr2,
+            "score": score,
+            "spot_vol_ratio": round(vol_ratio, 2),
+            "oi_change_pct": round(oi_change_pct, 2),
+            "taker_buy_pct": taker_buy_pct if taker_buy_pct else 0.0,
+            "cvd_val": cvd_val if cvd_val else 0.0,
+            "reason_entry": f"Nến H1 thứ 2 đóng xanh nhô vượt qua EMA21 (Bắt sóng sớm theo Price Action, không xét Volume).",
+            "reason_sl": "Dưới đáy nến tạo nền H1 + Đệm rủi ro 0.15 ATR H1.",
+            "reason_tp": "Mục tiêu đỉnh H1 gần nhất & cản H4.",
+            "candle_timestamp": int(candle_2['open_time'])
+        }
+        return True, details, score, "ĐẠT CHUẨN SETUP 6 (EARLY THUẦN NẾN)"
+
 # -----------------------------------------------------------------------------
 # 7. TELEGRAM SERVICE
 # -----------------------------------------------------------------------------
@@ -879,7 +971,9 @@ class TelegramService:
         status_tag = f"[{data.get('signal_status', 'CONFIRMED')}]"
         setup_name = data["setup_type"]
         
-        if setup_name == "H1_PULLBACK_RECOVERY":
+        if setup_name == "H1_EARLY_MOMENTUM_PA":
+            header = f"⚡ <b>[SETUP 6 – H1 EARLY MOMENTUM {status_tag}]</b>"
+        elif setup_name == "H1_PULLBACK_RECOVERY":
             header = f"🚀 <b>[SETUP 5 – H1 PULLBACK RECOVERY {status_tag}]</b>"
         elif setup_name == "H1_SIDEWAY_BREAKOUT":
             header = f"🔥 <b>[SETUP 4 – H1 SIDEWAY BREAKOUT {status_tag}]</b>"
@@ -923,7 +1017,7 @@ class TelegramService:
 telegram_service = TelegramService()
 
 # -----------------------------------------------------------------------------
-# 8. MARKET SCANNER & LOGGING ENGINE (CẬP NHẬT IN LOG & BÁO CÁO)
+# 8. MARKET SCANNER & LOGGING ENGINE
 # -----------------------------------------------------------------------------
 class MarketScanner:
     def scan_market(self, is_manual_scan: bool = False) -> List[Dict[str, Any]]:
@@ -937,7 +1031,7 @@ class MarketScanner:
         SYSTEM_STATE["qualified_symbols"] = len(qualified_list)
         
         ok_count, error_count, signals_count = 0, 0, 0
-        scan_reports = []  # Lưu kết quả phân tích tất cả các coin để tổng hợp báo cáo
+        scan_reports = []
 
         for idx, item in enumerate(qualified_list, 1):
             spot_sym = item["spot_symbol"]
@@ -945,7 +1039,6 @@ class MarketScanner:
             hold_vol = item["hold_vol"]
             realtime_price = item["last_price"]
 
-            # IN CHI TIẾT TIẾN TRÌNH QUÉT TỪNG COIN RA TERMINAL/LOG
             logger.info(f"🔍 [{idx}/{len(qualified_list)}] Đang kiểm tra #{spot_sym} (Giá: {realtime_price})...")
 
             try:
@@ -971,6 +1064,14 @@ class MarketScanner:
 
                 candidate_signals = []
                 rejection_reasons = []
+
+                # SETUP 6: H1 EARLY MOMENTUM RECLAIM (THUẦN NẾN) - ƯU TIÊN KIỂM TRA SỚM
+                if not db.is_cooldown_active(spot_sym, "H1_EARLY_MOMENTUM_PA", candle_ts):
+                    is_s6, d6, score6, reason6 = SetupEngine.evaluate_setup_6_early_momentum(
+                        df_h1, df_h4, realtime_price, oi_change_pct, taker_buy_pct, cvd_val
+                    )
+                    if is_s6: candidate_signals.append((score6, d6, "H1_EARLY_MOMENTUM_PA"))
+                    else: rejection_reasons.append(f"S6: {reason6}")
 
                 # SETUP 1
                 if not db.is_cooldown_active(spot_sym, "H4 BREAKOUT MỞ SÓNG", candle_ts):
@@ -1064,12 +1165,12 @@ async def full_auto_scheduler():
             await asyncio.sleep(60)
 
 # -----------------------------------------------------------------------------
-# 9. TELEGRAM COMMAND HANDLERS (BÁO CÁO SCAN CHI TIẾT TRỰC QUAN)
+# 9. TELEGRAM COMMAND HANDLERS
 # -----------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 <b>MEXC MULTI-ENGINE LONG SIGNAL BOT (PRO 5 SETUPS)</b>\n"
-        "Bot quét tự động 24/7 phát hiện 5 Setup Long chuẩn xác kỹ thuật.\n"
+        "🚀 <b>MEXC MULTI-ENGINE LONG SIGNAL BOT (PRO 6 SETUPS)</b>\n"
+        "Bot quét tự động 24/7 phát hiện 6 Setup Long chuẩn xác kỹ thuật.\n"
         "/status - Thống kê trạng thái hệ thống\n"
         "/scan - Kích hoạt quét & In bảng tổng hợp chi tiết", 
         parse_mode="HTML"
@@ -1096,7 +1197,6 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with SCAN_LOCK:
         reports = await asyncio.to_thread(scanner.scan_market, True)
     
-    # Tổng hợp báo cáo kết quả quét trực quan về Telegram
     signals_list = [r for r in reports if r["status"] == "SIGNAL"]
     rejected_list = [r for r in reports if r["status"] == "REJECTED"]
 
@@ -1111,7 +1211,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report_msg += "🎯 <b>Tín hiệu kích hoạt:</b> 0 (Chưa có coin thỏa mãn 100% Setup)\n\n"
 
     report_msg += "📋 <b>MẪU COIN TIỀM NĂNG (ĐANG CHỜ TÍCH LŨY):</b>\n"
-    for r in rejected_list[:7]:  # Hiển thị Top 7 coin điển hình và lý do bị loại
+    for r in rejected_list[:7]:
         report_msg += f"• <b>#{r['symbol']}</b>: <i>{r['reason']}</i>\n"
 
     report_msg += f"\n✅ <i>Đã quét xong {len(reports)} coin đạt chuẩn. Log tiến trình chi tiết đã được cập nhật trên Server.</i>"

@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 7 SETUPS)
-SETUP 1 – H4 BREAKOUT MỞ SÓNG (Thuần Nến PA H4/H1 - Bỏ Vol)
-SETUP 2 – H1 SIDEWAY BREAKOUT (Thuần Nến Breakout/Retest Box - Bỏ Vol)
+MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 7 SETUPS - FUTURES ONLY)
+SETUP 1 – H4 BREAKOUT MỞ SÓNG (Thuần Nến PA H4/H1)
+SETUP 2 – H1 SIDEWAY BREAKOUT (Thuần Nến Breakout/Retest Box)
 SETUP 3 – H1 PULLBACK RECOVERY LONG
-SETUP 4 – H1 EARLY MOMENTUM RECLAIM (Thuần Nến PA H1 - Không Check Vol)
+SETUP 4 – H1 EARLY MOMENTUM RECLAIM (Thuần Nến PA H1)
 SETUP 5 – H4 EMA21 BREAKOUT RECLAIM (Thuần Nến PA H4 - Mô hình 1000PEPEUSDT)
 SETUP 6 – H1 3-CANDLE EMA21 RECLAIM (Thuần Nến PA H1 - Mô hình IDOLUSDT)
 SETUP 7 – H1 BEATUSDT PULLBACK RE-ACCUMULATION (Thuần Nến PA H1 ĐẦU CHU KỲ)
@@ -53,10 +53,8 @@ DB_PATH = os.environ.get("DB_PATH", "mexc_multi_signals.db")
 MEXC_SPOT_BASE_URL = "https://api.mexc.com"
 MEXC_FUTURES_BASE_URL = "https://contract.mexc.com"
 
-# Hard Filters cho MEXC
-MIN_SPOT_VOL_24H = float(os.environ.get("MIN_SPOT_VOL_24H", "500000"))         # 500k USDT
+# Hard Filters cho MEXC Futures
 MIN_FUTURES_TURNOVER_24H = float(os.environ.get("MIN_FUTURES_TURNOVER_24H", "2000000")) # 2M USDT
-MAX_SPOT_SPREAD_PCT = float(os.environ.get("MAX_SPOT_SPREAD_PCT", "0.35"))      # 0.35%
 COOLDOWN_HOURS = 4
 
 STABLE_AND_ETF_BLACKLIST = {
@@ -87,7 +85,7 @@ flask_app = Flask(__name__)
 def health_check():
     return jsonify({
         "status": "online",
-        "system": "MEXC MULTI-ENGINE SIGNAL PLATFORM (PRO - 7 SETUPS)",
+        "system": "MEXC MULTI-ENGINE SIGNAL PLATFORM (PRO - 7 SETUPS FUTURES)",
         "is_scanning": SYSTEM_STATE["is_scanning"],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
@@ -229,7 +227,7 @@ class DatabaseManager:
 db = DatabaseManager()
 
 # -----------------------------------------------------------------------------
-# 4. MEXC API CLIENT
+# 4. MEXC API CLIENT (FUTURES ONLY)
 # -----------------------------------------------------------------------------
 class MexcClient:
     def __init__(self):
@@ -253,77 +251,56 @@ class MexcClient:
         return None
 
     def get_qualified_universe(self) -> List[Dict[str, Any]]:
-        spot_tickers = self._request(MEXC_SPOT_BASE_URL, "/api/v3/ticker/24hr")
-        book_tickers = self._request(MEXC_SPOT_BASE_URL, "/api/v3/ticker/bookTicker")
+        # Lấy trực tiếp danh sách Hợp đồng và Ticker Futures từ MEXC API
         futures_details = self._request(MEXC_FUTURES_BASE_URL, "/api/v1/contract/detail")
         futures_tickers = self._request(MEXC_FUTURES_BASE_URL, "/api/v1/contract/ticker")
 
-        if not spot_tickers or not book_tickers or not futures_details or not futures_tickers:
-            logger.error("Không thể tải đầy đủ thông tin danh mục từ MEXC API!")
+        if not futures_details or not futures_tickers:
+            logger.error("Không thể tải đầy đủ thông tin danh mục Futures từ MEXC API!")
             return []
 
-        futures_map = {}
+        fut_ticker_map = {}
         fut_ticker_data = futures_tickers.get("data", []) if isinstance(futures_tickers, dict) else futures_tickers
         if isinstance(fut_ticker_data, list):
             for ft in fut_ticker_data:
                 sym = ft.get("symbol", "").replace("_", "").upper()
-                futures_map[sym] = ft
-
-        fut_detail_set = set()
-        fut_detail_data = futures_details.get("data", []) if isinstance(futures_details, dict) else futures_details
-        if isinstance(fut_detail_data, list):
-            for fd in fut_detail_data:
-                if fd.get("state") == 0:
-                    sym = fd.get("symbol", "").replace("_", "").upper()
-                    fut_detail_set.add(sym)
-
-        book_map = {b["symbol"]: b for b in book_tickers if isinstance(b, dict) and "symbol" in b}
+                fut_ticker_map[sym] = ft
 
         qualified = []
-        for st in spot_tickers:
-            if not isinstance(st, dict): continue
-            symbol_spot = st.get("symbol", "").upper()
-            if not symbol_spot.endswith("USDT"):
-                continue
+        fut_detail_data = futures_details.get("data", []) if isinstance(futures_details, dict) else futures_details
+        
+        if isinstance(fut_detail_data, list):
+            for fd in fut_detail_data:
+                if fd.get("state") != 0:
+                    continue
 
-            base_coin = symbol_spot[:-4]
-            if base_coin in STABLE_AND_ETF_BLACKLIST or any(base_coin.endswith(suffix) for suffix in ["3L", "3S", "4L", "4S", "5L", "5S"]):
-                continue
+                raw_symbol = fd.get("symbol", "")
+                sym_clean = raw_symbol.replace("_", "").upper()
 
-            spot_vol_quote = float(st.get("quoteVolume", 0.0))
-            if spot_vol_quote < MIN_SPOT_VOL_24H:
-                continue
+                if not sym_clean.endswith("USDT"):
+                    continue
 
-            if symbol_spot not in fut_detail_set or symbol_spot not in futures_map:
-                continue
+                base_coin = sym_clean[:-4]
+                if base_coin in STABLE_AND_ETF_BLACKLIST or any(base_coin.endswith(suffix) for suffix in ["3L", "3S", "4L", "4S", "5L", "5S"]):
+                    continue
 
-            ft_info = futures_map[symbol_spot]
-            futures_turnover_24h = float(ft_info.get("amount24", 0.0))
-            if futures_turnover_24h < MIN_FUTURES_TURNOVER_24H:
-                continue
+                ft_info = fut_ticker_map.get(sym_clean, {})
+                futures_turnover_24h = float(ft_info.get("amount24", 0.0))
+                last_price = float(ft_info.get("lastPrice", 0.0))
+                hold_vol = float(ft_info.get("holdVol", 0.0))
 
-            book = book_map.get(symbol_spot)
-            if not book:
-                continue
-            bid = float(book.get("bidPrice", 0.0))
-            ask = float(book.get("askPrice", 0.0))
-            if bid <= 0:
-                continue
-            spread_pct = ((ask - bid) / bid) * 100.0
-            if spread_pct > MAX_SPOT_SPREAD_PCT:
-                continue
+                if futures_turnover_24h < MIN_FUTURES_TURNOVER_24H:
+                    continue
 
-            hold_vol = float(ft_info.get("holdVol", 0.0))
-
-            qualified.append({
-                "spot_symbol": symbol_spot,
-                "futures_symbol": ft_info.get("symbol", f"{base_coin}_USDT"),
-                "spot_volume_24h": spot_vol_quote,
-                "futures_turnover_24h": futures_turnover_24h,
-                "spread_pct": spread_pct,
-                "last_price": float(st.get("lastPrice", 0.0)),
-                "hold_vol": hold_vol
-            })
+                qualified.append({
+                    "spot_symbol": sym_clean,
+                    "futures_symbol": raw_symbol,
+                    "spot_volume_24h": 0.0,
+                    "futures_turnover_24h": futures_turnover_24h,
+                    "spread_pct": 0.0,
+                    "last_price": last_price,
+                    "hold_vol": hold_vol
+                })
 
         return qualified
 
@@ -1247,7 +1224,7 @@ async def full_auto_scheduler():
 # -----------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 <b>MEXC MULTI-ENGINE LONG SIGNAL BOT (PRO 7 SETUPS)</b>\n"
+        "🚀 <b>MEXC MULTI-ENGINE LONG SIGNAL BOT (PRO 7 SETUPS FUTURES)</b>\n"
         "Bot quét tự động 24/7 phát hiện 7 Setup Long chuẩn xác kỹ thuật.\n"
         "/status - Thống kê trạng thái hệ thống\n"
         "/scan - Kích hoạt quét & In bảng tổng hợp chi tiết", 
@@ -1270,7 +1247,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ Vòng quét đang chạy, vui lòng chờ...")
         return
     
-    await update.message.reply_text("🔄 <b>Kích hoạt quét toàn bộ MEXC...</b>\n<i>Đang phân tích từng đồng coin, vui lòng đợi trong giây lát...</i>", parse_mode="HTML")
+    await update.message.reply_text("🔄 <b>Kích hoạt quét toàn bộ danh mục Futures MEXC...</b>\n<i>Đang phân tích từng đồng coin, vui lòng đợi trong giây lát...</i>", parse_mode="HTML")
     
     async with SCAN_LOCK:
         reports = await asyncio.to_thread(scanner.scan_market, True)
@@ -1278,7 +1255,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     signals_list = [r for r in reports if r["status"] == "SIGNAL"]
     rejected_list = [r for r in reports if r["status"] == "REJECTED"]
 
-    report_msg = f"📊 <b>KẾT QUẢ PHÂN TÍCH TỔNG HỢP ({len(reports)} COIN)</b>\n\n"
+    report_msg = f"📊 <b>KẾT QUẢ PHÂN TÍCH TỔNG HỢP ({len(reports)} COIN FUTURES)</b>\n\n"
     
     if signals_list:
         report_msg += "🎯 <b>TÍN HIỆU KÍCH HOẠT VÀO LỆNH:</b>\n"

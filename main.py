@@ -304,11 +304,8 @@ class MexcClient:
         return qualified
 
     def fetch_spot_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> Optional[pd.DataFrame]:
-        # Mapping timeframe sang định dạng MEXC Futures API
         interval_map = {"1h": "Min60", "4h": "Hour4", "1d": "Day1", "15m": "Min15"}
         fut_interval = interval_map.get(interval, "Min60")
-        
-        # Đảm bảo symbol đúng định dạng Futures (vd: BTC_USDT)
         fut_symbol = symbol if "_" in symbol else f"{symbol[:-4]}_USDT"
         
         res = self._request(
@@ -479,7 +476,7 @@ class SetupEngine:
             "setup_type": "H4 BREAKOUT MỞ SÓNG",
             "signal_status": signal_status,
             "price": entry_price,
-            "entry_zone": f"{round(h1_last['ema21'], 4)} - {round(entry_price, 4)}",
+            "entry_zone": str(entry_price),
             "sl_price": round(sl_price, 4),
             "tp1": round(tp1, 4),
             "tp2": round(tp2, 4),
@@ -490,9 +487,6 @@ class SetupEngine:
             "oi_change_pct": round(oi_change_pct, 2),
             "taker_buy_pct": taker_buy_pct if taker_buy_pct else 0.0,
             "cvd_val": cvd_val if cvd_val else 0.0,
-            "reason_entry": f"H4 phá đỉnh 20 nến + H1 trên EMA21 ({signal_status}).",
-            "reason_sl": "Dưới đáy Swing Low H1 + 0.20 ATR.",
-            "reason_tp": "Theo cản H4 (RR ≥ 1:2).",
             "candle_timestamp": int(h1_last['open_time'])
         }
         return True, details, score, "ĐẠT CHUẨN SETUP 1"
@@ -537,7 +531,6 @@ class SetupEngine:
         vol_sma_h1 = h1_last['vol_sma20'] if h1_last['vol_sma20'] > 0 else 1
         vol_ratio_h1 = h1_last['volume'] / vol_sma_h1
 
-        box_length = len(box_window)
         recent_3_highs = df_h1['high'].iloc[-5:-2]
         had_breakout_before = (recent_3_highs > box_high).any()
         is_retesting = (df_h1['low'].iloc[-2] <= box_high * 1.002) and (h1_last['close'] > box_high)
@@ -580,7 +573,7 @@ class SetupEngine:
             "setup_type": "H1_SIDEWAY_BREAKOUT",
             "signal_status": signal_status,
             "price": entry_price,
-            "entry_zone": f"{round(box_high, 4)} - {round(entry_price, 4)}",
+            "entry_zone": str(entry_price),
             "sl_price": round(sl_price, 4),
             "tp1": tp1,
             "tp2": tp2,
@@ -593,9 +586,6 @@ class SetupEngine:
             "cvd_val": cvd_val if cvd_val else 0.0,
             "box_high": round(box_high, 4),
             "box_low": round(box_low, 4),
-            "reason_entry": f"H1 tích lũy {box_length} nến (Box: {round(box_low,4)}-{round(box_high,4)}), breakout EMA21 (Thuần nến PA).",
-            "reason_sl": "Dưới đáy Box + 0.20 ATR.",
-            "reason_tp": "Theo chiều cao Box & cản H4 (RR ≥ 1:2).",
             "candle_timestamp": int(h1_last['open_time'])
         }
         return True, details, score, "ĐẠT CHUẨN SETUP 2"
@@ -674,7 +664,7 @@ class SetupEngine:
             "setup_type": "H1_PULLBACK_RECOVERY",
             "signal_status": "CONFIRMED",
             "price": entry_price,
-            "entry_zone": f"{round(box_high, 4)} - {round(entry_price, 4)}",
+            "entry_zone": str(entry_price),
             "sl_price": round(sl_price, 4),
             "tp1": tp1,
             "tp2": tp2,
@@ -685,9 +675,6 @@ class SetupEngine:
             "oi_change_pct": round(oi_change_pct, 2),
             "taker_buy_pct": taker_buy_pct if taker_buy_pct else 0.0,
             "cvd_val": cvd_val if cvd_val else 0.0,
-            "reason_entry": f"H1 hồi EMA200, tạo HL, breakout vol {round(vol_ratio_h1,2)}x.",
-            "reason_sl": "Dưới đáy tích lũy HL + 0.20 ATR.",
-            "reason_tp": "Mục tiêu đỉnh H1 cũ & cản H4 (RR ≥ 1:2).",
             "candle_timestamp": int(h1_last['open_time'])
         }
         return True, details, score, "ĐẠT CHUẨN SETUP 3"
@@ -749,7 +736,7 @@ class SetupEngine:
             "setup_type": "H1_EARLY_MOMENTUM_PA",
             "signal_status": "EARLY_ENTRY",
             "price": entry_price,
-            "entry_zone": f"{round(ema21_h1, 4)} - {round(entry_price, 4)}",
+            "entry_zone": str(entry_price),
             "sl_price": round(sl_price, 4),
             "tp1": round(tp1, 4),
             "tp2": round(tp2, 4),
@@ -760,9 +747,6 @@ class SetupEngine:
             "oi_change_pct": round(oi_change_pct, 2),
             "taker_buy_pct": taker_buy_pct if taker_buy_pct else 0.0,
             "cvd_val": cvd_val if cvd_val else 0.0,
-            "reason_entry": f"Nến H1 thứ 2 đóng xanh nhô vượt qua EMA21 (Bắt sóng sớm theo Price Action H1, không xét Volume).",
-            "reason_sl": "Dưới đáy nến tạo nền H1 + Đệm rủi ro 0.15 ATR H1.",
-            "reason_tp": "Mục tiêu đỉnh H1 gần nhất & cản H4.",
             "candle_timestamp": int(candle_2['open_time'])
         }
         return True, details, score, "ĐẠT CHUẨN SETUP 4 (EARLY THUẦN NẾN H1)"
@@ -824,7 +808,7 @@ class SetupEngine:
             "setup_type": "H4_EMA21_RECLAIM_PA",
             "signal_status": "CONFIRMED",
             "price": entry_price,
-            "entry_zone": f"{round(ema21_h4, 4)} - {round(entry_price, 4)}",
+            "entry_zone": str(entry_price),
             "sl_price": round(sl_price, 4),
             "tp1": round(tp1, 4),
             "tp2": round(tp2, 4),
@@ -835,9 +819,6 @@ class SetupEngine:
             "oi_change_pct": round(oi_change_pct, 2),
             "taker_buy_pct": taker_buy_pct if taker_buy_pct else 0.0,
             "cvd_val": cvd_val if cvd_val else 0.0,
-            "reason_entry": f"Nến H4 đóng xanh dứt khoát cắt vượt qua EMA21 H4 (Thuần Price Action H4 - Mô hình 1000PEPEUSDT, không xét Volume).",
-            "reason_sl": "Dưới đáy râu nến tạo nền H4 + Đệm rủi ro 0.15 ATR H4.",
-            "reason_tp": "Mục tiêu các đỉnh kháng cự H4 mở rộng (R:R ≥ 1:2).",
             "candle_timestamp": int(h4_candle_last['open_time'])
         }
         return True, details, score, "ĐẠT CHUẨN SETUP 5 (H4 EMA21 RECLAIM PA)"
@@ -905,7 +886,7 @@ class SetupEngine:
             "setup_type": "H1_3CANDLE_EMA21_RECLAIM_PA",
             "signal_status": "CONFIRMED",
             "price": entry_price,
-            "entry_zone": f"{round(ema21_h1, 4)} - {round(entry_price, 4)}",
+            "entry_zone": str(entry_price),
             "sl_price": round(sl_price, 4),
             "tp1": round(tp1, 4),
             "tp2": round(tp2, 4),
@@ -916,9 +897,6 @@ class SetupEngine:
             "oi_change_pct": round(oi_change_pct, 2),
             "taker_buy_pct": taker_buy_pct if taker_buy_pct else 0.0,
             "cvd_val": cvd_val if cvd_val else 0.0,
-            "reason_entry": f"Nến H1 thứ 3 đóng xanh dứt khoát cắt vượt lên EMA21 H1 khi H1/H4 nằm trên EMA200 (Mô hình IDOLUSDT, không xét Volume).",
-            "reason_sl": "Dưới đáy cây nến H1 thứ 3 / cụm nến tạo nền + Đệm rủi ro 0.15 ATR H1.",
-            "reason_tp": "Mục tiêu các đỉnh kháng cự H1/H4 (R:R ≥ 1:2).",
             "candle_timestamp": int(c1['open_time'])
         }
         return True, details, score, "ĐẠT CHUẨN SETUP 6 (H1 3-CANDLE RECLAIM PA)"
@@ -989,7 +967,7 @@ class SetupEngine:
             "setup_type": "H1_BEATUSDT_PULLBACK_REACCUMULATION",
             "signal_status": "CONFIRMED",
             "price": entry_price,
-            "entry_zone": f"{round(ema21_h1, 4)} - {round(entry_price, 4)}",
+            "entry_zone": str(entry_price),
             "sl_price": round(sl_price, 4),
             "tp1": round(tp1, 4),
             "tp2": round(tp2, 4),
@@ -1000,15 +978,12 @@ class SetupEngine:
             "oi_change_pct": round(oi_change_pct, 2),
             "taker_buy_pct": taker_buy_pct if taker_buy_pct else 0.0,
             "cvd_val": cvd_val if cvd_val else 0.0,
-            "reason_entry": "Giá nhúng hồi rủ bỏ về EMA200 H1 và tạo nến xanh đóng vượt EMA21 (Mô hình BEATUSDT H1 đầu chu kỳ).",
-            "reason_sl": "Dưới đáy nhúng hồi / hỗ trợ EMA200 + Đệm rủi ro 0.15 ATR H1.",
-            "reason_tp": "Mục tiêu đỉnh sóng đẩy thứ nhất & cản H4 tiếp theo.",
             "candle_timestamp": int(candle_trigger['open_time'])
         }
         return True, details, score, "ĐẠT CHUẨN SETUP BEATUSDT PULLBACK"
 
 # -----------------------------------------------------------------------------
-# 7. TELEGRAM SERVICE
+# 7. TELEGRAM SERVICE (BẢO MẬT BỎ LÝ DO KỸ THUẬT & DÒNG TIỀN, CHỈ LẤY 1 GIÁ ENTRY)
 # -----------------------------------------------------------------------------
 class TelegramService:
     def __init__(self, token=BOT_TOKEN, chat_id=CHAT_ID):
@@ -1059,26 +1034,17 @@ class TelegramService:
         if "box_high" in data and "box_low" in data:
             box_info_str = f"📦 <b>Box High / Low:</b> {data['box_high']} / {data['box_low']}\n"
 
+        # Tin nhắn tối giản tuyệt đối: Chỉ 1 giá Entry, ẩn Dòng tiền và Ẩn toàn bộ Lý do kỹ thuật
         msg = f"""{header} <b>#{symbol}</b>
 
 ⭐ <b>Chất lượng Setup:</b> {data['score']}/100
 ⏱ <b>Thời gian:</b> {time_str}
-💰 <b>Entry Giá Đóng Cửa:</b> {data['price']}
 {box_info_str}
-📊 <b>XÁC NHẬN DÒNG TIỀN & ĐỘNG LƯỢNG:</b>
-- Volume Ratio Spot: <b>{data['spot_vol_ratio']}x</b>
-- OI Change Futures H1: <b>{data['oi_change_pct']:+.2f}%</b>
-- Taker Buy Ratio Spot: <b>{data['taker_buy_pct']:.1f}%</b>
-- CVD Spot Flow: <b>+{data['cvd_val']:,.0f} USDT</b>
-
 📍 <b>KẾ HOẠCH BẮT LỆNH KỸ THUẬT:</b>
-- <b>Vùng Entry Tham Chiếu:</b> {data['entry_zone']}
-- <b>Stop Loss Cấu Trúc:</b> {data['sl_price']} ({data['reason_sl']})
+- <b>Entry Giá Tham Chiếu:</b> {data['price']}
+- <b>Stop Loss:</b> {data['sl_price']}
 - <b>TP1:</b> {data['tp1']} (R:R <b>1:{data['tp1_rr']}</b>)
 - <b>TP2:</b> {data['tp2']} (R:R <b>1:{data['tp2_rr']}</b>)
-
-💡 <b>Lý do phát tín hiệu:</b> {data['reason_entry']}
-💡 <b>Lý do TP:</b> {data['reason_tp']}
 
 🔗 <a href="{chart_url}">Mở Chart MEXC #{symbol}</a>"""
         return self.send_message_sync(msg)
@@ -1210,7 +1176,6 @@ class MarketScanner:
                 logger.error(f"Lỗi xử lý symbol {spot_sym}: {e}")
                 error_count += 1
             
-            # Đã tăng delay lên 0.1s để chống bị MEXC chặn IP
             time.sleep(0.1)
 
         db.cleanup_old_oi_snapshots()
@@ -1305,7 +1270,6 @@ def main():
     logger.info(" KHỞI ĐỘNG HỆ THỐNG MEXC MULTI ENGINE 24/7 BOT ")
     logger.info("==================================================")
 
-    # Chạy Flask Server ngầm
     threading.Thread(target=run_flask_server, daemon=True).start()
 
     if not BOT_TOKEN or BOT_TOKEN.startswith("YOUR_"):
@@ -1318,13 +1282,10 @@ def main():
     app.add_handler(CommandHandler("scan", cmd_scan))
 
     async def post_init(application):
-        # Kích hoạt scheduler tự động và vòng quét đầu tiên
         asyncio.create_task(full_auto_scheduler())
         asyncio.create_task(asyncio.to_thread(scanner.scan_market))
 
     app.post_init = post_init
-
-    # run_polling() tự quản lý event loop chuẩn mực trên Python 3.10+
     app.run_polling()
 
 if __name__ == "__main__":

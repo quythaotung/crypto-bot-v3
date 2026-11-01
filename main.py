@@ -7,10 +7,10 @@ SETUP 1 – H4 BREAKOUT MỞ SÓNG (Thuần PA H4/H1)
 SETUP 2 – H1 SIDEWAY BREAKOUT (Thuần PA Breakout/Retest Box)
 SETUP 3 – H1 PULLBACK RECOVERY LONG (Thuần PA H1)
 SETUP 4 – H1 EARLY MOMENTUM RECLAIM (Thuần PA H1)
-SETUP 5 – H4 EMA21 BREAKOUT RECLAIM (Thuần PA H4)
+SETUP 5 – H4 EMA21 BREAKOUT RECLAIM (Thuần PA H4 - BẮT BỘC H4 > EMA200)
 SETUP 6 – H1 3-CANDLE EMA21 RECLAIM (Thuần PA H1)
 SETUP 7 – H1 BEATUSDT PULLBACK RE-ACCUMULATION (Thuần PA H1)
-SETUP 8 – H1 MOMENTUM EXPANSION (Chỉ bắt nến xanh thứ 2 - Không check Volume)
+SETUP 8 – H1 MOMENTUM EXPANSION (Chỉ bắt nến xanh thứ 2 - Thuần PA, Không Check Vol)
 ===============================================================================
 """
 
@@ -722,6 +722,7 @@ class SetupEngine:
         df_h4: pd.DataFrame, df_h1: pd.DataFrame, current_realtime_price: float,
         oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
     ) -> Tuple[bool, Dict[str, Any], int, str]:
+        """SETUP 5 / 7 - H4 EMA21 RECLAIM (SIẾT CHẶT ĐIỀU KIỆN: H4 PHẢI TRÊN EMA200)"""
         if df_h4 is None or len(df_h4) < 25:
             return False, {}, 0, "Dữ liệu nến H4 không đủ"
 
@@ -733,9 +734,10 @@ class SetupEngine:
         if current_realtime_price > entry_price + (1.2 * atr_h4):
             return False, {}, 0, "Giá real-time quá xa Entry H4"
 
+        # BẮT BỘC 100%: GIÁ ĐÓNG CỬA H4 PHẢI TRÊN EMA200 H4 (CHECK FOLLOW UPTREND H4)
         ema200_h4 = h4_candle_last.get('ema200', 0)
-        if entry_price < ema200_h4 * 0.995:
-            return False, {}, 0, "H4 nằm sâu dưới EMA200"
+        if entry_price < ema200_h4:
+            return False, {}, 0, "H4 nằm dưới EMA200 (Không thỏa mãn Follow Trend H4)"
 
         ema21_h4 = h4_candle_last['ema21']
         is_h4_green = h4_candle_last['close'] > h4_candle_last['open']
@@ -832,7 +834,6 @@ class SetupEngine:
             return False, {}, 0, "Dữ liệu nến H1 không đủ"
 
         candle_trigger = df_h1.iloc[-2]
-        candle_prev = df_h1.iloc[-3]
         entry_price = candle_trigger['close']
 
         atr_h1 = candle_trigger['atr'] if not np.isnan(candle_trigger['atr']) else (entry_price * 0.01)
@@ -1022,7 +1023,7 @@ class MarketScanner:
                         df_h4, df_h1, realtime_price, oi_change_pct, None, None
                     )
                     if is_s5: candidate_signals.append((score5, d5, "H4_EMA21_RECLAIM_PA"))
-                    else: rejection_reasons.append(f"S5: {reason5}")
+                    else: rejection_reasons.append(f"S5: {reason8 if 'reason8' in locals() else reason5}")
 
                 # SETUP 4: H1 EARLY MOMENTUM RECLAIM
                 if not db.is_cooldown_active(spot_sym, "H1_EARLY_MOMENTUM_PA", candle_ts):

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 7 SETUPS - FUTURES ONLY)
+MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 8 SETUPS - FUTURES ONLY)
 SETUP 1 – H4 BREAKOUT MỞ SÓNG (Thuần Nến PA H4/H1)
 SETUP 2 – H1 SIDEWAY BREAKOUT (Thuần Nến Breakout/Retest Box)
 SETUP 3 – H1 PULLBACK RECOVERY LONG
@@ -10,6 +10,7 @@ SETUP 4 – H1 EARLY MOMENTUM RECLAIM (Thuần Nến PA H1)
 SETUP 5 – H4 EMA21 BREAKOUT RECLAIM (Thuần Nến PA H4 - Mô hình 1000PEPEUSDT)
 SETUP 6 – H1 3-CANDLE EMA21 RECLAIM (Thuần Nến PA H1 - Mô hình IDOLUSDT)
 SETUP 7 – H1 BEATUSDT PULLBACK RE-ACCUMULATION (Thuần Nến PA H1 ĐẦU CHU KỲ)
+SETUP 8 – H1 MOMENTUM EXPANSION (Bắt nến xanh bùng nổ dốc - Mô hình EVAAUSDT)
 ===============================================================================
 """
 
@@ -85,7 +86,7 @@ flask_app = Flask(__name__)
 def health_check():
     return jsonify({
         "status": "online",
-        "system": "MEXC MULTI-ENGINE SIGNAL PLATFORM (PRO - 7 SETUPS FUTURES)",
+        "system": "MEXC MULTI-ENGINE SIGNAL PLATFORM (PRO - 8 SETUPS FUTURES)",
         "is_scanning": SYSTEM_STATE["is_scanning"],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
@@ -409,9 +410,68 @@ class TechnicalAnalyzer:
         return highs, lows
 
 # -----------------------------------------------------------------------------
-# 6. SETUP ENGINES (7 SETUPS)
+# 6. SETUP ENGINES (8 SETUPS)
 # -----------------------------------------------------------------------------
 class SetupEngine:
+    @staticmethod
+    def evaluate_setup_momentum_expansion(
+        df_h1: pd.DataFrame, current_realtime_price: float,
+        oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
+    ) -> Tuple[bool, Dict[str, Any], int, str]:
+        """SETUP 8 – BẮT NẾN XANH BÙNG NỔ DỐC MẠNH (MÔ HÌNH EVAAUSDT)"""
+        if df_h1 is None or len(df_h1) < 25:
+            return False, {}, 0, "Dữ liệu nến H1 không đủ"
+
+        c1 = df_h1.iloc[-2]  # Nến H1 vừa đóng cửa
+        entry_price = c1['close']
+        atr_h1 = c1['atr'] if not np.isnan(c1['atr']) else (entry_price * 0.01)
+
+        # Nới lỏng kiểm tra trượt giá lên 1.5 ATR cho nến bùng nổ
+        if current_realtime_price > entry_price + (1.5 * atr_h1):
+            return False, {}, 0, "Giá real-time quá xa Entry"
+
+        # 1. Thân nến xanh lớn hơn 1.2x ATR
+        candle_body = abs(c1['close'] - c1['open'])
+        if c1['close'] <= c1['open'] or candle_body < (1.2 * atr_h1):
+            return False, {}, 0, "Thân nến chưa đủ độ bùng nổ"
+
+        # 2. Vol nổ gấp 1.3x đường Vol 20 nến
+        vol_sma = c1['vol_sma20'] if c1['vol_sma20'] > 0 else 1
+        vol_ratio = c1['volume'] / vol_sma
+        if vol_ratio < 1.3:
+            return False, {}, 0, "Khối lượng chưa nổ (Vol < 1.3x)"
+
+        # 3. Nến đóng trên EMA21
+        if c1['close'] < c1['ema21']:
+            return False, {}, 0, "Nến chưa nằm trên EMA21"
+
+        sl_price = round(c1['low'] - (0.15 * atr_h1), 4)
+        risk = entry_price - sl_price
+        if risk <= 0: return False, {}, 0, "SL lỗi"
+
+        tp1 = round(entry_price + (1.5 * risk), 4)
+        tp2 = round(entry_price + (2.5 * risk), 4)
+
+        score = 92
+        details = {
+            "setup_type": "H1_MOMENTUM_EXPANSION",
+            "signal_status": "CONFIRMED",
+            "price": entry_price,
+            "entry_zone": str(entry_price),
+            "sl_price": sl_price,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp1_rr": 1.5,
+            "tp2_rr": 2.5,
+            "score": score,
+            "spot_vol_ratio": round(vol_ratio, 2),
+            "oi_change_pct": round(oi_change_pct, 2),
+            "taker_buy_pct": taker_buy_pct if taker_buy_pct else 0.0,
+            "cvd_val": cvd_val if cvd_val else 0.0,
+            "candle_timestamp": int(c1['open_time'])
+        }
+        return True, details, score, "ĐẠT CHUẨN NẾN BÙNG NỔ DỐC"
+
     @staticmethod
     def evaluate_setup_1_h4_breakout(
         df_h4: pd.DataFrame, df_h1: pd.DataFrame, current_realtime_price: float,
@@ -426,7 +486,7 @@ class SetupEngine:
         entry_price = h1_last['close']
 
         atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (entry_price * 0.01)
-        if current_realtime_price > entry_price + (0.8 * atr_h1):
+        if current_realtime_price > entry_price + (1.2 * atr_h1):
             return False, {}, 0, f"Giá real-time ({current_realtime_price}) chạy xa Entry H1 ({entry_price})"
 
         ema21_h4 = h4_last['ema21']
@@ -462,8 +522,8 @@ class SetupEngine:
         rr1 = round((tp1 - entry_price) / risk, 2)
         rr2 = round((tp2 - entry_price) / risk, 2)
 
-        if rr1 < 2.0:
-            return False, {}, 0, f"RR1 ({rr1}) < 1:2"
+        if rr1 < 1.8:
+            return False, {}, 0, f"RR1 ({rr1}) < 1:1.8"
 
         vol_sma_h1 = h1_last['vol_sma20'] if h1_last['vol_sma20'] > 0 else 1
         vol_ratio_h1 = h1_last['volume'] / vol_sma_h1
@@ -504,7 +564,7 @@ class SetupEngine:
         entry_price = h1_last['close']
 
         atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (entry_price * 0.01)
-        if current_realtime_price > entry_price + (0.8 * atr_h1):
+        if current_realtime_price > entry_price + (1.2 * atr_h1):
             return False, {}, 0, "Giá real-time quá xa Entry H1"
 
         ema21_h1 = h1_last['ema21']
@@ -561,8 +621,8 @@ class SetupEngine:
         rr1 = round((tp1 - entry_price) / risk, 2)
         rr2 = round((tp2 - entry_price) / risk, 2)
 
-        if rr1 < 1.4 or rr2 < 2.0:
-            return False, {}, 0, f"RR2 ({rr2}) < 1:2"
+        if rr1 < 1.3 or rr2 < 1.8:
+            return False, {}, 0, f"RR2 ({rr2}) < 1:1.8"
 
         score = 80
         if signal_status == "CONFIRMED": score += 10
@@ -603,7 +663,7 @@ class SetupEngine:
         entry_price = h1_last['close']
 
         atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (entry_price * 0.01)
-        if current_realtime_price > entry_price + (0.8 * atr_h1):
+        if current_realtime_price > entry_price + (1.2 * atr_h1):
             return False, {}, 0, "Giá real-time quá xa Entry H1"
 
         if df_h4 is not None and len(df_h4) >= 20:
@@ -634,8 +694,8 @@ class SetupEngine:
 
         vol_sma_h1 = h1_last['vol_sma20'] if h1_last['vol_sma20'] > 0 else 1
         vol_ratio_h1 = h1_last['volume'] / vol_sma_h1
-        if vol_ratio_h1 < 1.3:
-            return False, {}, 0, "Vol H1 Recovery < 1.3x"
+        if vol_ratio_h1 < 1.2:
+            return False, {}, 0, "Vol H1 Recovery < 1.2x"
 
         sl_price = round(box_low - (0.20 * atr_h1), 4)
         if sl_price >= entry_price:
@@ -653,11 +713,11 @@ class SetupEngine:
         rr1 = round((tp1 - entry_price) / risk, 2)
         rr2 = round((tp2 - entry_price) / risk, 2)
 
-        if rr1 < 1.4 or rr2 < 2.0:
-            return False, {}, 0, f"RR2 ({rr2}) < 1:2"
+        if rr1 < 1.3 or rr2 < 1.8:
+            return False, {}, 0, f"RR2 ({rr2}) < 1:1.8"
 
         score = 85
-        if vol_ratio_h1 >= 1.6: score += 10
+        if vol_ratio_h1 >= 1.5: score += 10
         score = min(score, 100)
 
         details = {
@@ -692,7 +752,8 @@ class SetupEngine:
         entry_price = candle_2['close']
 
         atr_h1 = candle_2['atr'] if not np.isnan(candle_2['atr']) else (entry_price * 0.01)
-        if current_realtime_price > entry_price + (0.6 * atr_h1):
+        # Nới lỏng trượt giá lên 1.5 ATR cho nến bùng nổ
+        if current_realtime_price > entry_price + (1.5 * atr_h1):
             return False, {}, 0, f"Giá real-time ({current_realtime_price}) đã chạy xa Entry nến 2 ({entry_price})"
 
         ema200_h1 = candle_2.get('ema200', 0)
@@ -702,10 +763,10 @@ class SetupEngine:
         ema21_h1 = candle_2['ema21']
         is_candle_2_green = candle_2['close'] > candle_2['open']
         is_candle_2_reclaim_ema21 = candle_2['close'] > ema21_h1
-        is_candle_1_below_ema21 = candle_1['close'] <= candle_1['ema21'] * 1.002
 
-        if not (is_candle_2_green and is_candle_2_reclaim_ema21 and is_candle_1_below_ema21):
-            return False, {}, 0, "Nến 2 chưa đóng xanh vượt EMA21 hoặc nến 1 đã đóng sẵn trên EMA21"
+        # Bỏ ràng buộc bắt buộc nến 1 phải dưới EMA21
+        if not (is_candle_2_green and is_candle_2_reclaim_ema21):
+            return False, {}, 0, "Nến 2 chưa đóng xanh nằm trên EMA21"
 
         swing_low = min(candle_1['low'], candle_2['low'])
         sl_price = round(swing_low - (0.15 * atr_h1), 4)
@@ -723,7 +784,7 @@ class SetupEngine:
         rr1 = round((tp1 - entry_price) / risk, 2)
         rr2 = round((tp2 - entry_price) / risk, 2)
 
-        if rr1 < 1.3 or rr2 < 1.8:
+        if rr1 < 1.2 or rr2 < 1.5:
             return False, {}, 0, f"Tỷ lệ R:R chưa đạt yêu cầu (RR1={rr1}, RR2={rr2})"
 
         vol_ratio = candle_2['volume'] / (candle_2['vol_sma20'] if candle_2['vol_sma20'] > 0 else 1)
@@ -764,7 +825,7 @@ class SetupEngine:
         entry_price = h4_candle_last['close']
 
         atr_h4 = h4_candle_last['atr'] if not np.isnan(h4_candle_last['atr']) else (entry_price * 0.015)
-        if current_realtime_price > entry_price + (0.5 * atr_h4):
+        if current_realtime_price > entry_price + (1.2 * atr_h4):
             return False, {}, 0, f"Giá real-time ({current_realtime_price}) đã chạy quá xa Entry H4 ({entry_price})"
 
         ema200_h4 = h4_candle_last.get('ema200', 0)
@@ -795,7 +856,7 @@ class SetupEngine:
         rr1 = round((tp1 - entry_price) / risk, 2)
         rr2 = round((tp2 - entry_price) / risk, 2)
 
-        if rr1 < 1.8 or rr2 < 2.5:
+        if rr1 < 1.5 or rr2 < 2.0:
             return False, {}, 0, f"Tỷ lệ R:R chưa đạt chuẩn H4 (RR1={rr1}, RR2={rr2})"
 
         vol_ratio = h4_candle_last['volume'] / (h4_candle_last['vol_sma20'] if h4_candle_last['vol_sma20'] > 0 else 1)
@@ -837,7 +898,7 @@ class SetupEngine:
         entry_price = c1['close']
 
         atr_h1 = c1['atr'] if not np.isnan(c1['atr']) else (entry_price * 0.01)
-        if current_realtime_price > entry_price + (0.5 * atr_h1):
+        if current_realtime_price > entry_price + (1.2 * atr_h1):
             return False, {}, 0, f"Giá real-time ({current_realtime_price}) đã chạy xa Entry nến 3 ({entry_price})"
 
         ema200_h1 = c1.get('ema200', 0)
@@ -873,7 +934,7 @@ class SetupEngine:
         rr1 = round((tp1 - entry_price) / risk, 2)
         rr2 = round((tp2 - entry_price) / risk, 2)
 
-        if rr1 < 1.4 or rr2 < 2.0:
+        if rr1 < 1.3 or rr2 < 1.8:
             return False, {}, 0, f"Tỷ lệ R:R chưa đạt chuẩn IDOLUSDT (RR1={rr1}, RR2={rr2})"
 
         vol_ratio = c1['volume'] / (c1['vol_sma20'] if c1['vol_sma20'] > 0 else 1)
@@ -914,7 +975,7 @@ class SetupEngine:
         entry_price = candle_trigger['close']
 
         atr_h1 = candle_trigger['atr'] if not np.isnan(candle_trigger['atr']) else (entry_price * 0.01)
-        if current_realtime_price > entry_price + (0.5 * atr_h1):
+        if current_realtime_price > entry_price + (1.2 * atr_h1):
             return False, {}, 0, f"Giá real-time ({current_realtime_price}) đã chạy xa Entry H1 ({entry_price})"
 
         ema200_h1 = candle_trigger.get('ema200', 0)
@@ -954,7 +1015,7 @@ class SetupEngine:
         rr1 = round((tp1 - entry_price) / risk, 2)
         rr2 = round((tp2 - entry_price) / risk, 2)
 
-        if rr1 < 1.5 or rr2 < 2.0:
+        if rr1 < 1.3 or rr2 < 1.8:
             return False, {}, 0, f"Tỷ lệ R:R chưa đạt chuẩn (RR1={rr1}, RR2={rr2})"
 
         vol_ratio = candle_trigger['volume'] / (candle_trigger['vol_sma20'] if candle_trigger['vol_sma20'] > 0 else 1)
@@ -1013,10 +1074,12 @@ class TelegramService:
         status_tag = f"[{data.get('signal_status', 'CONFIRMED')}]"
         setup_name = data["setup_type"]
         
-        if setup_name == "H1_BEATUSDT_PULLBACK_REACCUMULATION":
+        if setup_name == "H1_MOMENTUM_EXPANSION":
+            header = f"🚀 <b>[SETUP 8 – MOMENTUM EXPANSION {status_tag}]</b>"
+        elif setup_name == "H1_BEATUSDT_PULLBACK_REACCUMULATION":
             header = f"🔥 <b>[SETUP 7 – BEATUSDT PULLBACK {status_tag}]</b>"
         elif setup_name == "H1_3CANDLE_EMA21_RECLAIM_PA":
-            header = f"🚀 <b>[SETUP 6 – H1 3-CANDLE EMA21 RECLAIM {status_tag}]</b>"
+            header = f"⚡ <b>[SETUP 6 – H1 3-CANDLE EMA21 RECLAIM {status_tag}]</b>"
         elif setup_name == "H4_EMA21_RECLAIM_PA":
             header = f"👑 <b>[SETUP 5 – H4 EMA21 BREAKOUT RECLAIM {status_tag}]</b>"
         elif setup_name == "H1_EARLY_MOMENTUM_PA":
@@ -1034,7 +1097,6 @@ class TelegramService:
         if "box_high" in data and "box_low" in data:
             box_info_str = f"📦 <b>Box High / Low:</b> {data['box_high']} / {data['box_low']}\n"
 
-        # Tin nhắn tối giản tuyệt đối: Chỉ 1 giá Entry, ẩn Dòng tiền và Ẩn toàn bộ Lý do kỹ thuật
         msg = f"""{header} <b>#{symbol}</b>
 
 ⭐ <b>Chất lượng Setup:</b> {data['score']}/100
@@ -1100,6 +1162,14 @@ class MarketScanner:
                 candidate_signals = []
                 rejection_reasons = []
 
+                # SETUP 8: H1 MOMENTUM EXPANSION (EVAAUSDT)
+                if not db.is_cooldown_active(spot_sym, "H1_MOMENTUM_EXPANSION", candle_ts):
+                    is_s8, d8, score8, reason8 = SetupEngine.evaluate_setup_momentum_expansion(
+                        df_h1, realtime_price, oi_change_pct, taker_buy_pct, cvd_val
+                    )
+                    if is_s8: candidate_signals.append((score8, d8, "H1_MOMENTUM_EXPANSION"))
+                    else: rejection_reasons.append(f"S8: {reason8}")
+
                 # SETUP 7: H1 BEATUSDT PULLBACK RE-ACCUMULATION
                 if not db.is_cooldown_active(spot_sym, "H1_BEATUSDT_PULLBACK_REACCUMULATION", candle_ts):
                     is_s7, d7, score7, reason7 = SetupEngine.evaluate_setup_9_beatusdt_pullback_reaccumulation(
@@ -1108,7 +1178,7 @@ class MarketScanner:
                     if is_s7: candidate_signals.append((score7, d7, "H1_BEATUSDT_PULLBACK_REACCUMULATION"))
                     else: rejection_reasons.append(f"S7: {reason7}")
 
-                # SETUP 6: H1 3-CANDLE EMA21 RECLAIM (MÔ HÌNH IDOLUSDT)
+                # SETUP 6: H1 3-CANDLE EMA21 RECLAIM
                 if not db.is_cooldown_active(spot_sym, "H1_3CANDLE_EMA21_RECLAIM_PA", candle_ts):
                     is_s6, d6, score6, reason6 = SetupEngine.evaluate_setup_8_h1_3candle_reclaim_pa(
                         df_h1, df_h4, realtime_price, oi_change_pct, taker_buy_pct, cvd_val
@@ -1116,7 +1186,7 @@ class MarketScanner:
                     if is_s6: candidate_signals.append((score6, d6, "H1_3CANDLE_EMA21_RECLAIM_PA"))
                     else: rejection_reasons.append(f"S6: {reason6}")
 
-                # SETUP 5: H4 EMA21 BREAKOUT RECLAIM (MÔ HÌNH 1000PEPEUSDT)
+                # SETUP 5: H4 EMA21 BREAKOUT RECLAIM
                 if not db.is_cooldown_active(spot_sym, "H4_EMA21_RECLAIM_PA", candle_ts):
                     is_s5, d5, score5, reason5 = SetupEngine.evaluate_setup_7_h4_ema21_reclaim_pa(
                         df_h4, df_h1, realtime_price, oi_change_pct, taker_buy_pct, cvd_val
@@ -1213,8 +1283,8 @@ async def full_auto_scheduler():
 # -----------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 <b>MEXC MULTI-ENGINE LONG SIGNAL BOT (PRO 7 SETUPS FUTURES)</b>\n"
-        "Bot quét tự động 24/7 phát hiện 7 Setup Long chuẩn xác kỹ thuật.\n"
+        "🚀 <b>MEXC MULTI-ENGINE LONG SIGNAL BOT (PRO 8 SETUPS FUTURES)</b>\n"
+        "Bot quét tự động 24/7 phát hiện 8 Setup Long chuẩn xác kỹ thuật.\n"
         "/status - Thống kê trạng thái hệ thống\n"
         "/scan - Kích hoạt quét & In bảng tổng hợp chi tiết", 
         parse_mode="HTML"

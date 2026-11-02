@@ -231,7 +231,7 @@ class DatabaseManager:
 db = DatabaseManager()
 
 # -----------------------------------------------------------------------------
-# 4. MEXC API CLIENT (FUTURES OPTIMIZED & STOCK FILTERED)
+# 4. MEXC API CLIENT (FUTURES OPTIMIZED & STRICT STOCK FILTER)
 # -----------------------------------------------------------------------------
 class MexcClient:
     def __init__(self):
@@ -269,6 +269,12 @@ class MexcClient:
                 sym = ft.get("symbol", "").replace("_", "").upper()
                 fut_ticker_map[sym] = ft
 
+        # Danh sách từ khóa chứng khoán / ETF / Index cần loại bỏ hoàn toàn
+        STOCK_AND_INDEX_KEYWORDS = {
+            "STOCK", "INDEX", "ETF", "KORU", "TESLA", "APPLE", "NVDA", "AMZN",
+            "US500", "US30", "US100", "NAS100", "SPX", "DJI", "BULL", "BEAR"
+        }
+
         qualified = []
         fut_detail_data = futures_details.get("data", []) if isinstance(futures_details, dict) else futures_details
         
@@ -285,11 +291,10 @@ class MexcClient:
 
                 base_coin = sym_clean[:-4]
 
-                # BỘ LỌC CHẶN CỔ PHIẾU (STOCK), ETF, STABLECOIN
+                # BỘ LỌC CHẶN CỔ PHIẾU, ETF VÀ STABLECOIN
                 if (base_coin in STABLE_AND_ETF_BLACKLIST or 
-                    any(base_coin.endswith(suffix) for suffix in ["3L", "3S", "4L", "4S", "5L", "5S"]) or
-                    "STOCK" in base_coin or 
-                    "INDEX" in base_coin):
+                    any(base_coin.endswith(suffix) for suffix in ["3L", "3S", "4L", "4S", "5L", "5S", "2L", "2S"]) or
+                    any(kw in base_coin for kw in STOCK_AND_INDEX_KEYWORDS)):
                     continue
 
                 ft_info = fut_ticker_map.get(sym_clean, {})

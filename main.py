@@ -5,7 +5,8 @@
 MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 3 SETUPS)
 - SETUP 8: H1 MOMENTUM EXPANSION (PA NẾN XANH THỨ 2)
 - SETUP 6: H1 3-CANDLE EMA21 RECLAIM PA
-- SETUP MỚI: LONG H1 SQUEEZE EXPLOSION (DÒNG TIỀN + CẤU TRÚC DỘNG)
+- SETUP MỚI: LONG H1 SQUEEZE EXPLOSION (DÒNG TIỀN + CẤU TRÚC ĐỘNG)
+LỌC SẠCH 100% CỔ PHIẾU, HÀNG HÓA VÀ CHỈ SỐ (CHỈ GIỮ CRYPTO THUẦN TÚY)
 ===============================================================================
 """
 
@@ -229,7 +230,7 @@ class DatabaseManager:
 db = DatabaseManager()
 
 # -----------------------------------------------------------------------------
-# 4. MEXC API CLIENT
+# 4. MEXC API CLIENT (NÂNG CẤP BỘ LỌC TỪ KHÓA)
 # -----------------------------------------------------------------------------
 class MexcClient:
     def __init__(self):
@@ -267,10 +268,15 @@ class MexcClient:
                 sym = ft.get("symbol", "").replace("_", "").upper()
                 fut_ticker_map[sym] = ft
 
-        # Từ khóa lọc bỏ Cổ phiếu / ETF / Index
+        # BỘ LỌC TỪ KHÓA MỞ RỘNG: LOẠI BỎ HÀNG HÓA, KIM LOẠI, CỔ PHIẾU, CHỈ SỐ TÀI CHÍNH
         STOCK_AND_INDEX_KEYWORDS = {
-            "STOCK", "INDEX", "ETF", "KORU", "TESLA", "APPLE", "NVDA", "AMZN",
-            "US500", "US30", "US100", "NAS100", "SPX", "DJI", "BULL", "BEAR"
+            # Cổ phiếu / Công nghệ / Robot
+            "STOCK", "INDEX", "ETF", "KORU", "UNITREE", "TESLA", "APPLE", "NVDA", "AMZN",
+            "MSFT", "GOOG", "META", "AMD", "TSMC", "INTEL", "ARM", "SAMSUNG", "NOKIA", "ROBOT",
+            # Chỉ số tài chính & Đòn bẩy
+            "SOXL", "SOXS", "US500", "US30", "US100", "NAS100", "SPX", "DJI", "FTSE", "DAX", "NIFTY", "NIKKEI", "HK50", "BULL", "BEAR",
+            # Hàng hóa & Kim loại (Commodities)
+            "ALUMINUM", "COPPER", "GOLD", "SILVER", "CRUDE", "OIL", "GAS", "NATURALGAS", "WHEAT", "CORN", "SOY", "IRON", "STEEL", "LITHIUM", "NICKEL", "ZINC", "PALLADIUM", "PLATINUM"
         }
 
         qualified = []
@@ -289,6 +295,7 @@ class MexcClient:
 
                 base_coin = sym_clean[:-4]
 
+                # BỘ LỌC CHẶN TRIỆT ĐỂ
                 if (base_coin in STABLE_AND_ETF_BLACKLIST or 
                     any(base_coin.endswith(suffix) for suffix in ["3L", "3S", "4L", "4S", "5L", "5S", "2L", "2S"]) or
                     any(kw in base_coin for kw in STOCK_AND_INDEX_KEYWORDS)):
@@ -366,13 +373,11 @@ class MexcClient:
         return df
 
     def fetch_orderflow_metrics(self, symbol: str) -> Tuple[float, float]:
-        """Tính toán ước lượng Taker Buy % và CVD dựa trên nến H1"""
         fut_symbol = symbol if "_" in symbol else f"{symbol[:-4]}_USDT"
         df_h1 = self.fetch_spot_klines(symbol, "1h", 15)
         if df_h1 is None or len(df_h1) < 5:
-            return 54.0, 10000.0  # Mặc định an toàn
+            return 54.0, 10000.0
         
-        # Ước tính Taker Buy Ratio dựa trên vị thế đóng nến so với High-Low
         total_vol = df_h1['volume'].iloc[-3:-1].sum()
         buy_vol = 0.0
         for idx, row in df_h1.iloc[-3:-1].iterrows():
@@ -419,7 +424,7 @@ class TechnicalAnalyzer:
         return highs, lows
 
 # -----------------------------------------------------------------------------
-# 6. SETUP ENGINES (3 SETUPS GIỮ LẠI & MỚI)
+# 6. SETUP ENGINES (3 SETUPS CRYPTO THUẦN TÚY)
 # -----------------------------------------------------------------------------
 class SetupEngine:
     @staticmethod
@@ -428,7 +433,6 @@ class SetupEngine:
         oi_change_h1: float, taker_buy_pct: float, cvd_val: float,
         turnover_24h: float, spread_pct: float
     ) -> Tuple[bool, Dict[str, Any], int, str]:
-        """SETUP MỚI: LONG H1 SQUEEZE EXPLOSION (CHẤM ĐIỂM ĐỘNG NGHStrict 6 TIÊU CHÍ)"""
         if df_h1 is None or len(df_h1) < 30 or df_h4 is None or len(df_h4) < 20:
             return False, {}, 0, "Dữ liệu H1/H4 không đủ"
 
@@ -436,13 +440,11 @@ class SetupEngine:
         c1_close = h1_last['close']
         atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (c1_close * 0.01)
 
-        # 1. ĐIỀU KIỆN BẮT BỘC (HARD FILTERS)
         if taker_buy_pct < 53.0:
             return False, {}, 0, f"Spot Taker Buy ({taker_buy_pct}%) < 53%"
         if oi_change_h1 < 0.5:
             return False, {}, 0, f"OI H1 ({oi_change_h1}%) < 0.5%"
 
-        # Check 2/3 yếu tố: Volume H1 >= 1.2x, Cấu trúc H1 tích cực, H4 xu hướng tăng
         vol_sma20 = h1_last['vol_sma20'] if h1_last['vol_sma20'] > 0 else 1.0
         vol_ratio_h1 = h1_last['volume'] / vol_sma20
         cond_vol = vol_ratio_h1 >= 1.2
@@ -459,37 +461,27 @@ class SetupEngine:
         if factors_met < 2:
             return False, {}, 0, f"Chỉ đạt {factors_met}/3 yếu tố bổ trợ (yêu cầu >= 2)"
 
-        # 2. CHẤM ĐIỂM ĐỘNG (TOÀN BỘ TÍNH TỪ DỮ LIỆU THỰC TẾ)
-        # a. Spot Buy & CVD (Tối đa 30 điểm)
         score_buy = min(30.0, max(0.0, (taker_buy_pct - 50.0) * 2.0 + (10.0 if cvd_val > 0 else 0.0)))
-        
-        # b. OI (Tối đa 20 điểm)
         score_oi = min(20.0, max(0.0, oi_change_h1 * 4.0))
 
-        # c. Cấu trúc giá H1 (Tối đa 20 điểm)
         score_h1 = 10.0
         if is_breakout: score_h1 += 10.0
         elif is_near_res: score_h1 += 5.0
         if c1_close > h1_last['ema21']: score_h1 += 3.0
 
-        # d. Volume H1 (Tối đa 15 điểm)
         score_vol = min(15.0, max(0.0, vol_ratio_h1 * 7.5))
 
-        # e. Xu hướng H4 (Tối đa 10 điểm)
         score_h4 = 0.0
         if h4_last['close'] > h4_last['ema21']: score_h4 += 5.0
         if h4_last['close'] > h4_last.get('ema200', 0): score_h4 += 5.0
 
-        # f. Thanh khoản (Tối đa 5 điểm)
         score_liq = min(5.0, max(0.0, (turnover_24h / 2000000.0) * 2.5 + (2.5 if spread_pct <= 0.1 else 1.0)))
 
         total_score = int(round(score_buy + score_oi + score_h1 + score_vol + score_h4 + score_liq))
         total_score = min(100, total_score)
 
-        # Trạng thái
         signal_status = "CONFIRMED" if is_breakout else "EARLY"
 
-        # Tính Stop Loss (Dưới đáy Swing Low + ATR) & TP
         h1_highs, h1_lows = TechnicalAnalyzer.find_pivots(df_h1.iloc[:-1], left=2, right=2)
         h1_swing_low = h1_lows[-1]['price'] if h1_lows else df_h1['low'].iloc[-10:-1].min()
         sl_price = round(h1_swing_low - (0.15 * atr_h1), 4)
@@ -499,7 +491,6 @@ class SetupEngine:
 
         risk = c1_close - sl_price
         
-        # TP1 (Kháng cự H1), TP2 (Kháng cự H4)
         tp1 = round(h1_resistance if h1_resistance > c1_close else c1_close + (1.5 * risk), 4)
         h4_highs, _ = TechnicalAnalyzer.find_pivots(df_h4.iloc[:-1], left=2, right=2)
         tp2 = round(h4_highs[-1]['price'] if h4_highs and h4_highs[-1]['price'] > tp1 else c1_close + (2.8 * risk), 4)
@@ -527,7 +518,6 @@ class SetupEngine:
     def evaluate_setup_momentum_expansion(
         df_h1: pd.DataFrame, current_realtime_price: float
     ) -> Tuple[bool, Dict[str, Any], int, str]:
-        """SETUP 8: H1 MOMENTUM EXPANSION (PA NẾN XANH THỨ 2)"""
         if df_h1 is None or len(df_h1) < 25:
             return False, {}, 0, "Dữ liệu nến H1 không đủ"
 
@@ -569,7 +559,6 @@ class SetupEngine:
     def evaluate_setup_3candle_reclaim(
         df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float
     ) -> Tuple[bool, Dict[str, Any], int, str]:
-        """SETUP 6: H1 3-CANDLE EMA21 RECLAIM PA"""
         if df_h1 is None or len(df_h1) < 25:
             return False, {}, 0, "Dữ liệu H1 không đủ"
 
@@ -611,7 +600,7 @@ class SetupEngine:
         return True, details, score, "ĐẠT CHUẨN SETUP 6"
 
 # -----------------------------------------------------------------------------
-# 7. TELEGRAM SERVICE (GỬI ĐÚNG ĐIỀU KIỆN SCORE >= 88)
+# 7. TELEGRAM SERVICE
 # -----------------------------------------------------------------------------
 class TelegramService:
     def __init__(self, token=BOT_TOKEN, chat_id=CHAT_ID):
@@ -635,7 +624,6 @@ class TelegramService:
             return False
 
     def notify_batch_signals(self, signals_list: List[Dict[str, Any]]) -> bool:
-        """GOM CÁC TÍN HIỆU SCORE >= 88 VÀO 1 TIN NHẮN TỔNG HỢP CHI TIẾT"""
         if not signals_list:
             return True
 
@@ -643,7 +631,7 @@ class TelegramService:
         
         msg = f"🚀 <b>[MEXC LONG SIGNAL ENGINE - PUSH SCORE ≥ 88]</b>\n"
         msg += f"⏱ <b>Thời gian:</b> {time_str}\n"
-        msg += f"🔥 <b>Phát hiện:</b> {len(signals_list)} coin đạt chuẩn cực cao\n"
+        msg += f"🔥 <b>Phát hiện:</b> {len(signals_list)} coin Crypto thuần đạt chuẩn\n"
         msg += "-----------------------------------------\n\n"
 
         for idx, data in enumerate(signals_list, 1):
@@ -653,7 +641,7 @@ class TelegramService:
             setup_name = data["setup_type"]
             
             msg += f"{idx}. 📌 <b>#{symbol}</b> | <b>{setup_name}</b> {status_tag}\n"
-            msg += f"   ⭐ <b>Score:</b> {data['score']}/100\n"
+            msg += f"   ⭐️ <b>Score:</b> {data['score']}/100\n"
             msg += f"   📊 <b>Vol Spot H1 / SMA20:</b> {data.get('vol_ratio_h1', 1.0)}x\n"
             msg += f"   🛒 <b>Spot Taker Buy:</b> {data.get('taker_buy_pct', 50.0)}% | <b>CVD:</b> {data.get('cvd_val', 0.0)}\n"
             msg += f"   📈 <b>OI H1 Change:</b> +{data.get('oi_change_h1', 0.0)}%\n"
@@ -741,11 +729,9 @@ class MarketScanner:
                     best_score, best_data, best_setup_name = candidate_signals[0]
                     best_data["symbol"] = spot_sym
 
-                    # LƯU VÀO DATABASE CHO MỌI SCORE ĐỂ BACKTEST
                     row_id = db.record_signal(best_data)
                     best_data["row_id"] = row_id
 
-                    # BỘ LỌC ĐIỂM CỨNG: CHỈ GỬI TELEGRAM KHI SCORE >= 88
                     if best_score >= MIN_SCORE_TELEGRAM:
                         batch_signals.append(best_data)
                         logger.info(f"   🎯 [KÍCH HOẠT PUSH #{spot_sym}] Thỏa mãn {best_setup_name} (Score: {best_score} >= 88)")
@@ -765,7 +751,6 @@ class MarketScanner:
             
             time.sleep(0.1)
 
-        # GỬI TIN NHẮN TỔNG HỢP TELEGRAM BATCH
         if batch_signals:
             if telegram_service.notify_batch_signals(batch_signals):
                 for sig in batch_signals:

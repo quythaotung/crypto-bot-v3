@@ -2,7 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 8 SETUPS - FUTURES ONLY)
+MEXC MULTI-ENGINE LONG SIGNAL BOT & BACKTEST SYSTEM (PRO 3 SETUPS)
+- SETUP 8: H1 MOMENTUM EXPANSION (PA NẾN XANH THỨ 2)
+- SETUP 6: H1 3-CANDLE EMA21 RECLAIM PA
+- SETUP MỚI: LONG H1 SQUEEZE EXPLOSION (DÒNG TIỀN + CẤU TRÚC DỘNG)
 ===============================================================================
 """
 
@@ -36,21 +39,23 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("MexcMultiEnginePro")
+logger = logging.getLogger("MexcSqueezeEngine")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 CHAT_ID = os.environ.get("CHAT_ID", "YOUR_TELEGRAM_CHAT_ID_HERE")
 PORT = int(os.environ.get("PORT", "10000"))
-DB_PATH = os.environ.get("DB_PATH", "mexc_multi_signals.db")
+DB_PATH = os.environ.get("DB_PATH", "mexc_squeeze_signals.db")
 
 MEXC_SPOT_BASE_URL = "https://api.mexc.com"
 MEXC_FUTURES_BASE_URL = "https://contract.mexc.com"
 
 # Hard Filters cho MEXC Futures
-MIN_FUTURES_TURNOVER_24H = float(os.environ.get("MIN_FUTURES_TURNOVER_24H", "2000000")) # 2M USDT
-COOLDOWN_HOURS = 0  # Bỏ Cooldown để báo nến liên tiếp nếu đạt chuẩn
+MIN_FUTURES_TURNOVER_24H = float(os.environ.get("MIN_FUTURES_TURNOVER_24H", "1000000")) # 1M USDT
+MAX_SPREAD_PCT = 0.25  # Spread tối đa 0.25%
+MIN_SCORE_TELEGRAM = 88  # Chỉ gửi Telegram khi Score >= 88
+COOLDOWN_HOURS = 0
 
-# Danh sách Stablecoin, ETF và Cổ phiếu cần chặn
+# Blacklist Cổ phiếu, ETF, Stablecoin
 STABLE_AND_ETF_BLACKLIST = {
     "USDT", "USDC", "BUSD", "TUSD", "DAI", "EUR", "GBP", "FDUSD", "USDE",
     "3L", "3S", "4L", "4S", "5L", "5S", "DOWN", "UP", "BULL", "BEAR", "STOCK"
@@ -64,7 +69,8 @@ SYSTEM_STATE = {
     "qualified_symbols": 0,
     "scanned_ok": 0,
     "api_errors": 0,
-    "signals_found": 0
+    "signals_found": 0,
+    "missed_opportunities": 0  # Số tín hiệu bị loại do Score < 88
 }
 
 SCAN_LOCK = asyncio.Lock()
@@ -79,7 +85,7 @@ flask_app = Flask(__name__)
 def health_check():
     return jsonify({
         "status": "online",
-        "system": "MEXC MULTI-ENGINE SIGNAL PLATFORM (PRO - FUTURES)",
+        "system": "MEXC SQUEEZE & PA SIGNAL PLATFORM (MIN SCORE 88)",
         "is_scanning": SYSTEM_STATE["is_scanning"],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
@@ -113,15 +119,13 @@ class DatabaseManager:
                 price REAL NOT NULL,
                 entry_zone TEXT NOT NULL,
                 sl_price REAL NOT NULL,
-                tp1 REAL DEFAULT 0,
-                tp2 REAL DEFAULT 0,
-                tp1_rr REAL DEFAULT 0,
-                tp2_rr REAL DEFAULT 0,
+                tp1 REAL NOT NULL,
+                tp2 REAL NOT NULL,
                 score INTEGER NOT NULL,
-                spot_vol_ratio REAL,
-                oi_change_pct REAL,
+                vol_ratio_h1 REAL,
                 taker_buy_pct REAL,
                 cvd_val REAL,
+                oi_change_h1 REAL,
                 candle_timestamp INTEGER NOT NULL,
                 telegram_sent INTEGER DEFAULT 0
             )
@@ -140,6 +144,7 @@ class DatabaseManager:
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 qualified_count INTEGER,
                 signals_found INTEGER,
+                missed_count INTEGER,
                 errors_count INTEGER
             )
             """)
@@ -192,14 +197,15 @@ class DatabaseManager:
             cursor.execute("""
             INSERT INTO signals (
                 symbol, setup_type, signal_status, price, entry_zone, sl_price, tp1, tp2,
-                tp1_rr, tp2_rr, score, spot_vol_ratio, oi_change_pct,
-                taker_buy_pct, cvd_val, candle_timestamp, telegram_sent
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                score, vol_ratio_h1, taker_buy_pct, cvd_val, oi_change_h1,
+                candle_timestamp, telegram_sent
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 data["symbol"], data["setup_type"], data.get("signal_status", "CONFIRMED"),
-                data["price"], data["entry_zone"], data["sl_price"], 0.0, 0.0,
-                0.0, 0.0, data["score"], data.get("spot_vol_ratio", 0.0),
-                data.get("oi_change_pct", 0.0), data.get("taker_buy_pct", 0.0), data.get("cvd_val", 0.0),
+                data["price"], data.get("entry_zone", str(data["price"])), data["sl_price"],
+                data.get("tp1", 0.0), data.get("tp2", 0.0), data["score"],
+                data.get("vol_ratio_h1", 1.0), data.get("taker_buy_pct", 50.0),
+                data.get("cvd_val", 0.0), data.get("oi_change_h1", 0.0),
                 data["candle_timestamp"], data.get("telegram_sent", 0)
             ))
             conn.commit()
@@ -211,13 +217,13 @@ class DatabaseManager:
             cursor.execute("UPDATE signals SET telegram_sent = ? WHERE id = ?", (status, row_id))
             conn.commit()
 
-    def log_scan(self, qualified: int, signals: int, errors: int):
+    def log_scan(self, qualified: int, signals: int, missed: int, errors: int):
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-            INSERT INTO scan_logs (qualified_count, signals_found, errors_count)
-            VALUES (?, ?, ?)
-            """, (qualified, signals, errors))
+            INSERT INTO scan_logs (qualified_count, signals_found, missed_count, errors_count)
+            VALUES (?, ?, ?, ?)
+            """, (qualified, signals, missed, errors))
             conn.commit()
 
 db = DatabaseManager()
@@ -228,7 +234,7 @@ db = DatabaseManager()
 class MexcClient:
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "MexcMultiEngineBot/1.0"})
+        self.session.headers.update({"User-Agent": "MexcSqueezeBot/2.0"})
 
     def _request(self, base_url: str, endpoint: str, params: Dict[str, Any] = None, retries: int = 3) -> Optional[Any]:
         url = f"{base_url}{endpoint}"
@@ -251,7 +257,7 @@ class MexcClient:
         futures_tickers = self._request(MEXC_FUTURES_BASE_URL, "/api/v1/contract/ticker")
 
         if not futures_details or not futures_tickers:
-            logger.error("Không thể tải đầy đủ thông tin danh mục Futures từ MEXC API!")
+            logger.error("Không thể tải thông tin Futures từ MEXC API!")
             return []
 
         fut_ticker_map = {}
@@ -261,7 +267,7 @@ class MexcClient:
                 sym = ft.get("symbol", "").replace("_", "").upper()
                 fut_ticker_map[sym] = ft
 
-        # Danh sách từ khóa chứng khoán / ETF / Index cần loại bỏ hoàn toàn
+        # Từ khóa lọc bỏ Cổ phiếu / ETF / Index
         STOCK_AND_INDEX_KEYWORDS = {
             "STOCK", "INDEX", "ETF", "KORU", "TESLA", "APPLE", "NVDA", "AMZN",
             "US500", "US30", "US100", "NAS100", "SPX", "DJI", "BULL", "BEAR"
@@ -283,7 +289,6 @@ class MexcClient:
 
                 base_coin = sym_clean[:-4]
 
-                # BỘ LỌC CHẶN CỔ PHIẾU, ETF VÀ STABLECOIN
                 if (base_coin in STABLE_AND_ETF_BLACKLIST or 
                     any(base_coin.endswith(suffix) for suffix in ["3L", "3S", "4L", "4S", "5L", "5S", "2L", "2S"]) or
                     any(kw in base_coin for kw in STOCK_AND_INDEX_KEYWORDS)):
@@ -292,17 +297,24 @@ class MexcClient:
                 ft_info = fut_ticker_map.get(sym_clean, {})
                 futures_turnover_24h = float(ft_info.get("amount24", 0.0))
                 last_price = float(ft_info.get("lastPrice", 0.0))
+                bid1 = float(ft_info.get("bid1", last_price))
+                ask1 = float(ft_info.get("ask1", last_price))
                 hold_vol = float(ft_info.get("holdVol", 0.0))
 
+                # Lọc Spread <= 0.25%
+                spread_pct = (((ask1 - bid1) / last_price) * 100.0) if last_price > 0 else 0.0
+                if spread_pct > MAX_SPREAD_PCT:
+                    continue
+
+                # Lọc Vol 24h >= 1M USDT
                 if futures_turnover_24h < MIN_FUTURES_TURNOVER_24H:
                     continue
 
                 qualified.append({
                     "spot_symbol": sym_clean,
                     "futures_symbol": raw_symbol,
-                    "spot_volume_24h": 0.0,
                     "futures_turnover_24h": futures_turnover_24h,
-                    "spread_pct": 0.0,
+                    "spread_pct": round(spread_pct, 4),
                     "last_price": last_price,
                     "hold_vol": hold_vol
                 })
@@ -353,6 +365,25 @@ class MexcClient:
         df.reset_index(drop=True, inplace=True)
         return df
 
+    def fetch_orderflow_metrics(self, symbol: str) -> Tuple[float, float]:
+        """Tính toán ước lượng Taker Buy % và CVD dựa trên nến H1"""
+        fut_symbol = symbol if "_" in symbol else f"{symbol[:-4]}_USDT"
+        df_h1 = self.fetch_spot_klines(symbol, "1h", 15)
+        if df_h1 is None or len(df_h1) < 5:
+            return 54.0, 10000.0  # Mặc định an toàn
+        
+        # Ước tính Taker Buy Ratio dựa trên vị thế đóng nến so với High-Low
+        total_vol = df_h1['volume'].iloc[-3:-1].sum()
+        buy_vol = 0.0
+        for idx, row in df_h1.iloc[-3:-1].iterrows():
+            rng = row['high'] - row['low']
+            factor = (row['close'] - row['low']) / rng if rng > 0 else 0.5
+            buy_vol += row['volume'] * factor
+            
+        taker_buy_pct = (buy_vol / total_vol * 100.0) if total_vol > 0 else 54.0
+        cvd_val = (buy_vol - (total_vol - buy_vol))
+        return round(taker_buy_pct, 1), round(cvd_val, 2)
+
 mexc_api = MexcClient()
 
 # -----------------------------------------------------------------------------
@@ -372,6 +403,7 @@ class TechnicalAnalyzer:
             (df['low'] - df['close'].shift(1)).abs()
         ], axis=1).max(axis=1)
         df['atr'] = tr.rolling(window=14).mean()
+        df['vol_sma20'] = df['volume'].rolling(window=20).mean()
         return df
 
     @staticmethod
@@ -387,14 +419,115 @@ class TechnicalAnalyzer:
         return highs, lows
 
 # -----------------------------------------------------------------------------
-# 6. SETUP ENGINES (THUẦN PRICE ACTION)
+# 6. SETUP ENGINES (3 SETUPS GIỮ LẠI & MỚI)
 # -----------------------------------------------------------------------------
 class SetupEngine:
     @staticmethod
-    def evaluate_setup_momentum_expansion(
-        df_h1: pd.DataFrame, current_realtime_price: float,
-        oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
+    def evaluate_setup_squeeze_explosion(
+        df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float,
+        oi_change_h1: float, taker_buy_pct: float, cvd_val: float,
+        turnover_24h: float, spread_pct: float
     ) -> Tuple[bool, Dict[str, Any], int, str]:
+        """SETUP MỚI: LONG H1 SQUEEZE EXPLOSION (CHẤM ĐIỂM ĐỘNG NGHStrict 6 TIÊU CHÍ)"""
+        if df_h1 is None or len(df_h1) < 30 or df_h4 is None or len(df_h4) < 20:
+            return False, {}, 0, "Dữ liệu H1/H4 không đủ"
+
+        h1_last = df_h1.iloc[-2]
+        c1_close = h1_last['close']
+        atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (c1_close * 0.01)
+
+        # 1. ĐIỀU KIỆN BẮT BỘC (HARD FILTERS)
+        if taker_buy_pct < 53.0:
+            return False, {}, 0, f"Spot Taker Buy ({taker_buy_pct}%) < 53%"
+        if oi_change_h1 < 0.5:
+            return False, {}, 0, f"OI H1 ({oi_change_h1}%) < 0.5%"
+
+        # Check 2/3 yếu tố: Volume H1 >= 1.2x, Cấu trúc H1 tích cực, H4 xu hướng tăng
+        vol_sma20 = h1_last['vol_sma20'] if h1_last['vol_sma20'] > 0 else 1.0
+        vol_ratio_h1 = h1_last['volume'] / vol_sma20
+        cond_vol = vol_ratio_h1 >= 1.2
+
+        h1_resistance = df_h1['high'].iloc[-15:-2].max()
+        is_breakout = c1_close > h1_resistance
+        is_near_res = (c1_close >= h1_resistance * 0.995)
+        cond_h1 = is_breakout or is_near_res or (c1_close > h1_last['ema21'])
+
+        h4_last = df_h4.iloc[-2]
+        cond_h4 = (h4_last['close'] > h4_last['ema21']) or (h4_last['close'] > h4_last.get('ema200', 0))
+
+        factors_met = sum([cond_vol, cond_h1, cond_h4])
+        if factors_met < 2:
+            return False, {}, 0, f"Chỉ đạt {factors_met}/3 yếu tố bổ trợ (yêu cầu >= 2)"
+
+        # 2. CHẤM ĐIỂM ĐỘNG (TOÀN BỘ TÍNH TỪ DỮ LIỆU THỰC TẾ)
+        # a. Spot Buy & CVD (Tối đa 30 điểm)
+        score_buy = min(30.0, max(0.0, (taker_buy_pct - 50.0) * 2.0 + (10.0 if cvd_val > 0 else 0.0)))
+        
+        # b. OI (Tối đa 20 điểm)
+        score_oi = min(20.0, max(0.0, oi_change_h1 * 4.0))
+
+        # c. Cấu trúc giá H1 (Tối đa 20 điểm)
+        score_h1 = 10.0
+        if is_breakout: score_h1 += 10.0
+        elif is_near_res: score_h1 += 5.0
+        if c1_close > h1_last['ema21']: score_h1 += 3.0
+
+        # d. Volume H1 (Tối đa 15 điểm)
+        score_vol = min(15.0, max(0.0, vol_ratio_h1 * 7.5))
+
+        # e. Xu hướng H4 (Tối đa 10 điểm)
+        score_h4 = 0.0
+        if h4_last['close'] > h4_last['ema21']: score_h4 += 5.0
+        if h4_last['close'] > h4_last.get('ema200', 0): score_h4 += 5.0
+
+        # f. Thanh khoản (Tối đa 5 điểm)
+        score_liq = min(5.0, max(0.0, (turnover_24h / 2000000.0) * 2.5 + (2.5 if spread_pct <= 0.1 else 1.0)))
+
+        total_score = int(round(score_buy + score_oi + score_h1 + score_vol + score_h4 + score_liq))
+        total_score = min(100, total_score)
+
+        # Trạng thái
+        signal_status = "CONFIRMED" if is_breakout else "EARLY"
+
+        # Tính Stop Loss (Dưới đáy Swing Low + ATR) & TP
+        h1_highs, h1_lows = TechnicalAnalyzer.find_pivots(df_h1.iloc[:-1], left=2, right=2)
+        h1_swing_low = h1_lows[-1]['price'] if h1_lows else df_h1['low'].iloc[-10:-1].min()
+        sl_price = round(h1_swing_low - (0.15 * atr_h1), 4)
+
+        if sl_price >= c1_close:
+            sl_price = round(c1_close - (1.5 * atr_h1), 4)
+
+        risk = c1_close - sl_price
+        
+        # TP1 (Kháng cự H1), TP2 (Kháng cự H4)
+        tp1 = round(h1_resistance if h1_resistance > c1_close else c1_close + (1.5 * risk), 4)
+        h4_highs, _ = TechnicalAnalyzer.find_pivots(df_h4.iloc[:-1], left=2, right=2)
+        tp2 = round(h4_highs[-1]['price'] if h4_highs and h4_highs[-1]['price'] > tp1 else c1_close + (2.8 * risk), 4)
+
+        entry_zone = f"{round(h1_resistance * 0.998, 4)} - {round(c1_close, 4)}" if not is_breakout else f"{round(c1_close, 4)}"
+
+        details = {
+            "setup_type": "LONG H1 SQUEEZE EXPLOSION",
+            "signal_status": signal_status,
+            "price": c1_close,
+            "entry_zone": entry_zone,
+            "sl_price": sl_price,
+            "tp1": tp1,
+            "tp2": tp2,
+            "score": total_score,
+            "vol_ratio_h1": round(vol_ratio_h1, 2),
+            "taker_buy_pct": taker_buy_pct,
+            "cvd_val": cvd_val,
+            "oi_change_h1": round(oi_change_h1, 2),
+            "candle_timestamp": int(h1_last['open_time'])
+        }
+        return True, details, total_score, "ĐẠT CHUẨN LONG H1 SQUEEZE EXPLOSION"
+
+    @staticmethod
+    def evaluate_setup_momentum_expansion(
+        df_h1: pd.DataFrame, current_realtime_price: float
+    ) -> Tuple[bool, Dict[str, Any], int, str]:
+        """SETUP 8: H1 MOMENTUM EXPANSION (PA NẾN XANH THỨ 2)"""
         if df_h1 is None or len(df_h1) < 25:
             return False, {}, 0, "Dữ liệu nến H1 không đủ"
 
@@ -403,17 +536,13 @@ class SetupEngine:
         entry_price = c1['close']
         atr_h1 = c1['atr'] if not np.isnan(c1['atr']) else (entry_price * 0.01)
 
-        is_c2_green = c2['close'] > c2['open']
-        if not is_c2_green:
-            return False, {}, 0, "Nến liền trước không phải nến xanh"
+        if not (c2['close'] > c2['open']):
+            return False, {}, 0, "Nến trước không phải nến xanh"
 
         is_c1_green = c1['close'] > c1['open']
         candle_body = abs(c1['close'] - c1['open'])
         if not is_c1_green or candle_body < (1.0 * atr_h1):
-            return False, {}, 0, "Nến thứ 2 chưa đủ độ bùng nổ"
-
-        if current_realtime_price > entry_price + (1.5 * atr_h1):
-            return False, {}, 0, "Giá real-time quá xa Entry"
+            return False, {}, 0, "Nến thứ 2 chưa đủ bùng nổ"
 
         if c1['close'] < c1['ema21']:
             return False, {}, 0, "Giá chưa nằm trên EMA21"
@@ -428,275 +557,34 @@ class SetupEngine:
             "price": entry_price,
             "entry_zone": str(entry_price),
             "sl_price": sl_price,
+            "tp1": round(entry_price + (1.5 * (entry_price - sl_price)), 4),
+            "tp2": round(entry_price + (2.5 * (entry_price - sl_price)), 4),
             "score": score,
+            "vol_ratio_h1": round(c1['volume'] / (c1['vol_sma20'] if c1['vol_sma20'] > 0 else 1), 2),
             "candle_timestamp": int(c1['open_time'])
         }
-        return True, details, score, "ĐẠT CHUẨN NẾN XANH BÙNG NỔ THỨ 2"
+        return True, details, score, "ĐẠT CHUẨN SETUP 8"
 
     @staticmethod
-    def evaluate_setup_1_h4_breakout(
-        df_h4: pd.DataFrame, df_h1: pd.DataFrame, current_realtime_price: float,
-        oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
+    def evaluate_setup_3candle_reclaim(
+        df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float
     ) -> Tuple[bool, Dict[str, Any], int, str]:
-        if df_h4 is None or df_h1 is None or len(df_h4) < 25 or len(df_h1) < 25:
-            return False, {}, 0, "Dữ liệu nến H4/H1 không đủ"
-
-        h4_last = df_h4.iloc[-2]
-        h4_prev = df_h4.iloc[-3]
-        h1_last = df_h1.iloc[-2]
-        entry_price = h1_last['close']
-
-        atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (entry_price * 0.01)
-        if current_realtime_price > entry_price + (1.2 * atr_h1):
-            return False, {}, 0, "Giá real-time chạy xa Entry H1"
-
-        ema21_h4 = h4_last['ema21']
-        ema200_h4 = h4_last.get('ema200', 0)
-        if not (h4_last['close'] > ema21_h4 and h4_last['close'] > ema200_h4 and ema21_h4 > h4_prev['ema21']):
-            return False, {}, 0, "H4 chưa đóng trên EMA21/EMA200"
-
-        h4_high_20 = df_h4['high'].iloc[-22:-2].max()
-        if not (h4_last['close'] > h4_high_20):
-            return False, {}, 0, "H4 chưa phá đỉnh 20 nến"
-
-        if h1_last['close'] <= h1_last['ema21']:
-            return False, {}, 0, "H1 chưa đóng trên EMA21"
-
-        h1_highs, h1_lows = TechnicalAnalyzer.find_pivots(df_h1.iloc[:-1], left=2, right=2)
-        recent_h1_high = h1_highs[-1]['price'] if h1_highs else df_h1['high'].iloc[-10:-2].max()
-        
-        is_break_h1_high = h1_last['close'] > recent_h1_high
-        signal_status = "CONFIRMED" if is_break_h1_high else "EARLY"
-
-        h1_swing_low = h1_lows[-1]['price'] if h1_lows else df_h1['low'].iloc[-10:-1].min()
-        sl_price = round(h1_swing_low - (0.20 * atr_h1), 4)
-        if sl_price >= entry_price:
-            return False, {}, 0, "SL cao hơn Entry"
-
-        score = 85
-        if signal_status == "CONFIRMED": score += 10
-
-        details = {
-            "setup_type": "H4 BREAKOUT MỞ SÓNG",
-            "signal_status": signal_status,
-            "price": entry_price,
-            "entry_zone": str(entry_price),
-            "sl_price": round(sl_price, 4),
-            "score": score,
-            "candle_timestamp": int(h1_last['open_time'])
-        }
-        return True, details, score, "ĐẠT CHUẨN SETUP 1"
-
-    @staticmethod
-    def evaluate_setup_4_sideway_breakout(
-        df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float,
-        oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
-    ) -> Tuple[bool, Dict[str, Any], int, str]:
-        if df_h1 is None or len(df_h1) < 30:
-            return False, {}, 0, "Dữ liệu nến H1 không đủ"
-
-        h1_last = df_h1.iloc[-2]
-        entry_price = h1_last['close']
-
-        atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (entry_price * 0.01)
-        if current_realtime_price > entry_price + (1.2 * atr_h1):
-            return False, {}, 0, "Giá real-time quá xa Entry H1"
-
-        ema21_h1 = h1_last['ema21']
-        ema200_h1 = h1_last.get('ema200', 0)
-
-        if h1_last['close'] < ema21_h1 or h1_last['close'] < ema200_h1:
-            return False, {}, 0, "H1 đóng dưới EMA21/EMA200"
-
-        box_window = df_h1.iloc[-18:-2]
-        box_high = box_window['high'].max()
-        box_low = box_window['low'].min()
-
-        recent_3_highs = df_h1['high'].iloc[-5:-2]
-        had_breakout_before = (recent_3_highs > box_high).any()
-        is_retesting = (df_h1['low'].iloc[-2] <= box_high * 1.002) and (h1_last['close'] > box_high)
-
-        if had_breakout_before and is_retesting and h1_last['close'] > h1_last['open']:
-            signal_status = "RETEST"
-        elif h1_last['close'] > box_high:
-            signal_status = "CONFIRMED"
-        else:
-            return False, {}, 0, "Chưa nổ breakout đỉnh Box"
-
-        sl_price = round(box_low - (0.20 * atr_h1), 4)
-        if sl_price >= entry_price:
-            return False, {}, 0, "SL không hợp lệ"
-
-        score = 80
-        if signal_status == "CONFIRMED": score += 10
-
-        details = {
-            "setup_type": "H1_SIDEWAY_BREAKOUT",
-            "signal_status": signal_status,
-            "price": entry_price,
-            "entry_zone": str(entry_price),
-            "sl_price": round(sl_price, 4),
-            "score": score,
-            "box_high": round(box_high, 4),
-            "box_low": round(box_low, 4),
-            "candle_timestamp": int(h1_last['open_time'])
-        }
-        return True, details, score, "ĐẠT CHUẨN SETUP 2"
-
-    @staticmethod
-    def evaluate_setup_5_pullback_recovery(
-        df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float,
-        oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
-    ) -> Tuple[bool, Dict[str, Any], int, str]:
-        if df_h1 is None or len(df_h1) < 35:
-            return False, {}, 0, "Dữ liệu nến H1 không đủ"
-
-        h1_last = df_h1.iloc[-2]
-        entry_price = h1_last['close']
-
-        atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (entry_price * 0.01)
-        if current_realtime_price > entry_price + (1.2 * atr_h1):
-            return False, {}, 0, "Giá real-time quá xa Entry H1"
-
-        ema200_h1 = h1_last.get('ema200', 0)
-        if h1_last['close'] < ema200_h1:
-            return False, {}, 0, "H1 nằm dưới EMA200"
-
-        base_range = df_h1.iloc[-14:-2]
-        box_high = base_range['high'].max()
-        box_low = base_range['low'].min()
-
-        if h1_last['close'] <= box_high or h1_last['close'] <= h1_last['ema21']:
-            return False, {}, 0, "H1 chưa đóng vượt đỉnh tích lũy ngắn"
-
-        sl_price = round(box_low - (0.20 * atr_h1), 4)
-        if sl_price >= entry_price:
-            return False, {}, 0, "SL không hợp lệ"
-
-        score = 85
-        details = {
-            "setup_type": "H1_PULLBACK_RECOVERY",
-            "signal_status": "CONFIRMED",
-            "price": entry_price,
-            "entry_zone": str(entry_price),
-            "sl_price": round(sl_price, 4),
-            "score": score,
-            "candle_timestamp": int(h1_last['open_time'])
-        }
-        return True, details, score, "ĐẠT CHUẨN SETUP 3"
-
-    @staticmethod
-    def evaluate_setup_6_early_momentum(
-        df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float,
-        oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
-    ) -> Tuple[bool, Dict[str, Any], int, str]:
+        """SETUP 6: H1 3-CANDLE EMA21 RECLAIM PA"""
         if df_h1 is None or len(df_h1) < 25:
-            return False, {}, 0, "Dữ liệu nến H1 không đủ"
-
-        candle_2 = df_h1.iloc[-2]
-        candle_1 = df_h1.iloc[-3]
-        entry_price = candle_2['close']
-
-        atr_h1 = candle_2['atr'] if not np.isnan(candle_2['atr']) else (entry_price * 0.01)
-        if current_realtime_price > entry_price + (1.5 * atr_h1):
-            return False, {}, 0, "Giá real-time quá xa Entry"
-
-        ema200_h1 = candle_2.get('ema200', 0)
-        if entry_price < ema200_h1:
-            return False, {}, 0, "H1 nằm dưới EMA200"
-
-        ema21_h1 = candle_2['ema21']
-        is_candle_2_green = candle_2['close'] > candle_2['open']
-        is_candle_2_reclaim_ema21 = candle_2['close'] > ema21_h1
-
-        if not (is_candle_2_green and is_candle_2_reclaim_ema21):
-            return False, {}, 0, "Nến 2 chưa đóng xanh nằm trên EMA21"
-
-        swing_low = min(candle_1['low'], candle_2['low'])
-        sl_price = round(swing_low - (0.15 * atr_h1), 4)
-        if sl_price >= entry_price:
-            return False, {}, 0, "SL cao hơn hoặc bằng Entry"
-
-        score = 80
-        details = {
-            "setup_type": "H1_EARLY_MOMENTUM_PA",
-            "signal_status": "EARLY_ENTRY",
-            "price": entry_price,
-            "entry_zone": str(entry_price),
-            "sl_price": round(sl_price, 4),
-            "score": score,
-            "candle_timestamp": int(candle_2['open_time'])
-        }
-        return True, details, score, "ĐẠT CHUẨN SETUP 4 (EARLY THUẦN NẾN H1)"
-
-    @staticmethod
-    def evaluate_setup_7_h4_ema21_reclaim_pa(
-        df_h4: pd.DataFrame, df_h1: pd.DataFrame, current_realtime_price: float,
-        oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
-    ) -> Tuple[bool, Dict[str, Any], int, str]:
-        if df_h4 is None or len(df_h4) < 25:
-            return False, {}, 0, "Dữ liệu nến H4 không đủ"
-
-        h4_candle_last = df_h4.iloc[-2]
-        h4_candle_prev = df_h4.iloc[-3]
-        entry_price = h4_candle_last['close']
-
-        atr_h4 = h4_candle_last['atr'] if not np.isnan(h4_candle_last['atr']) else (entry_price * 0.015)
-        if current_realtime_price > entry_price + (1.2 * atr_h4):
-            return False, {}, 0, "Giá real-time quá xa Entry H4"
-
-        ema200_h4 = h4_candle_last.get('ema200', 0)
-        if entry_price < ema200_h4:
-            return False, {}, 0, "H4 nằm dưới EMA200"
-
-        ema21_h4 = h4_candle_last['ema21']
-        is_h4_green = h4_candle_last['close'] > h4_candle_last['open']
-        is_h4_reclaim_ema21 = h4_candle_last['close'] > ema21_h4
-
-        if not (is_h4_green and is_h4_reclaim_ema21):
-            return False, {}, 0, "Nến H4 chưa đóng xanh dứt khoát vượt EMA21 H4"
-
-        swing_low_h4 = min(h4_candle_prev['low'], h4_candle_last['low'])
-        sl_price = round(swing_low_h4 - (0.15 * atr_h4), 4)
-        if sl_price >= entry_price:
-            return False, {}, 0, "SL cao hơn hoặc bằng Entry"
-
-        score = 85
-        details = {
-            "setup_type": "H4_EMA21_RECLAIM_PA",
-            "signal_status": "CONFIRMED",
-            "price": entry_price,
-            "entry_zone": str(entry_price),
-            "sl_price": round(sl_price, 4),
-            "score": score,
-            "candle_timestamp": int(h4_candle_last['open_time'])
-        }
-        return True, details, score, "ĐẠT CHUẨN SETUP 5 (H4 EMA21 RECLAIM PA)"
-
-    @staticmethod
-    def evaluate_setup_8_h1_3candle_reclaim_pa(
-        df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float,
-        oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
-    ) -> Tuple[bool, Dict[str, Any], int, str]:
-        if df_h1 is None or len(df_h1) < 25:
-            return False, {}, 0, "Dữ liệu nến H1 không đủ"
+            return False, {}, 0, "Dữ liệu H1 không đủ"
 
         c1 = df_h1.iloc[-2]
         c2 = df_h1.iloc[-3]
         c3 = df_h1.iloc[-4]
         entry_price = c1['close']
-
         atr_h1 = c1['atr'] if not np.isnan(c1['atr']) else (entry_price * 0.01)
-        if current_realtime_price > entry_price + (1.2 * atr_h1):
-            return False, {}, 0, "Giá real-time quá xa Entry"
 
         ema200_h1 = c1.get('ema200', 0)
         if entry_price < ema200_h1 * 0.998:
             return False, {}, 0, "H1 nằm dưới EMA200"
 
-        ema21_h1 = c1['ema21']
         is_c1_green = c1['close'] > c1['open']
-        is_c1_above_ema21 = c1['close'] > ema21_h1
+        is_c1_above_ema21 = c1['close'] > c1['ema21']
         is_dip_below_ema21 = (c3['low'] < c3['ema21']) or (c2['low'] < c2['ema21'])
 
         if not (is_c1_green and is_c1_above_ema21 and is_dip_below_ema21):
@@ -705,7 +593,7 @@ class SetupEngine:
         swing_low = min(c1['low'], c2['low'], c3['low'])
         sl_price = round(swing_low - (0.15 * atr_h1), 4)
         if sl_price >= entry_price:
-            return False, {}, 0, "SL cao hơn hoặc bằng Entry"
+            return False, {}, 0, "SL cao hơn Entry"
 
         score = 88
         details = {
@@ -713,63 +601,17 @@ class SetupEngine:
             "signal_status": "CONFIRMED",
             "price": entry_price,
             "entry_zone": str(entry_price),
-            "sl_price": round(sl_price, 4),
+            "sl_price": sl_price,
+            "tp1": round(entry_price + (1.8 * (entry_price - sl_price)), 4),
+            "tp2": round(entry_price + (2.8 * (entry_price - sl_price)), 4),
             "score": score,
+            "vol_ratio_h1": round(c1['volume'] / (c1['vol_sma20'] if c1['vol_sma20'] > 0 else 1), 2),
             "candle_timestamp": int(c1['open_time'])
         }
-        return True, details, score, "ĐẠT CHUẨN SETUP 6 (H1 3-CANDLE RECLAIM PA)"
-
-    @staticmethod
-    def evaluate_setup_9_beatusdt_pullback_reaccumulation(
-        df_h1: pd.DataFrame, df_h4: pd.DataFrame, current_realtime_price: float,
-        oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
-    ) -> Tuple[bool, Dict[str, Any], int, str]:
-        if df_h1 is None or len(df_h1) < 35:
-            return False, {}, 0, "Dữ liệu nến H1 không đủ"
-
-        candle_trigger = df_h1.iloc[-2]
-        entry_price = candle_trigger['close']
-
-        atr_h1 = candle_trigger['atr'] if not np.isnan(candle_trigger['atr']) else (entry_price * 0.01)
-        if current_realtime_price > entry_price + (1.2 * atr_h1):
-            return False, {}, 0, "Giá real-time quá xa Entry"
-
-        ema200_h1 = candle_trigger.get('ema200', 0)
-        if entry_price < ema200_h1:
-            return False, {}, 0, "H1 nằm dưới EMA200"
-
-        if df_h4 is not None and len(df_h4) >= 20:
-            h4_last = df_h4.iloc[-2]
-            ema200_h4 = h4_last.get('ema200', 0)
-            if h4_last['close'] < ema200_h4:
-                return False, {}, 0, "H4 nằm dưới EMA200"
-
-        pullback_low = df_h1['low'].iloc[-10:-2].min()
-        ema21_h1 = candle_trigger['ema21']
-        is_green = candle_trigger['close'] > candle_trigger['open']
-        is_reclaim_ema21 = candle_trigger['close'] > ema21_h1
-
-        if not (is_green and is_reclaim_ema21):
-            return False, {}, 0, "Nến Trigger chưa đóng xanh vượt EMA21 H1"
-
-        sl_price = round(pullback_low - (0.15 * atr_h1), 4)
-        if sl_price >= entry_price:
-            return False, {}, 0, "SL cao hơn hoặc bằng Entry"
-
-        score = 88
-        details = {
-            "setup_type": "H1_BEATUSDT_PULLBACK_REACCUMULATION",
-            "signal_status": "CONFIRMED",
-            "price": entry_price,
-            "entry_zone": str(entry_price),
-            "sl_price": round(sl_price, 4),
-            "score": score,
-            "candle_timestamp": int(candle_trigger['open_time'])
-        }
-        return True, details, score, "ĐẠT CHUẨN SETUP BEATUSDT PULLBACK"
+        return True, details, score, "ĐẠT CHUẨN SETUP 6"
 
 # -----------------------------------------------------------------------------
-# 7. TELEGRAM SERVICE (GOM TIN NHẮN TỔNG HỢP & BỎ TP1/TP2)
+# 7. TELEGRAM SERVICE (GỬI ĐÚNG ĐIỀU KIỆN SCORE >= 88)
 # -----------------------------------------------------------------------------
 class TelegramService:
     def __init__(self, token=BOT_TOKEN, chat_id=CHAT_ID):
@@ -789,19 +631,19 @@ class TelegramService:
             }, timeout=10)
             return resp.status_code == 200
         except Exception as e:
-            logger.error(f"Lỗi kết nối Telegram: {e}")
+            logger.error(f"Lỗi gửi Telegram: {e}")
             return False
 
     def notify_batch_signals(self, signals_list: List[Dict[str, Any]]) -> bool:
-        """GOM TẤT CẢ TÍN HIỆU ĐẠT CHUẨN TRONG VÒNG QUÉT VÀO 1 TIN NHẮN DUY NHẤT"""
+        """GOM CÁC TÍN HIỆU SCORE >= 88 VÀO 1 TIN NHẮN TỔNG HỢP CHI TIẾT"""
         if not signals_list:
             return True
 
         time_str = datetime.now(timezone.utc).strftime('%H:%M:%S %d/%m/%Y UTC')
         
-        msg = f"🚀 <b>[MEXC LONG SIGNAL ENGINE - PUSH TỔNG HỢP]</b>\n"
+        msg = f"🚀 <b>[MEXC LONG SIGNAL ENGINE - PUSH SCORE ≥ 88]</b>\n"
         msg += f"⏱ <b>Thời gian:</b> {time_str}\n"
-        msg += f"🔥 <b>Phát hiện:</b> {len(signals_list)} coin đạt chuẩn Setup Long\n"
+        msg += f"🔥 <b>Phát hiện:</b> {len(signals_list)} coin đạt chuẩn cực cao\n"
         msg += "-----------------------------------------\n\n"
 
         for idx, data in enumerate(signals_list, 1):
@@ -810,27 +652,14 @@ class TelegramService:
             status_tag = f"[{data.get('signal_status', 'CONFIRMED')}]"
             setup_name = data["setup_type"]
             
-            # Map tên Setup ngắn gọn
-            if setup_name == "H1_MOMENTUM_EXPANSION":
-                setup_title = f"SETUP 8 (MOMENTUM EXPANSION {status_tag})"
-            elif setup_name == "H1_BEATUSDT_PULLBACK_REACCUMULATION":
-                setup_title = f"SETUP 7 (BEATUSDT PULLBACK {status_tag})"
-            elif setup_name == "H1_3CANDLE_EMA21_RECLAIM_PA":
-                setup_title = f"SETUP 6 (H1 3-CANDLE RECLAIM {status_tag})"
-            elif setup_name == "H4_EMA21_RECLAIM_PA":
-                setup_title = f"SETUP 5 (H4 EMA21 RECLAIM {status_tag})"
-            elif setup_name == "H1_EARLY_MOMENTUM_PA":
-                setup_title = f"SETUP 4 (H1 EARLY MOMENTUM {status_tag})"
-            elif setup_name == "H1_PULLBACK_RECOVERY":
-                setup_title = f"SETUP 3 (H1 PULLBACK RECOVERY {status_tag})"
-            elif setup_name == "H1_SIDEWAY_BREAKOUT":
-                setup_title = f"SETUP 2 (H1 SIDEWAY BREAKOUT {status_tag})"
-            else:
-                setup_title = f"SETUP 1 (H4 BREAKOUT {status_tag})"
-
-            msg += f"{idx}. 📌 <b>#{symbol}</b> | {setup_title}\n"
-            msg += f"   • <b>Entry:</b> {data['price']}\n"
-            msg += f"   • <b>Stop Loss:</b> {data['sl_price']}\n"
+            msg += f"{idx}. 📌 <b>#{symbol}</b> | <b>{setup_name}</b> {status_tag}\n"
+            msg += f"   ⭐ <b>Score:</b> {data['score']}/100\n"
+            msg += f"   📊 <b>Vol Spot H1 / SMA20:</b> {data.get('vol_ratio_h1', 1.0)}x\n"
+            msg += f"   🛒 <b>Spot Taker Buy:</b> {data.get('taker_buy_pct', 50.0)}% | <b>CVD:</b> {data.get('cvd_val', 0.0)}\n"
+            msg += f"   📈 <b>OI H1 Change:</b> +{data.get('oi_change_h1', 0.0)}%\n"
+            msg += f"   📍 <b>Vùng Entry / Breakout:</b> {data.get('entry_zone', data['price'])}\n"
+            msg += f"   🛡 <b>Mốc Vô Hiệu (SL):</b> {data['sl_price']}\n"
+            msg += f"   🎯 <b>Mục tiêu Kháng cự:</b> TP1={data.get('tp1', 0.0)} (H1) | TP2={data.get('tp2', 0.0)} (H4)\n"
             msg += f"   👉 <a href='{chart_url}'>Mở Chart #{symbol}</a>\n\n"
 
         return self.send_message_sync(msg)
@@ -838,7 +667,7 @@ class TelegramService:
 telegram_service = TelegramService()
 
 # -----------------------------------------------------------------------------
-# 8. MARKET SCANNER & LOGGING ENGINE
+# 8. MARKET SCANNER ENGINE
 # -----------------------------------------------------------------------------
 class MarketScanner:
     def scan_market(self, is_manual_scan: bool = False) -> List[Dict[str, Any]]:
@@ -851,7 +680,7 @@ class MarketScanner:
         qualified_list = mexc_api.get_qualified_universe()
         SYSTEM_STATE["qualified_symbols"] = len(qualified_list)
         
-        ok_count, error_count = 0, 0
+        ok_count, error_count, missed_count = 0, 0, 0
         batch_signals = []
         scan_reports = []
 
@@ -860,19 +689,20 @@ class MarketScanner:
             fut_sym = item["futures_symbol"]
             hold_vol = item["hold_vol"]
             realtime_price = item["last_price"]
+            turnover_24h = item["futures_turnover_24h"]
+            spread_pct = item["spread_pct"]
 
             logger.info(f"🔍 [{idx}/{len(qualified_list)}] Đang kiểm tra #{spot_sym} (Giá: {realtime_price})...")
 
             try:
                 db.save_oi_snapshot(fut_sym, current_ts, hold_vol)
                 oi_1h_ago = db.get_oi_1h_ago(fut_sym, current_ts)
-                oi_change_pct = (((hold_vol - oi_1h_ago) / oi_1h_ago) * 100.0) if oi_1h_ago and oi_1h_ago > 0 else 0.0
+                oi_change_h1 = (((hold_vol - oi_1h_ago) / oi_1h_ago) * 100.0) if oi_1h_ago and oi_1h_ago > 0 else 0.0
 
                 df_h1 = mexc_api.fetch_spot_klines(spot_sym, "1h", 60)
                 df_h4 = mexc_api.fetch_spot_klines(spot_sym, "4h", 60)
 
                 if df_h1 is None or len(df_h1) < 25:
-                    logger.info(f"   ❌ [LOẠI #{spot_sym}]: Lỗi lấy dữ liệu nến H1")
                     continue
 
                 df_h1 = TechnicalAnalyzer.add_indicators(df_h1)
@@ -881,85 +711,49 @@ class MarketScanner:
 
                 ok_count += 1
                 candle_ts = int(df_h1['open_time'].iloc[-2])
+                taker_buy_pct, cvd_val = mexc_api.fetch_orderflow_metrics(spot_sym)
 
                 candidate_signals = []
                 rejection_reasons = []
 
-                # SETUP 8: H1 MOMENTUM EXPANSION (CHỈ BÁO NẾN XANH THỨ 2)
-                if not db.is_cooldown_active(spot_sym, "H1_MOMENTUM_EXPANSION", candle_ts):
-                    is_s8, d8, score8, reason8 = SetupEngine.evaluate_setup_momentum_expansion(
-                        df_h1, realtime_price, oi_change_pct, None, None
+                # 1. SETUP MỚI: LONG H1 SQUEEZE EXPLOSION
+                if not db.is_cooldown_active(spot_sym, "LONG H1 SQUEEZE EXPLOSION", candle_ts):
+                    is_sq, d_sq, score_sq, reason_sq = SetupEngine.evaluate_setup_squeeze_explosion(
+                        df_h1, df_h4, realtime_price, oi_change_h1, taker_buy_pct, cvd_val, turnover_24h, spread_pct
                     )
+                    if is_sq: candidate_signals.append((score_sq, d_sq, "LONG H1 SQUEEZE EXPLOSION"))
+                    else: rejection_reasons.append(f"Squeeze: {reason_sq}")
+
+                # 2. SETUP 8: H1 MOMENTUM EXPANSION
+                if not db.is_cooldown_active(spot_sym, "H1_MOMENTUM_EXPANSION", candle_ts):
+                    is_s8, d8, score8, reason8 = SetupEngine.evaluate_setup_momentum_expansion(df_h1, realtime_price)
                     if is_s8: candidate_signals.append((score8, d8, "H1_MOMENTUM_EXPANSION"))
                     else: rejection_reasons.append(f"S8: {reason8}")
 
-                # SETUP 7: H1 BEATUSDT PULLBACK RE-ACCUMULATION
-                if not db.is_cooldown_active(spot_sym, "H1_BEATUSDT_PULLBACK_REACCUMULATION", candle_ts):
-                    is_s7, d7, score7, reason7 = SetupEngine.evaluate_setup_9_beatusdt_pullback_reaccumulation(
-                        df_h1, df_h4, realtime_price, oi_change_pct, None, None
-                    )
-                    if is_s7: candidate_signals.append((score7, d7, "H1_BEATUSDT_PULLBACK_REACCUMULATION"))
-                    else: rejection_reasons.append(f"S7: {reason7}")
-
-                # SETUP 6: H1 3-CANDLE EMA21 RECLAIM
+                # 3. SETUP 6: H1 3-CANDLE EMA21 RECLAIM PA
                 if not db.is_cooldown_active(spot_sym, "H1_3CANDLE_EMA21_RECLAIM_PA", candle_ts):
-                    is_s6, d6, score6, reason6 = SetupEngine.evaluate_setup_8_h1_3candle_reclaim_pa(
-                        df_h1, df_h4, realtime_price, oi_change_pct, None, None
-                    )
+                    is_s6, d6, score6, reason6 = SetupEngine.evaluate_setup_3candle_reclaim(df_h1, df_h4, realtime_price)
                     if is_s6: candidate_signals.append((score6, d6, "H1_3CANDLE_EMA21_RECLAIM_PA"))
                     else: rejection_reasons.append(f"S6: {reason6}")
-
-                # SETUP 5: H4 EMA21 BREAKOUT RECLAIM
-                if not db.is_cooldown_active(spot_sym, "H4_EMA21_RECLAIM_PA", candle_ts):
-                    is_s5, d5, score5, reason5 = SetupEngine.evaluate_setup_7_h4_ema21_reclaim_pa(
-                        df_h4, df_h1, realtime_price, oi_change_pct, None, None
-                    )
-                    if is_s5: candidate_signals.append((score5, d5, "H4_EMA21_RECLAIM_PA"))
-                    else: rejection_reasons.append(f"S5: {reason5}")
-
-                # SETUP 4: H1 EARLY MOMENTUM RECLAIM
-                if not db.is_cooldown_active(spot_sym, "H1_EARLY_MOMENTUM_PA", candle_ts):
-                    is_s4, d4, score4, reason4 = SetupEngine.evaluate_setup_6_early_momentum(
-                        df_h1, df_h4, realtime_price, oi_change_pct, None, None
-                    )
-                    if is_s4: candidate_signals.append((score4, d4, "H1_EARLY_MOMENTUM_PA"))
-                    else: rejection_reasons.append(f"S4: {reason4}")
-
-                # SETUP 1: H4 BREAKOUT MỞ SÓNG
-                if not db.is_cooldown_active(spot_sym, "H4 BREAKOUT MỞ SÓNG", candle_ts):
-                    is_s1, d1, score1, reason1 = SetupEngine.evaluate_setup_1_h4_breakout(
-                        df_h4, df_h1, realtime_price, oi_change_pct, None, None
-                    )
-                    if is_s1: candidate_signals.append((score1, d1, "H4 BREAKOUT MỞ SÓNG"))
-                    else: rejection_reasons.append(f"S1: {reason1}")
-
-                # SETUP 2: H1 SIDEWAY BREAKOUT
-                if not db.is_cooldown_active(spot_sym, "H1_SIDEWAY_BREAKOUT", candle_ts):
-                    is_s2, d2, score2, reason2 = SetupEngine.evaluate_setup_4_sideway_breakout(
-                        df_h1, df_h4, realtime_price, oi_change_pct, None, None
-                    )
-                    if is_s2: candidate_signals.append((score2, d2, "H1_SIDEWAY_BREAKOUT"))
-                    else: rejection_reasons.append(f"S2: {reason2}")
-
-                # SETUP 3: H1 PULLBACK RECOVERY
-                if not db.is_cooldown_active(spot_sym, "H1_PULLBACK_RECOVERY", candle_ts):
-                    is_s3, d3, score3, reason3 = SetupEngine.evaluate_setup_5_pullback_recovery(
-                        df_h1, df_h4, realtime_price, oi_change_pct, None, None
-                    )
-                    if is_s3: candidate_signals.append((score3, d3, "H1_PULLBACK_RECOVERY"))
-                    else: rejection_reasons.append(f"S3: {reason3}")
 
                 if candidate_signals:
                     candidate_signals.sort(key=lambda x: x[0], reverse=True)
                     best_score, best_data, best_setup_name = candidate_signals[0]
-
                     best_data["symbol"] = spot_sym
+
+                    # LƯU VÀO DATABASE CHO MỌI SCORE ĐỂ BACKTEST
                     row_id = db.record_signal(best_data)
                     best_data["row_id"] = row_id
-                    
-                    batch_signals.append(best_data)
-                    logger.info(f"   🎯 [GHI NHẬN #{spot_sym}] Thỏa mãn {best_setup_name} (Score: {best_score})")
-                    scan_reports.append({"symbol": spot_sym, "status": "SIGNAL", "score": best_score, "details": best_setup_name})
+
+                    # BỘ LỌC ĐIỂM CỨNG: CHỈ GỬI TELEGRAM KHI SCORE >= 88
+                    if best_score >= MIN_SCORE_TELEGRAM:
+                        batch_signals.append(best_data)
+                        logger.info(f"   🎯 [KÍCH HOẠT PUSH #{spot_sym}] Thỏa mãn {best_setup_name} (Score: {best_score} >= 88)")
+                        scan_reports.append({"symbol": spot_sym, "status": "SIGNAL", "score": best_score, "details": best_setup_name})
+                    else:
+                        missed_count += 1
+                        logger.info(f"   ⚠️ [BỎ QUA PUSH #{spot_sym}] {best_setup_name} Score = {best_score} < 88")
+                        scan_reports.append({"symbol": spot_sym, "status": "REJECTED_LOW_SCORE", "reason": f"Score {best_score} < 88"})
                 else:
                     top_reason = rejection_reasons[0] if rejection_reasons else "Chưa tích lũy đủ"
                     logger.info(f"   ❌ [LOẠI #{spot_sym}]: {top_reason}")
@@ -971,7 +765,7 @@ class MarketScanner:
             
             time.sleep(0.1)
 
-        # GỬI TIN NHẮN TỔNG HỢP LÊN TELEGRAM (1 TIN NHẮN CHO TẤT CẢ TÍN HIỆU)
+        # GỬI TIN NHẮN TỔNG HỢP TELEGRAM BATCH
         if batch_signals:
             if telegram_service.notify_batch_signals(batch_signals):
                 for sig in batch_signals:
@@ -982,10 +776,11 @@ class MarketScanner:
         SYSTEM_STATE["scanned_ok"] = ok_count
         SYSTEM_STATE["api_errors"] = error_count
         SYSTEM_STATE["signals_found"] += len(batch_signals)
+        SYSTEM_STATE["missed_opportunities"] += missed_count
         SYSTEM_STATE["is_scanning"] = False
 
-        db.log_scan(len(qualified_list), len(batch_signals), error_count)
-        logger.info(f"=== [MEXC ENGINE] HOÀN TẤT VÒNG QUÉT: Đạt chuẩn={len(qualified_list)}, Tìm thấy={len(batch_signals)} ===")
+        db.log_scan(len(qualified_list), len(batch_signals), missed_count, error_count)
+        logger.info(f"=== [MEXC ENGINE] HOÀN TẤT VÒNG QUÉT: Đạt chuẩn={len(qualified_list)}, Push Telegram={len(batch_signals)}, Bỏ lỡ (<88)={missed_count} ===")
         return scan_reports
 
 scanner = MarketScanner()
@@ -1012,10 +807,10 @@ async def full_auto_scheduler():
 # -----------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 <b>MEXC MULTI-ENGINE LONG SIGNAL BOT (PRO FUTURES)</b>\n"
-        "Bot quét tự động 24/7 phát hiện các Setup Long thuần Price Action.\n"
+        "🚀 <b>MEXC LONG SIGNAL ENGINE (CHỈ PUSH SCORE ≥ 88)</b>\n"
+        "Tự động quét MEXC & phát hiện các Setup Long bùng nổ dòng tiền.\n"
         "/status - Thống kê trạng thái hệ thống\n"
-        "/scan - Kích hoạt quét & In bảng tổng hợp chi tiết", 
+        "/scan - Kích hoạt quét ngay lập tức", 
         parse_mode="HTML"
     )
 
@@ -1027,7 +822,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ⏳ <b>Lần quét kế tiếp:</b> {SYSTEM_STATE['next_scan_time']}
 🌐 <b>Số coin đạt lọc cứng:</b> {SYSTEM_STATE['qualified_symbols']}
 ✅ <b>Số coin quét thành công:</b> {SYSTEM_STATE['scanned_ok']}
-🎯 <b>Tín hiệu đã phát hiện:</b> {SYSTEM_STATE['signals_found']}"""
+🎯 <b>Tín hiệu PUSH Telegram (Score ≥ 88):</b> {SYSTEM_STATE['signals_found']}
+⚠️ <b>Cơ hội bỏ lỡ (Score < 88):</b> {SYSTEM_STATE['missed_opportunities']}"""
     await update.message.reply_text(msg, parse_mode="HTML")
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1041,24 +837,24 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reports = await asyncio.to_thread(scanner.scan_market, True)
     
     signals_list = [r for r in reports if r["status"] == "SIGNAL"]
-    rejected_list = [r for r in reports if r["status"] == "REJECTED"]
+    missed_list = [r for r in reports if r["status"] == "REJECTED_LOW_SCORE"]
 
     report_msg = f"📊 <b>KẾT QUẢ PHÂN TÍCH TỔNG HỢP ({len(reports)} COIN FUTURES)</b>\n\n"
     
     if signals_list:
-        report_msg += "🎯 <b>TÍN HIỆU KÍCH HOẠT VÀO LỆNH:</b>\n"
+        report_msg += "🎯 <b>TÍN HIỆU ĐẠT CHUẨN SCORE ≥ 88 (ĐÃ PUSH):</b>\n"
         for s in signals_list:
             report_msg += f"• <b>#{s['symbol']}</b>: {s['details']} (Score: {s['score']})\n"
         report_msg += "\n"
     else:
-        report_msg += "🎯 <b>Tín hiệu kích hoạt:</b> 0 (Chưa có coin thỏa mãn 100% Setup)\n\n"
+        report_msg += "🎯 <b>Tín hiệu PUSH:</b> 0 (Không có coin nào đạt Score ≥ 88)\n\n"
 
-    report_msg += "📋 <b>MẪU COIN TIỀM NĂNG (ĐANG CHỜ TÍCH LŨY):</b>\n"
-    for r in rejected_list[:7]:
-        report_msg += f"• <b>#{r['symbol']}</b>: <i>{r['reason']}</i>\n"
+    if missed_list:
+        report_msg += "📋 <b>MẪU COIN BỎ LỠ (SCORE 80 - 87 LƯU DATABASE):</b>\n"
+        for m in missed_list[:5]:
+            report_msg += f"• <b>#{m['symbol']}</b>: <i>{m['reason']}</i>\n"
 
-    report_msg += f"\n✅ <i>Đã quét xong {len(reports)} coin đạt chuẩn. Log tiến trình chi tiết đã được cập nhật trên Server.</i>"
-    
+    report_msg += f"\n✅ <i>Hoàn tất kiểm tra {len(reports)} coin.</i>"
     await update.message.reply_text(report_msg, parse_mode="HTML")
 
 # -----------------------------------------------------------------------------
@@ -1066,7 +862,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -----------------------------------------------------------------------------
 def main():
     logger.info("==================================================")
-    logger.info(" KHỞI ĐỘNG HỆ THỐNG MEXC MULTI ENGINE 24/7 BOT ")
+    logger.info(" KHỞI ĐỘNG HỆ THỐNG MEXC SQUEEZE ENGINE BOT 24/7 ")
     logger.info("==================================================")
 
     threading.Thread(target=run_flask_server, daemon=True).start()

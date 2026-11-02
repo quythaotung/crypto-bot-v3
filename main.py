@@ -9,7 +9,7 @@ SETUP 3 – H1 PULLBACK RECOVERY LONG (Thuần PA H1)
 SETUP 4 – H1 EARLY MOMENTUM RECLAIM (Thuần PA H1)
 SETUP 5 – H4 EMA21 BREAKOUT RECLAIM (Thuần PA H4 - BẮT BỘC H4 > EMA200)
 SETUP 6 – H1 3-CANDLE EMA21 RECLAIM (Thuần PA H1)
-SETUP 7 – H1 BEATUSDT PULLBACK RE-ACCUMULATION (Thuần PA H1 - BẮT BỘC CẢ H1 VÀ H4 > EMA200)
+SETUP 7 – H1 BEATUSDT PULLBACK RE-ACCUMULATION (Thuần PA - BẮT BỘC H1 & H4 > EMA200)
 SETUP 8 – H1 MOMENTUM EXPANSION (Chỉ bắt nến xanh thứ 2 - Thuần PA, Không Check Vol)
 ===============================================================================
 """
@@ -58,9 +58,10 @@ MEXC_FUTURES_BASE_URL = "https://contract.mexc.com"
 MIN_FUTURES_TURNOVER_24H = float(os.environ.get("MIN_FUTURES_TURNOVER_24H", "2000000")) # 2M USDT
 COOLDOWN_HOURS = 0  # Bỏ Cooldown để báo nến liên tiếp nếu đạt chuẩn
 
+# Danh sách Stablecoin, ETF và Cổ phiếu cần chặn
 STABLE_AND_ETF_BLACKLIST = {
     "USDT", "USDC", "BUSD", "TUSD", "DAI", "EUR", "GBP", "FDUSD", "USDE",
-    "3L", "3S", "4L", "4S", "5L", "5S", "DOWN", "UP", "BULL", "BEAR"
+    "3L", "3S", "4L", "4S", "5L", "5S", "DOWN", "UP", "BULL", "BEAR", "STOCK"
 }
 
 SYSTEM_STATE = {
@@ -230,7 +231,7 @@ class DatabaseManager:
 db = DatabaseManager()
 
 # -----------------------------------------------------------------------------
-# 4. MEXC API CLIENT (FUTURES OPTIMIZED)
+# 4. MEXC API CLIENT (FUTURES OPTIMIZED & STOCK FILTERED)
 # -----------------------------------------------------------------------------
 class MexcClient:
     def __init__(self):
@@ -283,7 +284,12 @@ class MexcClient:
                     continue
 
                 base_coin = sym_clean[:-4]
-                if base_coin in STABLE_AND_ETF_BLACKLIST or any(base_coin.endswith(suffix) for suffix in ["3L", "3S", "4L", "4S", "5L", "5S"]):
+
+                # BỘ LỌC CHẶN CỔ PHIẾU (STOCK), ETF, STABLECOIN
+                if (base_coin in STABLE_AND_ETF_BLACKLIST or 
+                    any(base_coin.endswith(suffix) for suffix in ["3L", "3S", "4L", "4S", "5L", "5S"]) or
+                    "STOCK" in base_coin or 
+                    "INDEX" in base_coin):
                     continue
 
                 ft_info = fut_ticker_map.get(sym_clean, {})
@@ -349,33 +355,6 @@ class MexcClient:
         df.sort_values(by="open_time", ascending=True, inplace=True)
         df.reset_index(drop=True, inplace=True)
         return df
-
-    def fetch_spot_orderflow_and_cvd(self, symbol: str, limit: int = 1000) -> Tuple[Optional[float], Optional[float], bool]:
-        res = self._request(MEXC_SPOT_BASE_URL, "/api/v3/aggTrades", params={"symbol": symbol, "limit": limit})
-        if not res or not isinstance(res, list) or len(res) < 30:
-            return None, None, False
-
-        taker_buy_vol = 0.0
-        taker_sell_vol = 0.0
-
-        for t in res:
-            qty = float(t.get("q", 0.0))
-            price = float(t.get("p", 0.0))
-            vol_usdt = qty * price
-            is_buyer_maker = t.get("m", False)
-
-            if is_buyer_maker:
-                taker_buy_vol += vol_usdt
-            else:
-                taker_sell_vol += vol_usdt
-
-        total_vol = taker_buy_vol + taker_sell_vol
-        if total_vol <= 0:
-            return None, None, False
-
-        taker_buy_pct = (taker_buy_vol / total_vol) * 100.0
-        cvd_val = taker_buy_vol - taker_sell_vol
-        return round(taker_buy_pct, 2), round(cvd_val, 2), True
 
 mexc_api = MexcClient()
 
@@ -550,7 +529,6 @@ class SetupEngine:
             return False, {}, 0, "Dữ liệu nến H1 không đủ"
 
         h1_last = df_h1.iloc[-2]
-        h1_prev = df_h1.iloc[-3]
         entry_price = h1_last['close']
 
         atr_h1 = h1_last['atr'] if not np.isnan(h1_last['atr']) else (entry_price * 0.01)
@@ -722,7 +700,7 @@ class SetupEngine:
         df_h4: pd.DataFrame, df_h1: pd.DataFrame, current_realtime_price: float,
         oi_change_pct: float, taker_buy_pct: Optional[float], cvd_val: Optional[float]
     ) -> Tuple[bool, Dict[str, Any], int, str]:
-        """SETUP 5 / 7 - H4 EMA21 RECLAIM (SIẾT CHẶT ĐIỀU KIỆN: H4 PHẢI TRÊN EMA200)"""
+        """SETUP 5 - H4 EMA21 RECLAIM (SIẾT CHẶT ĐIỀU KIỆN: H4 PHẢI TRÊN EMA200)"""
         if df_h4 is None or len(df_h4) < 25:
             return False, {}, 0, "Dữ liệu nến H4 không đủ"
 
